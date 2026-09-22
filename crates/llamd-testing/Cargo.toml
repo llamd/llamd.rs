@@ -15,6 +15,7 @@ llamd-quant.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+llamd-tokenizer.workspace = true
 llamd-gguf.workspace = true
 llamd-core.workspace = true
 serde_json.workspace = true

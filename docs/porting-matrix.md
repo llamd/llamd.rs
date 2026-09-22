@@ -17,7 +17,7 @@ inheriting the reference's design would defeat the purpose.
 |---|---|---|---|---|---|---|
 | 1 | `ggml/src/gguf.cpp`, `gguf.h` | ~2k | `llamd-gguf` | **Reimplement.** A file format with a written spec; a parser is the natural Rust artifact. Memory-map, zero-copy tensor views. | Parse the real Qwen3-Coder Q6_K; every KV pair and tensor descriptor must equal `gguf_dump` output | `—` |
 | 2 | `ggml-common.h` block structs | ~1k | `llamd-quant` | **Bit-exact obligation.** `block_q6_K` (210 B), `block_q8_0` (34 B), `QK_K=256`. Layout must match byte for byte or every weight is wrong. | `static_assert`-equivalent size tests; dequantize a real tensor and compare against llama.cpp's own dequant, bit for bit | `—` |
-| 3 | `src/llama-vocab.cpp` | 4,732 | `llamd-tokenizer` | **Reimplement BPE first** (Qwen is BPE). SPM/WPM/UGM deferred until a model needs them. | Tokenize a corpus through both; **exact id-sequence match is mandatory**, not a tolerance | `—` |
+| 3 | `src/llama-vocab.cpp` | 4,732 | `llamd-tokenizer` | **BPE done** — gpt2 model, qwen2 pre-tokenizer, byte mapping, merge loop, special tokens, decode. SPM/WPM/UGM deferred. | **24/24 prompts exactly equal to llama.cpp** on the real Qwen3-Coder vocabulary (151,936 tokens). Verified non-vacuous by injecting a whitespace-rule bug and watching it fail. | `ok` |
 | 4 | `src/llama-arch.cpp/.h` | 1,963 | `llamd-models` | **Reimplement as Rust enums + serde.** A 2k-line C++ enum-to-string table becomes a derive. | Architecture and tensor names resolve identically for every Qwen variant | `—` |
 | 5 | `src/llama-model.cpp` | 6,842 | `llamd-models` | **Selectively reimplement.** Qwen3 and Qwen3MoE only. The other ~40 architectures are explicitly out of scope; adding one is a deliberate decision, not a sweep. | Tensor wiring matches; shapes equal the oracle's for the same file | `—` |
 | 6 | `ggml` tensor core | large | `llamd-tensor` | **Redesign.** ggml's arena + `ggml_context` model exists because C has no ownership. Rust has one. Shapes/strides/dtypes with real lifetimes, and the `Backend` trait seam. | Shape and stride arithmetic property-tested; results compared per op | `—` |
@@ -39,6 +39,17 @@ inheriting the reference's design would defeat the purpose.
 | 22 | `src/llama-quant.cpp` | 1,487 | `llamd-quant` | **Deferred.** LLAMD *reads* quantized models first; producing them is later. | — | `—` |
 | 23 | `src/llama-adapter.cpp` | — | — | **Out of scope initially.** LoRA/control vectors. | — | `—` |
 | 24 | `src/llama-mmap.cpp` | 905 | `llamd-gguf` | **Reimplement** with `memmap2`. Isolated unsafe, documented. | Large-model load without copying | `—` |
+
+## A blind spot worth knowing about
+
+Row 3 reached `ok` on an end-to-end comparison. Deliberately breaking the
+per-digit split rule (`\p{N}` → `\p{N}+`) did **not** fail that comparison,
+because BPE merges the digits back and the final ids are identical.
+
+An end-to-end comparison proves the *pipeline* agrees, not that each stage
+does. Stages whose errors are absorbed downstream need their own tests — and
+the only way to learn which stages those are is to try breaking them. Every
+row that reaches `ok` should get the same treatment.
 
 ## Unsafe policy
 

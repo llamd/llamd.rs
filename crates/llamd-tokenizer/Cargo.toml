@@ -10,3 +10,5 @@ authors.workspace      = true
 
 [dependencies]
 llamd-core.workspace = true
+llamd-gguf.workspace = true
+unicode-general-category = "1"
