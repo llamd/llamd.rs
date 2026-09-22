@@ -1,0 +1,20 @@
+[package]
+name         = "llamd-testing"
+description  = "The validation harness. Runs identical inputs through llama.cpp and LLAMD and compares."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[dependencies]
+llamd-core.workspace = true
+llamd-gguf.workspace = true
+llamd-quant.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+llamd-gguf.workspace = true
+llamd-core.workspace = true
+serde_json.workspace = true
