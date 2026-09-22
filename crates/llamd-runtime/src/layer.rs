@@ -207,3 +207,98 @@ pub fn embed(be: &dyn Backend, model: &Model, token: u32) -> Result<Vec<f32>> {
     let table = model.tensor(&model.tok_embd)?;
     Ok(be.get_rows(&table, &[token])?.data().to_vec())
 }
+
+/// The MoE feed-forward: run the chosen experts and combine them.
+///
+/// PROVENANCE. Follows `build_moe_ffn` in `llama.cpp/src/llama-graph.cpp`
+/// with `LLM_FFN_SILU` gating (MIT, © 2023-2026 The ggml authors).
+///
+/// For each selected expert `e` with weight `w`:
+///
+/// ```text
+///   gate = W_gate[e] · x        up = W_up[e] · x
+///   act  = silu(gate) * up      out += w * (W_down[e] · act)
+/// ```
+///
+/// SiLU is applied to the GATE only, and the product is elementwise. Applying
+/// it to `up`, or after the multiply, is the kind of mistake that still
+/// produces fluent text — SwiGLU is not symmetric in its two branches.
+///
+/// ONLY THE CHOSEN EXPERTS ARE TOUCHED. That is the whole point of a
+/// mixture-of-experts: 8 of 128 here, which is why a 30B model costs about 3B
+/// per token. Materialising all 128 would be correct and 16× the work.
+pub fn moe_ffn(
+    be: &dyn Backend,
+    model: &Model,
+    il: usize,
+    x: &[f32],
+    routing: &llamd_models::Routing,
+) -> Result<Vec<f32>> {
+    let l = &model.layers[il];
+    let n_embd = model.hparams.n_embd;
+    let gate_n = l.ffn_gate_exps.as_ref().expect("moe layer");
+    let up_n = l.ffn_up_exps.as_ref().expect("moe layer");
+    let down_n = l.ffn_down_exps.as_ref().expect("moe layer");
+
+    let xt = Tensor::from_slice(&[n_embd], x)?;
+    let mut out = vec![0.0f32; n_embd];
+
+    for (&e, &w) in routing.experts.iter().zip(&routing.weights) {
+        let e = e as usize;
+        let gate = be.matmul(&model.expert(gate_n, e)?, &xt)?;
+        let up = be.matmul(&model.expert(up_n, e)?, &xt)?;
+
+        let n = gate.elems();
+        let act = be.mul(&be.silu(&gate.reshape(&[n])?)?, &up.reshape(&[n])?)?;
+
+        let down = be.matmul(&model.expert(down_n, e)?, &act.reshape(&[n, 1])?)?;
+        for (o, &d) in out.iter_mut().zip(down.data()) {
+            *o += w * d;
+        }
+    }
+    Ok(out)
+}
+
+/// Everything above, for all layers, ending in logits over the vocabulary.
+///
+/// Single token, single sequence. Slow by construction — the CPU reference
+/// dequantizes each weight as it is used, because caching 23 GiB of f32 is
+/// not possible and caching selectively would be an optimization in the one
+/// crate whose performance is explicitly a non-goal.
+pub fn forward(
+    be: &dyn Backend,
+    model: &Model,
+    token: u32,
+    pos: u32,
+    kv: &mut KvCache,
+) -> Result<Vec<f32>> {
+    let h = &model.hparams;
+    let mut x = embed(be, model, token)?;
+
+    for il in 0..h.n_layer {
+        let t = forward_layer(be, model, il, &x, pos, kv)?;
+        let ffn = moe_ffn(be, model, il, &t.ffn_norm, &t.routing)?;
+        // Second residual: the FFN adds to its own input, not to the layer's.
+        for (a, b) in x.iter_mut().zip(t.ffn_inp.iter()) {
+            *a = *b;
+        }
+        for (a, b) in x.iter_mut().zip(&ffn) {
+            *a += *b;
+        }
+    }
+
+    let xt = Tensor::from_slice(&[h.n_embd], &x)?;
+    let normed = be.mul(
+        &be.rms_norm(&xt, h.rms_eps)?,
+        &model.tensor(&model.output_norm)?,
+    )?;
+
+    // Models that tie the output projection to the embeddings have no
+    // `output.weight`; say which is happening rather than failing obscurely.
+    let out_w = match &model.output {
+        Some(n) => model.tensor(n)?,
+        None => model.tensor(&model.tok_embd)?,
+    };
+    let logits = be.matmul(&out_w, &normed)?;
+    Ok(logits.data().to_vec())
+}

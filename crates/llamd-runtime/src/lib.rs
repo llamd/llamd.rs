@@ -11,4 +11,4 @@ pub mod layer;
 
 pub use attention::{AttnParams, attend};
 pub use kv::KvCache;
-pub use layer::{LayerTrace, embed, forward_layer};
+pub use layer::{LayerTrace, embed, forward, forward_layer, moe_ffn};

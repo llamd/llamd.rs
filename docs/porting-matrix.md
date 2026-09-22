@@ -26,7 +26,7 @@ inheriting the reference's design would defeat the purpose.
 | 9 | attention | — | `llamd-runtime` | **GQA done** — 32 query heads over 4 KV heads, `kv_head = q_head / 8`, scaled by 1/sqrt(128). Flash Attention still outstanding. | Matches llama.cpp's `kqv_out-0` at 3.2e-4 in the layer trace; the `%` vs `/` head mapping has its own test | `cpu` |
 | 10 | `src/llama-kv-cache*.cpp` | 7,882 | `llamd-runtime` | **Unified cache done**, per-layer lengths. Layout kept simple and explicitly provisional — it is an AMD-first decision for the ROCm backend to revisit. | Used by the layer trace; `bytes_for` reproduces the 96 KiB/token that sets the context ceiling | `cpu` |
 | 11 | `src/llama-graph.cpp` | 5,305 | `llamd-runtime` | **Redesign.** Graph building in Rust wants a typed builder, not a C struct-graph. | Same logical graph → same numerics | `—` |
-| 12 | `src/llama-context.cpp` | 4,813 | `llamd-runtime` | **Single-token layer forward done.** Full decode loop over 48 layers, batching and session state still outstanding. | **13 tensors of layer 0 match llama.cpp's own trace**; verified non-vacuous by skipping QK-norm → 2.3e0 | `cpu` |
+| 12 | `src/llama-context.cpp` | 4,813 | `llamd-runtime` | **Full 48-layer forward to logits done** — MoE FFN included, 7.3 s per token on the reference. Batching and multi-token sequences still outstanding. | 13 tensors of layer 0 match the trace; routing matches **exactly through layer 45**. Token equality NOT achieved — see the MoE routing limitation below | `cpu` |
 | 13 | `src/llama-batch.cpp` | 1,161 | `llamd-runtime` | **Reimplement.** Batch assembly and splitting. | Batched output equals sequential output | `—` |
 | 14 | MoE routing | — | `llamd-models` | **Done.** softmax over 128 → top-8 → renormalise, with ggml's 6.1e-5 clamp and ties broken toward the lower index. | **Selection identical to ggml across 4 seeds**, set-compared since ggml documents top-k order as unspecified. Weights validated by invariant only — see the gap below | `ok` |
 | 15 | `src/llama-sampler.cpp` | 4,431 | `llamd-sampling` | **Reimplement the chain.** temp, top-k, top-p, min-p, typical, penalties, mirostat, grammar. | Same seed + same logits → same token. Exact. | `—` |
@@ -39,6 +39,38 @@ inheriting the reference's design would defeat the purpose.
 | 22 | `src/llama-quant.cpp` | 1,487 | `llamd-quant` | **Deferred.** LLAMD *reads* quantized models first; producing them is later. | — | `—` |
 | 23 | `src/llama-adapter.cpp` | — | — | **Out of scope initially.** LoRA/control vectors. | — | `—` |
 | 24 | `src/llama-mmap.cpp` | 905 | `llamd-gguf` | **Reimplement** with `memmap2`. Isolated unsafe, documented. | Large-model load without copying | `—` |
+
+## The limitation that shapes what comes next
+
+**An f32 reference cannot match a quantized MoE implementation token-for-token,
+and this is structural rather than a matter of precision.**
+
+Measured on the real model. Routing weights match llama.cpp exactly through
+layer 45 and closely at 46. At layer 47 the router is nearly uniform:
+
+```text
+  ours    0.1734  0.1547  0.1506  …  0.1102  0.0637  0.0634
+  oracle  0.1782  0.1500  0.1347  …  0.1248  0.0789  0.0738
+```
+
+Eight experts within a factor of 2.4 — a near-tied discrete choice. The
+quantized-path difference (ggml quantizes activations to Q8_K; the reference
+multiplies in f32) is far smaller than the gaps between most experts, but it is
+larger than the gaps here, so the selection flips. A different expert is a
+different model, so the final hidden state and therefore the logits differ.
+llama.cpp's greedy token ranks **second** in ours, 0.62 logit below the top.
+
+This is not something a tolerance can fix, and widening one would only hide it.
+The fix is for LLAMD to implement the same quantized dot product — `Q6_K`
+weights against `Q8_K` activations — at which point the comparison becomes
+quantized-against-quantized and token equality is achievable. That work is now
+the highest-value item for `llamd-cpu`, ahead of any GPU kernel: without it,
+no backend can be validated at the token level.
+
+It also says something about MoE models generally that is worth carrying into
+the ROCm work: **routing is discrete, so it amplifies arbitrarily small
+numerical differences into arbitrarily large output differences.** Any backend
+will have to match the quantized path, not merely approximate it.
 
 ## Gaps worth knowing about
 
