@@ -1,0 +1,15 @@
+# The upstream reference implementation, pinned.
+#
+# llama.cpp is LLAMD's behavioural, architectural and numerical oracle. It is a
+# git CHECKOUT, not vendored source: it is excluded from LLAMD's history by
+# .gitignore and restored by scripts/clone-reference.sh.
+#
+# Pinning matters because the oracle decides what "correct" means. If the
+# reference moves under a validation run, a passing test and a failing one are
+# no longer comparable.
+
+url=https://github.com/ggml-org/llama.cpp.git
+commit=0f8a414b7587bc412e44611d4c9e2fea876449a6
+short=0f8a414b7
+date=2026-09-22
+license=MIT

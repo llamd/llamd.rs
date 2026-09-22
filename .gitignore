@@ -1,0 +1,19 @@
+# The reference implementation is a git CHECKOUT, not part of LLAMD's history.
+# It is cloned by scripts/clone-reference.sh and pinned in REFERENCE.
+llama.cpp/
+
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Models and artifacts — never committed
+*.gguf
+models/
+/bench-results/
+/validation-out/
+
+# Local
+.env
+*.log
+.state/
