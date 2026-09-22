@@ -15,6 +15,8 @@ llamd-quant.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+llamd-cpu.workspace = true
+llamd-tensor.workspace = true
 llamd-tokenizer.workspace = true
 llamd-gguf.workspace = true
 llamd-core.workspace = true

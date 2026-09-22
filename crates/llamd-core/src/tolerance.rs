@@ -23,6 +23,21 @@ pub const EXACT: f32 = 0.0;
 /// multiply-add.
 pub const F32_ULP: f32 = 1.2e-7;
 
+/// Same arithmetic, different summation order.
+///
+/// A reduction over `n` terms accumulates about `sqrt(n)` rounding steps, and
+/// two implementations that block or vectorise the sum differently will
+/// disagree by roughly that much. This is NOT a licence for a different
+/// algorithm: only for the same one summed in a different order.
+///
+/// Sized for reductions up to a few thousand terms — `sqrt(4096) = 64` ULP is
+/// about 7.6e-6, so this leaves headroom without being able to hide a
+/// structural error, which would be O(1) rather than O(1e-6).
+///
+/// Introduced when `rms_norm` over 128 elements differed from ggml by 1.9 ULP
+/// and `F32_ULP` was found to be the wrong category for any reduction.
+pub const REDUCTION: f32 = 1e-5;
+
 /// Accumulated error through one attention block.
 ///
 /// Justification: a reduction over `n` terms accumulates roughly `sqrt(n)`
@@ -122,7 +137,8 @@ mod tests {
         // Each stage of accumulation admits more error than the one before.
         // If this ever fails somebody has widened the wrong constant.
         assert!(EXACT < F32_ULP);
-        assert!(F32_ULP < ATTENTION);
+        assert!(F32_ULP < REDUCTION);
+        assert!(REDUCTION <= ATTENTION);
         assert!(ATTENTION < LAYER);
         assert!(LAYER < LOGITS);
     }

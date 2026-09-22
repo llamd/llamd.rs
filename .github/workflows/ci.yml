@@ -23,7 +23,12 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo build --workspace
-      # Oracle tests skip loudly without LLAMD_TEST_MODEL; unit tests still run.
+      # The ggml oracle needs no GPU and no model: it validates the CPU
+      # reference ops against the pinned ggml. Building it here means op-level
+      # regressions are caught on an ordinary runner.
+      - run: ./scripts/clone-reference.sh
+      - run: ./tools/ggml-oracle/build.sh
+      # Model-dependent tests skip loudly without LLAMD_TEST_MODEL.
       - run: cargo test --workspace
 
   # The unsafe policy is a rule, so it is a test.
@@ -107,6 +112,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: ./scripts/clone-reference.sh
+      - run: ./tools/ggml-oracle/build.sh
       - run: cargo test --workspace --release
         env:
           LLAMD_TEST_MODEL: ${{ vars.LLAMD_TEST_MODEL }}

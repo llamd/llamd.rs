@@ -135,8 +135,10 @@ name = "llamd-testing"
 version = "0.1.0"
 dependencies = [
  "llamd-core",
+ "llamd-cpu",
  "llamd-gguf",
  "llamd-quant",
+ "llamd-tensor",
  "llamd-tokenizer",
  "serde_json",
 ]
