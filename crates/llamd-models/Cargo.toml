@@ -12,3 +12,4 @@ authors.workspace      = true
 llamd-core.workspace = true
 llamd-tensor.workspace = true
 llamd-gguf.workspace = true
+llamd-quant.workspace = true

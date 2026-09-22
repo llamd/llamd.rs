@@ -282,3 +282,71 @@ fn get_rows_matches_ggml_exactly() {
     // routing would be a different expert.
     check("get_rows", ours.data(), &theirs, EXACT);
 }
+
+/// Expert selection must match ggml EXACTLY — a different expert is a
+/// different model, so there is no tolerance to apply.
+///
+/// ggml documents `argsort_top_k` as returning indices in no particular order,
+/// so the comparison is set-based. Asserting an order would be testing an
+/// implementation detail the reference does not promise, and would fail for
+/// the wrong reason the day ggml changes its sort.
+#[test]
+fn moe_expert_selection_matches_ggml_exactly() {
+    if oracle_path().is_none() {
+        skip(
+            "moe_expert_selection_matches_ggml_exactly",
+            "build tools/ggml-oracle first",
+        );
+        return;
+    }
+    // The real routing shape: 8 experts chosen from 128.
+    let (n_expert, n_used) = (128usize, 8usize);
+
+    for seed in [31u32, 37, 41, 43] {
+        let logits = sample(n_expert, seed);
+        let ours = llamd_models::route(&logits, n_used).unwrap();
+
+        let bin = oracle_path().unwrap();
+        let mut c = std::process::Command::new(&bin)
+            .args(["top_k", &n_expert.to_string(), "1", &n_used.to_string()])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            let si = c.stdin.as_mut().unwrap();
+            for v in &logits {
+                si.write_all(&v.to_le_bytes()).unwrap();
+            }
+        }
+        let out = c.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "oracle top_k failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let theirs: Vec<u32> = out
+            .stdout
+            .chunks_exact(4)
+            .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u32)
+            .collect();
+
+        let mut a = ours.experts.clone();
+        let mut b = theirs.clone();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(
+            a, b,
+            "seed {seed}: expert SETS differ\n  ours {a:?}\n  ggml {b:?}"
+        );
+
+        // Weights must still sum to one after renormalising the chosen few.
+        let s: f32 = ours.weights.iter().sum();
+        assert!(
+            (s - 1.0).abs() < ATTENTION,
+            "seed {seed}: weights sum to {s}, not 1"
+        );
+    }
+    eprintln!("  expert selection: 8 of 128 identical to ggml across 4 seeds");
+}

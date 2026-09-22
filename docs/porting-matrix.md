@@ -18,8 +18,8 @@ inheriting the reference's design would defeat the purpose.
 | 1 | `ggml/src/gguf.cpp`, `gguf.h` | ~2k | `llamd-gguf` | **Reimplement.** A file format with a written spec; a parser is the natural Rust artifact. Memory-map, zero-copy tensor views. | Parse the real Qwen3-Coder Q6_K; every KV pair and tensor descriptor must equal `gguf_dump` output | `—` |
 | 2 | `ggml-common.h` block structs | ~1k | `llamd-quant` | **Bit-exact obligation.** `block_q6_K` (210 B), `block_q8_0` (34 B), `QK_K=256`. Layout must match byte for byte or every weight is wrong. | `static_assert`-equivalent size tests; dequantize a real tensor and compare against llama.cpp's own dequant, bit for bit | `—` |
 | 3 | `src/llama-vocab.cpp` | 4,732 | `llamd-tokenizer` | **BPE done** — gpt2 model, qwen2 pre-tokenizer, byte mapping, merge loop, special tokens, decode. SPM/WPM/UGM deferred. | **24/24 prompts exactly equal to llama.cpp** on the real Qwen3-Coder vocabulary (151,936 tokens). Verified non-vacuous by injecting a whitespace-rule bug and watching it fail. | `ok` |
-| 4 | `src/llama-arch.cpp/.h` | 1,963 | `llamd-models` | **Reimplement as Rust enums + serde.** A 2k-line C++ enum-to-string table becomes a derive. | Architecture and tensor names resolve identically for every Qwen variant | `—` |
-| 5 | `src/llama-model.cpp` | 6,842 | `llamd-models` | **Selectively reimplement.** Qwen3 and Qwen3MoE only. The other ~40 architectures are explicitly out of scope; adding one is a deliberate decision, not a sweep. | Tensor wiring matches; shapes equal the oracle's for the same file | `—` |
+| 4 | `src/llama-arch.cpp/.h` | 1,963 | `llamd-models` | **Done for qwen3/qwen3moe.** `Arch` enum, `Hparams` read from GGUF with validation, per-layer tensor naming. Nothing defaulted silently. | All 579 tensors resolve on the real model; shapes checked against what the hyperparameters imply | `ok` |
+| 5 | `src/llama-model.cpp` | 6,842 | `llamd-models` | **Loader done, lazily.** 30.53B params over 579 tensors opened in 73 ms; nothing materialised until asked for, since f32 would be ~122 GiB. One expert extracted in 23 ms without its 127 siblings. | Every named tensor verified present at open; shapes match hparams | `cpu` |
 | 6 | `ggml` tensor core | large | `llamd-tensor` | **Shape, Tensor and the `Backend` trait done.** ggml dimension order kept (`ne[0]` contiguous); ownership replaces the arena. | Stride arithmetic tested; the convention asserted directly, since getting it backwards yields a transposed matmul and confident nonsense | `cpu` |
 | 7 | `ggml-cpu` | 93,114 | `llamd-cpu` | **Reference path done** for rms_norm, softmax, silu, add/mul/scale, matmul, rope, get_rows. No SIMD, no fusion — deliberately. | **6/6 ops match ggml** via `tools/ggml-oracle`: rms_norm 6.6e-7, matmul 2.4e-6, rope 5.4e-7, get_rows **exact**. Non-vacuity proven by injecting an interleaved-RoPE bug → 6.5e-1 | `ok` |
 | 8 | RoPE | — | `llamd-cpu` | **NeoX pairing done** — element `i` pairs with `i + head_dim/2`, at the model's real `freq_base` 1e7. YaRN/NTK scaling for long context still outstanding. | Matches ggml at 5.4e-7 for head_dim 128. The interleaved convention is also "RoPE", also finite, and wrong — so it has its own test | `cpu` |
@@ -28,7 +28,7 @@ inheriting the reference's design would defeat the purpose.
 | 11 | `src/llama-graph.cpp` | 5,305 | `llamd-runtime` | **Redesign.** Graph building in Rust wants a typed builder, not a C struct-graph. | Same logical graph → same numerics | `—` |
 | 12 | `src/llama-context.cpp` | 4,813 | `llamd-runtime` | **Reimplement.** Decode loop, batching, session state. | End-to-end sequence equality | `—` |
 | 13 | `src/llama-batch.cpp` | 1,161 | `llamd-runtime` | **Reimplement.** Batch assembly and splitting. | Batched output equals sequential output | `—` |
-| 14 | MoE routing (`llama-model`) | — | `llamd-models` | **Reimplement.** Qwen3MoE: top-k expert selection and gather. ~3B of 30B active per token, so this is a first-order performance path, not a detail. | Expert selection must match **exactly** — a different expert is a different model | `—` |
+| 14 | MoE routing | — | `llamd-models` | **Done.** softmax over 128 → top-8 → renormalise, with ggml's 6.1e-5 clamp and ties broken toward the lower index. | **Selection identical to ggml across 4 seeds**, set-compared since ggml documents top-k order as unspecified. Weights validated by invariant only — see the gap below | `ok` |
 | 15 | `src/llama-sampler.cpp` | 4,431 | `llamd-sampling` | **Reimplement the chain.** temp, top-k, top-p, min-p, typical, penalties, mirostat, grammar. | Same seed + same logits → same token. Exact. | `—` |
 | 16 | `ggml-cuda` (hipified) | 46,122 | `llamd-rocm` | **Do NOT port.** This is the whole point: a backend written *for* RDNA4 rather than CUDA-with-substitutions. wave32/64, LDS budget, matrix cores, occupancy. | Every kernel vs the CPU reference; then benchmarked against hipified llama.cpp on the same card | `—` |
 | 17 | `ggml-vulkan` | 38,029 | `llamd-vulkan` | **Reimplement, first-class.** Portable path and a cross-check on ROCm: two independent GPU implementations disagreeing is a strong bug signal. | vs CPU reference; benchmarked vs llama.cpp Vulkan | `—` |
@@ -39,6 +39,22 @@ inheriting the reference's design would defeat the purpose.
 | 22 | `src/llama-quant.cpp` | 1,487 | `llamd-quant` | **Deferred.** LLAMD *reads* quantized models first; producing them is later. | — | `—` |
 | 23 | `src/llama-adapter.cpp` | — | — | **Out of scope initially.** LoRA/control vectors. | — | `—` |
 | 24 | `src/llama-mmap.cpp` | 905 | `llamd-gguf` | **Reimplement** with `memmap2`. Isolated unsafe, documented. | Large-model load without copying | `—` |
+
+## Gaps worth knowing about
+
+**MoE weights are not compared against ggml, only the selection is.**
+`build_moe_ffn` is a composition, not a single op, so the oracle can reach the
+top-k but not the weights. They are checked by invariant — sum to one, ordered,
+not re-softmaxed — which would catch a gross error and would not catch a subtle
+one. Closing this needs a whole-FFN comparison, and until then the row is `ok`
+for selection and silent about weights.
+
+**A claim I had to retract.** This module's comment asserted that softmaxing
+after top-k instead of before would change the weights. A negative control
+disproved it: renormalising a subset of a softmax is algebraically identical to
+softmaxing the subset, so the order changes nothing. The real distinction is
+`SOFTMAX` versus `SOFTMAX_WEIGHT` gating, and that now has its own test. Prose
+in a comment is not evidence; the control was.
 
 ## A blind spot worth knowing about
 

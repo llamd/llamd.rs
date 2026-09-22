@@ -85,6 +85,7 @@ version = "0.1.0"
 dependencies = [
  "llamd-core",
  "llamd-gguf",
+ "llamd-quant",
  "llamd-tensor",
 ]
 
@@ -137,6 +138,7 @@ dependencies = [
  "llamd-core",
  "llamd-cpu",
  "llamd-gguf",
+ "llamd-models",
  "llamd-quant",
  "llamd-tensor",
  "llamd-tokenizer",

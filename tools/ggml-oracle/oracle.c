@@ -89,6 +89,29 @@ int main(int argc, char **argv) {
         // mode 2 = GGML_ROPE_TYPE_NEOX, which pairs i with i + n_dims/2.
         r = ggml_rope_ext(ctx, a, pos, NULL, n_dims, GGML_ROPE_TYPE_NEOX,
                           0, freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+    } else if (!strcmp(op, "top_k")) {
+        // top_k <ne0> <ne1> <k> : softmax over ne0, then ggml's top-k.
+        //
+        // This is the expert-selection half of build_moe_ffn. ggml documents
+        // the indices as being in NO PARTICULAR ORDER, so the comparison on
+        // the Rust side is set-based; asserting an order would be testing an
+        // implementation detail the reference does not promise.
+        //
+        // Indices come back as i32 and are written as i32, so the caller must
+        // read them as such rather than as float.
+        if (argc < 5) die("top_k needs k");
+        int k = atoi(argv[4]);
+        struct ggml_tensor *p = ggml_soft_max(ctx, a);
+        r = ggml_argsort_top_k(ctx, p, k);
+        struct ggml_cgraph *g2 = ggml_new_graph(ctx);
+        ggml_build_forward_expand(g2, r);
+        ggml_graph_compute_with_ctx(ctx, g2, 1);
+        size_t n2 = ggml_nelements(r);
+        if (fwrite(r->data, sizeof(int32_t), n2, stdout) != n2) die("short write");
+        fflush(stdout);
+        fprintf(stderr, "oracle: top_k -> %zu indices\n", n2);
+        ggml_free(ctx);
+        return 0;
     } else if (!strcmp(op, "get_rows")) {
         // get_rows <ne0> <ne1> <n_ids> ; ids follow the data as i32
         if (argc < 5) die("get_rows needs n_ids");
