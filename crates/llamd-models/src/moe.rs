@@ -53,7 +53,17 @@ pub const WEIGHT_SUM_FLOOR: f32 = 6.103515625e-5; // exactly 2^-14
 pub struct Routing {
     /// Selected expert indices, best first.
     pub experts: Vec<u32>,
-    /// Their weights, renormalised to sum to one.
+    /// The chosen experts' probabilities, BEFORE renormalisation.
+    ///
+    /// Kept because llama.cpp dumps this stage separately
+    /// (`ffn_moe_weights`), which makes it independently checkable. These sum
+    /// to well under one — the top 8 of 128 capture whatever mass they
+    /// capture.
+    pub weights_raw: Vec<f32>,
+    /// Their sum, after ggml's clamp. (`ffn_moe_weights_sum_clamped`.)
+    pub weight_sum: f32,
+    /// The weights actually used, renormalised to sum to one.
+    /// (`ffn_moe_weights_norm`.)
     pub weights: Vec<f32>,
 }
 
@@ -90,13 +100,16 @@ pub fn route(logits: &[f32], n_used: usize) -> Result<Routing> {
     let experts: Vec<u32> = idx.into_iter().take(n_used).collect();
 
     // 4-5. gather and renormalise, with ggml's clamp on the divisor.
-    let mut weights: Vec<f32> = experts.iter().map(|&e| probs[e as usize]).collect();
-    let sum = weights.iter().sum::<f32>().max(WEIGHT_SUM_FLOOR);
-    for w in &mut weights {
-        *w /= sum;
-    }
+    let weights_raw: Vec<f32> = experts.iter().map(|&e| probs[e as usize]).collect();
+    let weight_sum = weights_raw.iter().sum::<f32>().max(WEIGHT_SUM_FLOOR);
+    let weights: Vec<f32> = weights_raw.iter().map(|w| w / weight_sum).collect();
 
-    Ok(Routing { experts, weights })
+    Ok(Routing {
+        experts,
+        weights_raw,
+        weight_sum,
+        weights,
+    })
 }
 
 #[cfg(test)]

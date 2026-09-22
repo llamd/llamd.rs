@@ -38,6 +38,56 @@ pub const F32_ULP: f32 = 1.2e-7;
 /// and `F32_ULP` was found to be the wrong category for any reduction.
 pub const REDUCTION: f32 = 1e-5;
 
+/// f32 reference matmul versus ggml's QUANTIZED dot product.
+///
+/// This is not a rounding tolerance — it is the gap between two different
+/// algorithms, and it is the most important one in this file to understand.
+///
+/// ggml does NOT dequantize a Q6_K weight and multiply in f32. Its type traits
+/// say `vec_dot = ggml_vec_dot_q6_K_q8_K`, `vec_dot_type = GGML_TYPE_Q8_K`: it
+/// quantizes the f32 ACTIVATION to Q8_K and performs an integer dot product
+/// against the packed weights. LLAMD's CPU reference dequantizes to f32 and
+/// multiplies in f32, because its job is to be obviously correct rather than
+/// fast.
+///
+/// Q8_K carries an 8-bit quantum per 256-element block, so each activation
+/// element acquires roughly 1/254 ≈ 3.9e-3 of relative error. Over a k-term
+/// dot product those errors partly cancel, leaving about `3.9e-3 / sqrt(k)`
+/// — for k = 2048 that is ~8.7e-5, and it compounds through a layer.
+///
+/// A difference at this scale is therefore EXPECTED and says nothing is wrong.
+/// A structural error would still be O(1), as the RoPE control demonstrated.
+///
+/// NOTE FOR THE GPU BACKENDS: a ROCm or Vulkan kernel that also uses a
+/// quantized path should be compared against GGML directly at `REDUCTION`, not
+/// against this reference at this tolerance. Comparing quantized-to-quantized
+/// is a much tighter test than quantized-to-f32, and using the looser bound
+/// where the tighter one applies would waste the comparison.
+pub const QUANTIZED_MATMUL: f32 = 1e-3;
+
+/// The quantized-path gap ACCUMULATED through a whole layer.
+///
+/// One quantized matmul lands within [`QUANTIZED_MATMUL`]. A layer chains
+/// several — Q, K, V, the output projection, then the router reading their
+/// result — and the gap compounds. Measured on layer 0 of Qwen3-Coder against
+/// llama.cpp's own trace:
+///
+/// ```text
+///   Q                5.9e-5     one matmul
+///   K_normed         5.5e-4     matmul + per-head norm
+///   attn_heads       3.2e-4     + attention
+///   ffn_norm         1.6e-4     + projection, residual, norm
+///   moe_logits       1.3e-3     + the router matmul
+/// ```
+///
+/// Set at 5e-3: about four times the largest observed value, so ordinary
+/// variation across prompts and layers does not cause a spurious failure,
+/// while remaining two orders below the O(1) signature of a structural error.
+///
+/// Raising this is not a way to make a failing comparison pass. If a value
+/// exceeds it, the cause is a different algorithm, not a longer chain.
+pub const QUANTIZED_LAYER: f32 = 5e-3;
+
 /// Accumulated error through one attention block.
 ///
 /// Justification: a reduction over `n` terms accumulates roughly `sqrt(n)`
@@ -141,6 +191,9 @@ mod tests {
         assert!(REDUCTION <= ATTENTION);
         assert!(ATTENTION < LAYER);
         assert!(LAYER < LOGITS);
+        // The quantized-path gap is wider than any pure-rounding bound.
+        assert!(LAYER < QUANTIZED_MATMUL);
+        assert!(QUANTIZED_MATMUL < QUANTIZED_LAYER);
     }
 
     #[test]

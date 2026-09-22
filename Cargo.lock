@@ -102,6 +102,8 @@ name = "llamd-runtime"
 version = "0.1.0"
 dependencies = [
  "llamd-core",
+ "llamd-cpu",
+ "llamd-gguf",
  "llamd-models",
  "llamd-tensor",
 ]
@@ -140,6 +142,7 @@ dependencies = [
  "llamd-gguf",
  "llamd-models",
  "llamd-quant",
+ "llamd-runtime",
  "llamd-tensor",
  "llamd-tokenizer",
  "serde_json",
