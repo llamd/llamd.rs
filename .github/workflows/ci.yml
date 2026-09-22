@@ -1,0 +1,112 @@
+name: ci
+
+on:
+  push: { branches: [main] }
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Everything that does not need a 23 GiB model or an AMD GPU.
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: rustfmt, clippy }
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo build --workspace
+      # Oracle tests skip loudly without LLAMD_TEST_MODEL; unit tests still run.
+      - run: cargo test --workspace
+
+  # The unsafe policy is a rule, so it is a test.
+  unsafe-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: only the permitted crates may use unsafe
+        run: |
+          # Two bugs this gate had when first written, both worth keeping in
+          # mind: `if grep ... | head` tests HEAD's exit status, which is
+          # always 0, so it reported a violation for every crate; and matching
+          # the WORD "unsafe" flags `forbid(unsafe_code)` itself — the very
+          # thing that proves compliance. Match real unsafe constructs, and
+          # never pipe inside the condition.
+          allowed="llamd-gguf llamd-rocm llamd-vulkan llamd-cpu"
+          fail=0
+          for d in crates/*/; do
+            c=$(basename "$d")
+            case " $allowed " in *" $c "*) continue ;; esac
+            hits=$(grep -rn --include='*.rs' -E 'unsafe[[:space:]]*(\{|fn|impl|trait)' "$d/src" 2>/dev/null || true)
+            if [ -n "$hits" ]; then
+              echo "::error::$c uses unsafe but is not on the allow-list"
+              printf '%s\n' "$hits"
+              fail=1
+            fi
+            entry=""
+            [ -f "$d/src/lib.rs" ]  && entry="$d/src/lib.rs"
+            [ -f "$d/src/main.rs" ] && entry="$d/src/main.rs"
+            if [ -n "$entry" ] && ! grep -q 'forbid(unsafe_code)' "$entry"; then
+              echo "::error::$c is missing #![forbid(unsafe_code)] in $entry"; fail=1
+            fi
+          done
+          exit $fail
+
+  # Tolerances must stay named. A bare literal in a comparison is how a claim
+  # gets quietly weakened.
+  tolerance-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: no ad-hoc numeric tolerances in tests
+        run: |
+          if grep -rnE '(abs\(\)\s*<|epsilon|EPSILON)\s*[0-9]' \
+               crates/*/tests crates/*/src --include='*.rs' \
+               | grep -v 'llamd-core/src/tolerance.rs'; then
+            echo "::error::use a named constant from llamd_core::tolerance"
+            exit 1
+          fi
+          echo "ok"
+
+  # Provenance is a licence obligation, so it is checked.
+  provenance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: derived crates carry attribution
+        run: |
+          fail=0
+          for c in llamd-quant llamd-gguf; do
+            grep -q 'PROVENANCE' "crates/$c/src/lib.rs" \
+              || { echo "::error::crates/$c/src/lib.rs has no PROVENANCE header"; fail=1; }
+          done
+          grep -q '^commit=' REFERENCE || { echo "::error::REFERENCE has no pinned commit"; fail=1; }
+          exit $fail
+      - name: the reference checkout is not committed
+        run: |
+          if git ls-files | grep -q '^llama.cpp/'; then
+            echo "::error::llama.cpp/ must be a checkout, not vendored source"; exit 1
+          fi
+          if git ls-files | grep -qE '\.gguf$'; then
+            echo "::error::model weights must never be committed"; exit 1
+          fi
+          echo "ok"
+
+  # Needs the R9700. Self-hosted only; an ordinary runner has no GPU, and a
+  # hardware test that silently skips on every run is worse than none.
+  hardware:
+    runs-on: [self-hosted, r9700]
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/clone-reference.sh
+      - run: cargo test --workspace --release
+        env:
+          LLAMD_TEST_MODEL: ${{ vars.LLAMD_TEST_MODEL }}
