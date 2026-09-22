@@ -1,0 +1,67 @@
+# LLAMD.rs — Large Language Acceleration for AMD
+#
+# A workspace, not a monolith: the crate boundaries are the architecture. In
+# particular `llamd-tensor` owns the Backend trait, and nothing above it may
+# know which backend is in use — that is what allows a new backend later
+# without touching model or runtime code.
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/llamd-core",
+    "crates/llamd-gguf",
+    "crates/llamd-quant",
+    "crates/llamd-tokenizer",
+    "crates/llamd-tensor",
+    "crates/llamd-cpu",
+    "crates/llamd-models",
+    "crates/llamd-runtime",
+    "crates/llamd-sampling",
+    "crates/llamd-server",
+    "crates/llamd-testing",
+    "crates/llamd-bench",
+    "crates/llamd-cli",
+]
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2024"
+rust-version = "1.85"
+license      = "MIT"
+repository   = "https://github.com/scottsoft/llamd.rs"
+authors      = ["LLAMD.rs contributors"]
+
+[workspace.dependencies]
+# Internal
+llamd-core      = { path = "crates/llamd-core" }
+llamd-gguf      = { path = "crates/llamd-gguf" }
+llamd-quant     = { path = "crates/llamd-quant" }
+llamd-tokenizer = { path = "crates/llamd-tokenizer" }
+llamd-tensor    = { path = "crates/llamd-tensor" }
+llamd-cpu       = { path = "crates/llamd-cpu" }
+llamd-models    = { path = "crates/llamd-models" }
+llamd-runtime   = { path = "crates/llamd-runtime" }
+llamd-sampling  = { path = "crates/llamd-sampling" }
+
+# External — deliberately few. Every dependency in the numerical path is a
+# thing that must be trusted or verified, so the numerical path has none.
+thiserror = "2"
+memmap2   = "0.9"
+half      = "2"
+rayon     = "1"
+serde     = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing   = "0.1"
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+# Overflow checks stay ON in release. An index overflow in a tensor kernel
+# produces silently wrong numbers, which is the single hardest class of bug to
+# find in this project. The cost is worth paying until benchmarks say otherwise.
+overflow-checks = true
+
+[profile.bench]
+inherits = "release"
+debug    = true

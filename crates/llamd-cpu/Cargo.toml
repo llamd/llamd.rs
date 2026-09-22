@@ -1,0 +1,14 @@
+[package]
+name         = "llamd-cpu"
+description  = "The CPU reference backend. Clarity over speed: its job is to adjudicate GPU bugs."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[dependencies]
+llamd-core.workspace = true
+llamd-tensor.workspace = true
+llamd-quant.workspace = true

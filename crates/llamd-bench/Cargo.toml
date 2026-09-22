@@ -1,0 +1,12 @@
+[package]
+name         = "llamd-bench"
+description  = "Benchmarks: LLAMD vs llama.cpp, ROCm vs Vulkan, on identical workloads."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[dependencies]
+llamd-core.workspace = true

@@ -1,0 +1,12 @@
+[package]
+name         = "llamd-tokenizer"
+description  = "Tokenization. BPE first, because Qwen is BPE."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[dependencies]
+llamd-core.workspace = true

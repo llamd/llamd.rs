@@ -1,0 +1,12 @@
+[package]
+name         = "llamd-core"
+description  = "Shared types, errors and the numerical tolerance vocabulary used across the workspace."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[dependencies]
+thiserror.workspace = true
