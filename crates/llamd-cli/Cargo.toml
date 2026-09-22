@@ -1,0 +1,18 @@
+[package]
+name         = "llamd-cli"
+description  = "The llamd binary."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[dependencies]
+llamd-core.workspace = true
+llamd-gguf.workspace = true
+llamd-quant.workspace = true
+
+[[bin]]
+name = "llamd"
+path = "src/main.rs"

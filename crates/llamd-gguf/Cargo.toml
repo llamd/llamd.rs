@@ -1,0 +1,15 @@
+[package]
+name         = "llamd-gguf"
+description  = "GGUF parsing: header, metadata, tensor descriptors, and memory-mapped zero-copy tensor data."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[dependencies]
+llamd-core.workspace = true
+llamd-quant.workspace = true
+memmap2.workspace = true
+thiserror.workspace = true
