@@ -1,0 +1,13 @@
+[package]
+name         = "llamd-quant"
+description  = "Quantized block formats. Bit-exact with ggml: Q6_K, Q8_0 first."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[dependencies]
+llamd-core.workspace = true
+half.workspace = true
