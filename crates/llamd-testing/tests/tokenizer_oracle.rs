@@ -33,8 +33,8 @@ const CORPUS: &[&str] = &[
     "",
     " ",
     "\n",
-    "​zero-width space",
-    "mixed  　unicode\u{3000}spaces",
+    "\u{200B}zero-width space",
+    "mixed  \u{3000}unicode\u{3000}spaces",
     "very_long_identifier_name_that_will_be_split_by_bpe_somewhere",
     "0x7FFFFFFF & 0b1010 | 0o777",
 ];
