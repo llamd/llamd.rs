@@ -137,6 +137,7 @@ dependencies = [
 name = "llamd-testing"
 version = "0.1.0"
 dependencies = [
+ "half",
  "llamd-core",
  "llamd-cpu",
  "llamd-gguf",

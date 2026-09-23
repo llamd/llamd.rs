@@ -49,7 +49,7 @@ int main(int argc, char **argv) {
 
     // Operand `a` is created per-op, because RoPE needs a 3D tensor and the
     // input can only be read once: stdin is a pipe and cannot be rewound.
-    if (strcmp(op, "rope") != 0) {
+    if (strcmp(op, "rope") != 0 && strcmp(op, "mul_mat_q6k") != 0) {
         a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1);
         na = (size_t)ne0*ne1;
         if (fread(a->data, sizeof(float), na, stdin) != na) die("short read for operand a");
@@ -89,6 +89,24 @@ int main(int argc, char **argv) {
         // mode 2 = GGML_ROPE_TYPE_NEOX, which pairs i with i + n_dims/2.
         r = ggml_rope_ext(ctx, a, pos, NULL, n_dims, GGML_ROPE_TYPE_NEOX,
                           0, freq_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+    } else if (!strcmp(op, "mul_mat_q6k")) {
+        // mul_mat_q6k <n> <rows> : a Q6_K weight against an f32 activation.
+        //
+        // Exercises the path LLAMD must match at the token level: ggml
+        // quantizes the activation to Q8_K and runs an integer dot product,
+        // rather than dequantizing the weight and multiplying in f32.
+        //
+        // Input is the PACKED Q6_K bytes for <rows> rows of <n> elements,
+        // then <n> f32 activations.
+        if (argc < 4) die("mul_mat_q6k needs <n> <rows>");
+        int64_t nel = ne0, rows = ne1;
+        struct ggml_tensor *wq = ggml_new_tensor_2d(ctx, GGML_TYPE_Q6_K, nel, rows);
+        size_t wbytes = ggml_nbytes(wq);
+        if (fread(wq->data, 1, wbytes, stdin) != wbytes) die("short read for q6_K weights");
+        struct ggml_tensor *act = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nel, 1);
+        if (fread(act->data, sizeof(float), nel, stdin) != (size_t)nel)
+            die("short read for activation");
+        r = ggml_mul_mat(ctx, wq, act);
     } else if (!strcmp(op, "top_k")) {
         // top_k <ne0> <ne1> <k> : softmax over ne0, then ggml's top-k.
         //

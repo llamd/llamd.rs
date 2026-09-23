@@ -19,6 +19,9 @@
 
 use llamd_core::{Error, Result};
 
+pub mod dot;
+pub use dot::{BlockQ8K, Q8K_BLOCK_BYTES, dot_q6k_q8k, quantize_q8_k};
+
 /// Super-block size for the k-quant family. `QK_K` in ggml.
 pub const QK_K: usize = 256;
 
@@ -98,7 +101,7 @@ impl QuantType {
 
 /// f16 → f32, matching `GGML_FP16_TO_FP32`.
 #[inline]
-fn f16_to_f32(bits: u16) -> f32 {
+pub(crate) fn f16_to_f32(bits: u16) -> f32 {
     half::f16::from_bits(bits).to_f32()
 }
 

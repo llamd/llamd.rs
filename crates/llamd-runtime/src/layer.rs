@@ -94,16 +94,9 @@ pub fn forward_layer(
     let l = &model.layers[il];
     let (n_embd, n_head, n_head_kv, hd) = (h.n_embd, h.n_head, h.n_head_kv, h.n_head_dim);
 
-    // SINGLE-TOKEN SHAPE CONVENTION. `matmul` returns rank-2 `[m, n]`, so with
-    // one token every projection comes back as `[dim, 1]` while the residual
-    // path carries `[dim]`. Rather than making `add` silently tolerate a rank
-    // mismatch — which would hide real shape errors — each projection is
-    // squeezed back to rank 1 explicitly, at the point it happens.
+    // Projections now go through `matvec_quant`, which returns a plain Vec,
+    // so the rank-squeeze helper this function used to need is gone with it.
     let xt = Tensor::from_slice(&[n_embd], x)?;
-    let vec1 = |t: Tensor| -> Result<Tensor> {
-        let n = t.elems();
-        t.reshape(&[n])
-    };
 
     // ── attention norm ───────────────────────────────────────────────────
     let norm = be.rms_norm(&xt, h.rms_eps)?;
@@ -111,9 +104,18 @@ pub fn forward_layer(
     let attn_norm = be.mul(&norm, &w_attn_norm)?;
 
     // ── projections ──────────────────────────────────────────────────────
-    let q = vec1(be.matmul(&model.tensor(&l.attn_q)?, &attn_norm)?)?;
-    let k = vec1(be.matmul(&model.tensor(&l.attn_k)?, &attn_norm)?)?;
-    let v = vec1(be.matmul(&model.tensor(&l.attn_v)?, &attn_norm)?)?;
+    let q = Tensor::from_slice(
+        &[n_head * hd],
+        &model.matvec_quant(&l.attn_q, attn_norm.data())?,
+    )?;
+    let k = Tensor::from_slice(
+        &[n_head_kv * hd],
+        &model.matvec_quant(&l.attn_k, attn_norm.data())?,
+    )?;
+    let v = Tensor::from_slice(
+        &[n_head_kv * hd],
+        &model.matvec_quant(&l.attn_v, attn_norm.data())?,
+    )?;
 
     // ── QK-norm, per head, BEFORE RoPE ───────────────────────────────────
     let q_normed = match &l.attn_q_norm {
@@ -164,10 +166,7 @@ pub fn forward_layer(
     )?;
 
     // ── output projection and residual ───────────────────────────────────
-    let kqv_out = vec1(be.matmul(
-        &model.tensor(&l.attn_out)?,
-        &Tensor::from_slice(&[n_head * hd], &attn_out)?,
-    )?)?;
+    let kqv_out = Tensor::from_slice(&[n_embd], &model.matvec_quant(&l.attn_out, &attn_out)?)?;
     let ffn_inp = be.add(&xt, &kqv_out)?;
 
     // ── FFN norm and routing ─────────────────────────────────────────────
@@ -178,7 +177,8 @@ pub fn forward_layer(
         .ffn_gate_inp
         .as_ref()
         .ok_or_else(|| llamd_core::Error::unsupported("layer", "dense FFN is not implemented"))?;
-    let moe_logits = vec1(be.matmul(&model.tensor(router)?, &ffn_norm)?)?;
+    let moe_logits =
+        Tensor::from_slice(&[h.n_expert], &model.matvec_quant(router, ffn_norm.data())?)?;
     let moe_probs = be.softmax(&moe_logits)?;
     let routing = llamd_models::route(moe_logits.data(), h.n_expert_used)?;
 
@@ -240,19 +240,19 @@ pub fn moe_ffn(
     let up_n = l.ffn_up_exps.as_ref().expect("moe layer");
     let down_n = l.ffn_down_exps.as_ref().expect("moe layer");
 
-    let xt = Tensor::from_slice(&[n_embd], x)?;
     let mut out = vec![0.0f32; n_embd];
 
     for (&e, &w) in routing.experts.iter().zip(&routing.weights) {
         let e = e as usize;
-        let gate = be.matmul(&model.expert(gate_n, e)?, &xt)?;
-        let up = be.matmul(&model.expert(up_n, e)?, &xt)?;
+        let gate = model.matvec_expert_quant(gate_n, e, x)?;
+        let up = model.matvec_expert_quant(up_n, e, x)?;
 
-        let n = gate.elems();
-        let act = be.mul(&be.silu(&gate.reshape(&[n])?)?, &up.reshape(&[n])?)?;
+        let n = gate.len();
+        let gt = Tensor::from_slice(&[n], &gate)?;
+        let act = be.mul(&be.silu(&gt)?, &Tensor::from_slice(&[n], &up)?)?;
 
-        let down = be.matmul(&model.expert(down_n, e)?, &act.reshape(&[n, 1])?)?;
-        for (o, &d) in out.iter_mut().zip(down.data()) {
+        let down = model.matvec_expert_quant(down_n, e, act.data())?;
+        for (o, &d) in out.iter_mut().zip(&down) {
             *o += w * d;
         }
     }
@@ -295,10 +295,10 @@ pub fn forward(
 
     // Models that tie the output projection to the embeddings have no
     // `output.weight`; say which is happening rather than failing obscurely.
-    let out_w = match &model.output {
-        Some(n) => model.tensor(n)?,
-        None => model.tensor(&model.tok_embd)?,
-    };
-    let logits = be.matmul(&out_w, &normed)?;
-    Ok(logits.data().to_vec())
+    // A model that ties output to the embedding table has no `output.weight`.
+    let name = model
+        .output
+        .clone()
+        .unwrap_or_else(|| model.tok_embd.clone());
+    model.matvec_quant(&name, normed.data())
 }

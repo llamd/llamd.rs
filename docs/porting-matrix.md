@@ -16,7 +16,7 @@ inheriting the reference's design would defeat the purpose.
 | # | llama.cpp | lines | LLAMD crate | approach | validated by | status |
 |---|---|---|---|---|---|---|
 | 1 | `ggml/src/gguf.cpp`, `gguf.h` | ~2k | `llamd-gguf` | **Reimplement.** A file format with a written spec; a parser is the natural Rust artifact. Memory-map, zero-copy tensor views. | Parse the real Qwen3-Coder Q6_K; every KV pair and tensor descriptor must equal `gguf_dump` output | `—` |
-| 2 | `ggml-common.h` block structs | ~1k | `llamd-quant` | **Bit-exact obligation.** `block_q6_K` (210 B), `block_q8_0` (34 B), `QK_K=256`. Layout must match byte for byte or every weight is wrong. | `static_assert`-equivalent size tests; dequantize a real tensor and compare against llama.cpp's own dequant, bit for bit | `—` |
+| 2 | `ggml-common.h`, `ggml-quants.c`, `ggml-cpu/quants.c` | ~3k | `llamd-quant` | **Block layouts AND the quantized dot product done.** `block_q6_K` (210 B), `block_q8_0` (34 B), `block_q8_K` (292 B), `quantize_q8_k`, `dot_q6k_q8k`. | Size tests; dequantization checked on real weights; **the dot product agrees with ggml at 1.9e-7** | `ok` |
 | 3 | `src/llama-vocab.cpp` | 4,732 | `llamd-tokenizer` | **BPE done** — gpt2 model, qwen2 pre-tokenizer, byte mapping, merge loop, special tokens, decode. SPM/WPM/UGM deferred. | **24/24 prompts exactly equal to llama.cpp** on the real Qwen3-Coder vocabulary (151,936 tokens). Verified non-vacuous by injecting a whitespace-rule bug and watching it fail. | `ok` |
 | 4 | `src/llama-arch.cpp/.h` | 1,963 | `llamd-models` | **Done for qwen3/qwen3moe.** `Arch` enum, `Hparams` read from GGUF with validation, per-layer tensor naming. Nothing defaulted silently. | All 579 tensors resolve on the real model; shapes checked against what the hyperparameters imply | `ok` |
 | 5 | `src/llama-model.cpp` | 6,842 | `llamd-models` | **Loader done, lazily.** 30.53B params over 579 tensors opened in 73 ms; nothing materialised until asked for, since f32 would be ~122 GiB. One expert extracted in 23 ms without its 127 siblings. | Every named tensor verified present at open; shapes match hparams | `cpu` |
@@ -40,37 +40,38 @@ inheriting the reference's design would defeat the purpose.
 | 23 | `src/llama-adapter.cpp` | — | — | **Out of scope initially.** LoRA/control vectors. | — | `—` |
 | 24 | `src/llama-mmap.cpp` | 905 | `llamd-gguf` | **Reimplement** with `memmap2`. Isolated unsafe, documented. | Large-model load without copying | `—` |
 
-## The limitation that shapes what comes next
+## The limitation that shaped this work — RESOLVED
 
-**An f32 reference cannot match a quantized MoE implementation token-for-token,
-and this is structural rather than a matter of precision.**
+An f32 reference could not match a quantized MoE implementation token-for-token.
+Routing matched llama.cpp exactly through layer 45; at layer 47 the router put
+eight experts within a factor of 2.4, the quantized-path difference flipped the
+selection, and llama.cpp's greedy token ranked **second**, 0.62 logit below ours.
 
-Measured on the real model. Routing weights match llama.cpp exactly through
-layer 45 and closely at 46. At layer 47 the router is nearly uniform:
+**Fixed by performing the same arithmetic.** `llamd-quant::dot_q6k_q8k`
+quantizes activations to Q8_K and runs the integer dot product ggml runs,
+rather than dequantizing weights to f32. Against ggml's own `mul_mat` on Q6_K
+weights it agrees to **1.1e-7 – 1.9e-7**, versus 5.5e-4 for the f32 path.
 
-```text
-  ours    0.1734  0.1547  0.1506  …  0.1102  0.0637  0.0634
-  oracle  0.1782  0.1500  0.1347  …  0.1248  0.0789  0.0738
-```
+Result on the real model:
 
-Eight experts within a factor of 2.4 — a near-tied discrete choice. The
-quantized-path difference (ggml quantizes activations to Q8_K; the reference
-multiplies in f32) is far smaller than the gaps between most experts, but it is
-larger than the gaps here, so the selection flips. A different expert is a
-different model, so the final hidden state and therefore the logits differ.
-llama.cpp's greedy token ranks **second** in ours, 0.62 logit below the top.
+| | f32 reference | quantized path |
+|---|---|---|
+| llama.cpp's token | rank 1, −0.62 | **rank 0** |
+| logit[0] | 7.0420 (oracle 5.9153) | **5.9729** |
+| logit sum gap | 2.95e-2 | **8.2e-3** |
+| time per token | 7.3 s | **3.0 s** |
 
-This is not something a tolerance can fix, and widening one would only hide it.
-The fix is for LLAMD to implement the same quantized dot product — `Q6_K`
-weights against `Q8_K` activations — at which point the comparison becomes
-quantized-against-quantized and token equality is achievable. That work is now
-the highest-value item for `llamd-cpu`, ahead of any GPU kernel: without it,
-no backend can be validated at the token level.
+Faster as well as correct: the quantized path never materialises 23 GiB of f32.
 
-It also says something about MoE models generally that is worth carrying into
-the ROCm work: **routing is discrete, so it amplifies arbitrarily small
-numerical differences into arbitrarily large output differences.** Any backend
-will have to match the quantized path, not merely approximate it.
+**Five prompts now agree with llama.cpp's greedy token**, two of them with
+margins under 0.2 — `"Hi"` at 0.1196 and `"def"` at 0.1946 — which are exactly
+the near-ties the f32 path got wrong.
+
+The general lesson stands for the GPU work: **MoE routing is discrete, so it
+amplifies arbitrarily small numerical differences into arbitrarily large output
+differences.** A ROCm or Vulkan kernel must match the quantized path, not
+approximate it — and it should be compared against ggml at `REDUCTION`, not
+against the f32 reference at `QUANTIZED_MATMUL`.
 
 ## Gaps worth knowing about
 
@@ -83,6 +84,14 @@ Closing it corrected a misreading: `ffn_moe_weights-0` is the gather BEFORE
 normalisation. Comparing our normalised weights against it gave 1.000000 vs
 0.349709 — not a precision failure but two different quantities. The top 8
 experts of 128 hold about 35% of the probability mass.
+
+**Two blind spots in the quantized path, found by trying to break it.**
+Swapping `round_ties_even` for Rust's `round` changes no token and fails no
+oracle comparison — exact .5 values are vanishingly rare in real activations.
+Dropping the negative scale likewise changes nothing here, because `d` is
+`1/iscale` so the sign cancels in the product. Both are still reproduced
+faithfully, and both are covered only by unit tests that ask directly. A
+stage-level property that end-to-end tests cannot see needs its own test.
 
 **The layer comparison uses sums, which a permutation would survive.**
 `eval-callback` truncates the values it prints but sums over the whole tensor,

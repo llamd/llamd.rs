@@ -226,6 +226,97 @@ impl Model {
         Tensor::new(Shape::new(&[d0, d1])?, out)
     }
 
+    /// Matrix-vector product against a QUANTIZED weight, without
+    /// dequantizing it.
+    ///
+    /// This is the path that matches llama.cpp. The f32 reference
+    /// (`tensor()` then `Backend::matmul`) performs different arithmetic, and
+    /// while the difference is tiny it is larger than the gap between
+    /// near-tied MoE experts — so it changes which expert runs, and therefore
+    /// the emitted token. See docs/porting-matrix.md.
+    ///
+    /// Falls back to dequantizing for types without a quantized kernel, so a
+    /// model mixing F32 and Q6_K tensors still runs; the fallback is exact for
+    /// F32 and so costs nothing in fidelity there.
+    pub fn matvec_quant(&self, name: &str, x: &[f32]) -> Result<Vec<f32>> {
+        let info = self.info(name)?;
+        let ty = llamd_quant::QuantType::from_ggml(info.ggml_type)?;
+        let k = info.dims[0] as usize;
+        let rows = info.elems() as usize / k;
+        if x.len() != k {
+            return Err(Error::Shape {
+                expected: vec![k],
+                got: vec![x.len()],
+            });
+        }
+
+        if ty != llamd_quant::QuantType::Q6K {
+            // F32 and F16 weights are exact either way; dequantizing them
+            // introduces nothing. Only the k-quants have a separate path.
+            let w = self.tensor(name)?;
+            return Ok((0..rows)
+                .map(|r| {
+                    let row = &w.data()[r * k..(r + 1) * k];
+                    row.iter().zip(x).map(|(a, b)| a * b).sum()
+                })
+                .collect());
+        }
+
+        let a = llamd_quant::quantize_q8_k(x);
+        let bytes = ty.bytes_for(k)?;
+        let data = self.gguf.tensor_data(info)?;
+        (0..rows)
+            .map(|r| {
+                let row = data
+                    .get(r * bytes..(r + 1) * bytes)
+                    .ok_or_else(|| Error::malformed("matvec", format!("{name} row {r}")))?;
+                Ok(llamd_quant::dot_q6k_q8k(row, &a, k))
+            })
+            .collect()
+    }
+
+    /// The same, for one expert of a 3D expert tensor.
+    pub fn matvec_expert_quant(&self, name: &str, expert: usize, x: &[f32]) -> Result<Vec<f32>> {
+        let info = self.info(name)?;
+        let ty = llamd_quant::QuantType::from_ggml(info.ggml_type)?;
+        if info.dims.len() != 3 || ty != llamd_quant::QuantType::Q6K {
+            // Keep the general path available rather than refusing: a model
+            // with F32 experts is unusual but not wrong.
+            let w = self.expert(name, expert)?;
+            let k = w.row_len();
+            return Ok((0..w.rows())
+                .map(|r| {
+                    w.data()[r * k..(r + 1) * k]
+                        .iter()
+                        .zip(x)
+                        .map(|(a, b)| a * b)
+                        .sum()
+                })
+                .collect());
+        }
+        let (k, rows) = (info.dims[0] as usize, info.dims[1] as usize);
+        if x.len() != k {
+            return Err(Error::Shape {
+                expected: vec![k],
+                got: vec![x.len()],
+            });
+        }
+        let per_expert = ty.bytes_for(k * rows)?;
+        let row_bytes = ty.bytes_for(k)?;
+        let data = self.gguf.tensor_data(info)?;
+        let base = expert * per_expert;
+        let a = llamd_quant::quantize_q8_k(x);
+        (0..rows)
+            .map(|r| {
+                let o = base + r * row_bytes;
+                let row = data
+                    .get(o..o + row_bytes)
+                    .ok_or_else(|| Error::malformed("matvec", format!("{name} e{expert} r{r}")))?;
+                Ok(llamd_quant::dot_q6k_q8k(row, &a, k))
+            })
+            .collect()
+    }
+
     /// Total parameters, counted from the tensor descriptors.
     pub fn n_params(&self) -> u64 {
         self.gguf.tensors.iter().map(|t| t.elems()).sum()

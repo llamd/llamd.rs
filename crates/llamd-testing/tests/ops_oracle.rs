@@ -350,3 +350,89 @@ fn moe_expert_selection_matches_ggml_exactly() {
     }
     eprintln!("  expert selection: 8 of 128 identical to ggml across 4 seeds");
 }
+
+/// The quantized dot product, compared against ggml's own.
+///
+/// This is the comparison that decides whether LLAMD can ever match
+/// llama.cpp at the token level. The f32 reference cannot: it performs
+/// different arithmetic, and on a near-tied MoE routing decision that flips
+/// which expert runs. This path performs the SAME arithmetic, so the bar is
+/// much tighter — `REDUCTION`, not `QUANTIZED_MATMUL`.
+#[test]
+fn quantized_dot_matches_ggml() {
+    if oracle_path().is_none() {
+        skip(
+            "quantized_dot_matches_ggml",
+            "build tools/ggml-oracle first",
+        );
+        return;
+    }
+    use llamd_quant::{Q6K_BLOCK_BYTES, QK_K, dot_q6k_q8k, quantize_q8_k};
+
+    for (blocks, rows, seed) in [(1usize, 1usize, 3u32), (4, 1, 5), (8, 3, 7)] {
+        let n = blocks * QK_K;
+
+        // Deterministic Q6_K bytes. Arbitrary but valid: every field is used,
+        // so a mistake in unpacking shows up rather than cancelling.
+        let mut w = vec![0u8; rows * blocks * Q6K_BLOCK_BYTES];
+        let mut st = seed.wrapping_mul(2654435761).wrapping_add(11);
+        for b in w.iter_mut() {
+            st = st.wrapping_mul(1664525).wrapping_add(1013904223);
+            *b = (st >> 16) as u8;
+        }
+        // The f16 super-block scale must be a sane number, not a random bit
+        // pattern that could be inf or NaN.
+        for r in 0..rows * blocks {
+            let d_off = r * Q6K_BLOCK_BYTES + QK_K / 2 + QK_K / 4 + QK_K / 16;
+            let d = half::f16::from_f32(0.01 + (r as f32) * 0.003);
+            w[d_off..d_off + 2].copy_from_slice(&d.to_bits().to_le_bytes());
+        }
+
+        let x = sample(n, seed.wrapping_add(100));
+        let a = quantize_q8_k(&x);
+
+        let mut ours = Vec::with_capacity(rows);
+        for r in 0..rows {
+            let row = &w[r * blocks * Q6K_BLOCK_BYTES..(r + 1) * blocks * Q6K_BLOCK_BYTES];
+            ours.push(dot_q6k_q8k(row, &a, n));
+        }
+
+        // The oracle takes raw bytes, so the weights go over as-is.
+        let bin = oracle_path().unwrap();
+        let mut c = std::process::Command::new(&bin)
+            .args(["mul_mat_q6k", &n.to_string(), &rows.to_string()])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            let si = c.stdin.as_mut().unwrap();
+            si.write_all(&w).unwrap();
+            for v in &x {
+                si.write_all(&v.to_le_bytes()).unwrap();
+            }
+        }
+        let out = c.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "oracle mul_mat_q6k failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let theirs: Vec<f32> = out
+            .stdout
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+
+        // REDUCTION: the same integer arithmetic in the same order should
+        // agree to within a reordered-summation step. Needing more than this
+        // would mean the quantizer or the unpacking differs.
+        check(
+            &format!("q6k·q8k n{n} rows{rows}"),
+            &ours,
+            &theirs,
+            REDUCTION,
+        );
+    }
+}

@@ -130,36 +130,32 @@ fn full_forward_matches_llama_cpp() {
         );
     }
 
-    // WHAT THIS TEST CAN AND CANNOT ASSERT.
+    // TOKEN EQUALITY, now that the quantized path exists.
     //
-    // It cannot assert logit equality, and the reason is structural rather
-    // than a matter of precision. Routing in this model matches llama.cpp
-    // EXACTLY through layer 45 and closely at 46, then diverges at layer 47 —
-    // where the router is nearly uniform (0.178, 0.150, 0.135, … 0.125,
-    // 0.079, 0.074). A near-tied discrete choice, perturbed by the
-    // quantized-path difference, selects different experts, and a different
-    // expert is a different model.
+    // With the f32 reference this assertion could not have been made: the
+    // different arithmetic flipped a near-tied routing decision at layer 47
+    // and llama.cpp's token ranked SECOND, 0.62 logit below ours. Performing
+    // the same Q6_K x Q8_K arithmetic closes that, and the reference's choice
+    // is now the top of ours.
     //
-    // So an f32 reference cannot be expected to agree token-for-token with a
-    // Q8_K implementation of an MoE model. Closing that needs LLAMD to
-    // implement the same quantized dot product, not a looser tolerance here.
-    //
-    // What is assertable: the pass completes, the shape is right, the values
-    // are finite, and the reference's own top token is near the top of ours
-    // rather than anywhere in 151,936.
+    // The logit SUM still differs by ~8e-3 — f32 rounding in the norms,
+    // softmax and residuals accumulating over 48 layers. That is expected and
+    // is not asserted, because the token is the claim worth making and a sum
+    // is a weak proxy for it.
     let oracle_top = 525u32; // " are" — llama.cpp's greedy choice for "Hi"
     let rank = ranked
         .iter()
         .position(|(t, _)| *t as u32 == oracle_top)
         .expect("the reference's token is not in our ranking at all");
-    assert!(
-        rank < 8,
-        "llama.cpp's token {oracle_top} ranks {rank} in ours — far enough to \
-         indicate a bug rather than a routing tie"
+    assert_eq!(
+        rank, 0,
+        "llama.cpp emits {oracle_top:?} but LLAMD ranks it {rank}; top was {:?}",
+        ranked[0]
     );
     eprintln!(
-        "  llama.cpp's token ranks {rank} here, {:.4} below the top",
-        ranked[0].1 - ranked[rank].1
+        "  argmax agrees with llama.cpp: token {oracle_top} {:?}, {:.4} clear of second",
+        vocab.text_of(oracle_top).unwrap_or("?"),
+        ranked[0].1 - ranked[1].1
     );
-    eprintln!("  (logit sum gap {rel:.3e} — see the note above on why this is not asserted)");
+    eprintln!("  (logit sum gap {rel:.3e}, not asserted — see the note above)");
 }
