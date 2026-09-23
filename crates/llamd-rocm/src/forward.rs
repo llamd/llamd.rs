@@ -100,11 +100,6 @@ impl DevBuf {
         self.ptr as *mut f32
     }
 
-    /// Read-only view, for kernel parameters declared `const float *`.
-    pub(crate) fn as_f32_const(&self) -> *const f32 {
-        self.ptr as *const f32
-    }
-
     pub fn upload_bytes(&self, host: &[u8]) -> Result<()> {
         if host.len() > self.bytes {
             return Err(Error::Shape {

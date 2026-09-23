@@ -478,18 +478,6 @@ impl DeviceModel {
         &self.hp
     }
 
-    /// Quantize the activation in `src` and matvec it against `w`.
-    ///
-    /// Both launches go into the queue; neither waits. The activation is
-    /// quantized ON THE DEVICE, which is what lets the whole token stay here —
-    /// with that conversion on the host every matmul would need a round-trip.
-    fn qmatvec(&self, w: &DevBuf, src: &DevBuf, out: &DevBuf, k: usize, rows: usize) -> Result<()> {
-        let blocks = k / 256;
-        op::quantize(src, &self.s.aq, &self.s.ad, blocks)?;
-        op::matvec(w, &self.s.aq, &self.s.ad, out, blocks, rows)?;
-        Ok(())
-    }
-
     /// Queue one token's worth of work. Does not synchronise.
     ///
     /// Split out from `forward` so graph capture can record exactly this and

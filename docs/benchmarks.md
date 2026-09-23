@@ -976,3 +976,86 @@ and the sweep stays in the test suite so the answer keeps coming from the engine
 An RDNA4-native engine written in Rust is ahead of hipified CUDA at batch 1 and
 batch 2, and within 4–6% at batch 4 and 8 — from 0.004× four commits ago. The
 remaining gap is one identified piece of work, not a mystery.
+
+---
+
+## 13. The Vulkan backend: Vulkan against ROCm on identical hardware
+
+LLAMD now has a second GPU backend, and Vulkan is the default. The reason to
+build it is in §12's shape: the engine had become tightly coupled to one vendor's
+runtime, and the interesting question — whether an AMD-native engine can be
+optimised harder through the vendor-neutral compute API the card exposes — could
+not be asked without a second path.
+
+### It computes the same thing
+
+`shaders/q6k_matvec.comp` implements the identity from §12 over the same planar
+layout the ROCm backend uses. RADV reports
+`integerDotProduct4x8BitPackedUnsignedAccelerated = true`, so
+`dotPacked4x8AccSatEXT` is the hardware instruction, not an emulation.
+
+Validated against `llamd_quant::dot_q6k_q8k` at every block count the model uses
+and every batch width:
+
+| rows × k | blocks | nseq | worst deviation | bound |
+|---|---|---|---|---|
+| 256 × 768 | 3 | 1 | 2.44e-4 | 6.45e-3 |
+| 1024 × 2048 | 8 | 1 | 4.88e-4 | 1.12e-2 |
+| 512 × 4096 | 16 | 1 | 9.77e-4 | 1.55e-2 |
+| 1024 × 2048 | 8 | 4 | 4.88e-4 | 1.15e-2 |
+| 256 × 2048 | 8 | 8 | 4.88e-4 | 1.20e-2 |
+| 7 × 2048 | 8 | 1 | 3.66e-4 | 1.07e-2 |
+
+And against the ROCm backend directly: **worst 9.77e-4 against a 1.17e-2 bound
+over 4096 values.** Each sequence gets a different activation, so a shader that
+used sequence 0's for all of them would fail rather than pass.
+
+### A fairness correction made before reporting any number
+
+The first comparison had Vulkan 2.0–2.7× ahead, and part of that was not the
+backend. Writing the shader made an improvement obvious that the HIP kernel did
+not have: the packed word already holds the four weights in the order the dot
+product wants, so **one mask-and-shift transforms all four at once** where the
+HIP kernel extracted each of sixteen bytes separately — four operations instead
+of sixteen.
+
+That is better code, not a better API, so it was ported back to HIP before
+measuring. It improved ROCm on `expert_down` from 32.5 to ~20 µs.
+
+### The comparison, three runs, same card and same planar bytes
+
+| shape | size | Vulkan µs | ROCm µs | |
+|---|---|---|---|---|
+| `attn_q` [2048→4096] nseq 1 | 6.6 MiB | **7.1 – 7.4** | 28.3 – 29.7 | **Vulkan 3.9 – 4.2×** |
+| `attn_q` [2048→4096] nseq 8 | 6.6 MiB | **19.2 – 19.9** | 35.4 – 43.7 | **Vulkan 1.8 – 2.3×** |
+| `attn_out` [4096→2048] nseq 8 | 6.6 MiB | **18.8** | 32.1 – 34.8 | **Vulkan 1.7 – 1.8×** |
+| `expert_down` ×8 nseq 1 | 9.8 MiB | **13.3 – 13.4** | 19.9 – 22.5 | **Vulkan 1.5 – 1.7×** |
+| `output` [2048→151936] nseq 1 | 243 MiB | 449 – 470 | **422 – 429** | ROCm 1.04 – 1.11× |
+| `output` [2048→151936] nseq 8 | 243 MiB | 626 – 644 | 632 – 642 | parity |
+
+The pattern is consistent and interpretable. **On the one genuinely HBM-bound
+shape the two backends are equivalent** — same memory system, same bytes, and
+neither API changes physics. On the smaller, cache-resident shapes Vulkan is
+1.5–4× faster, plausibly from RADV's wider subgroup (64 against wave32, so one
+subgroup per row costs proportionally less reduction) and its scheduling.
+
+**And the caveat that this repo has earned the hard way applies to both columns:**
+a repeated dispatch over a 6.6 MiB tensor on a card with 64 MB of Infinity Cache
+measures cache bandwidth. §9 and §10 record two optimisations that looked
+excellent under exactly this kind of measurement and were rejected by the engine.
+The shapes above are labelled with their size for that reason, and the
+engine-level verdict is not in yet.
+
+### What is NOT done, stated plainly
+
+**End-to-end inference still runs on ROCm.** The Vulkan backend has *one* of the
+roughly fourteen kernels a token needs — the Q6_K matvec, which is the hardest
+and the one carrying most of the traffic, but one. Norms, RoPE, attention, the
+router, the MoE combine, the argmax and the quantize/bias shaders exist only in
+HIP, so `DeviceModel` is still a ROCm path.
+
+So "Vulkan is the default backend" is true of the selection policy and of the
+kernel that is implemented and validated. It is **not** yet true that a token is
+computed on Vulkan. The honest reading of the table above is *a strong signal on
+the dominant kernel*, and the next increment is the remaining shaders — after
+which a whole-token Vulkan-versus-ROCm number can be put beside llama.cpp's.

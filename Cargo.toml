@@ -15,6 +15,7 @@ members = [
     "crates/llamd-tensor",
     "crates/llamd-cpu",
     "crates/llamd-rocm",
+    "crates/llamd-vulkan",
     "crates/llamd-models",
     "crates/llamd-runtime",
     "crates/llamd-sampling",
@@ -41,6 +42,7 @@ llamd-tokenizer = { path = "crates/llamd-tokenizer" }
 llamd-tensor    = { path = "crates/llamd-tensor" }
 llamd-cpu       = { path = "crates/llamd-cpu" }
 llamd-rocm      = { path = "crates/llamd-rocm" }
+llamd-vulkan    = { path = "crates/llamd-vulkan" }
 llamd-models    = { path = "crates/llamd-models" }
 llamd-runtime   = { path = "crates/llamd-runtime" }
 llamd-sampling  = { path = "crates/llamd-sampling" }

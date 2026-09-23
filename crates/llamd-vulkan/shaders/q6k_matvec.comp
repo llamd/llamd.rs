@@ -1,0 +1,164 @@
+#version 450
+//
+// Planar Q6_K x Q8_K matvec, batched, for Vulkan compute on AMD.
+//
+// THIS IS THE SAME ARITHMETIC as crates/llamd-rocm/kernels/llamd_udot.hip, and
+// deliberately so: the point of a second backend is a comparison on identical
+// hardware, which is only meaningful if both compute the same thing. Both are
+// validated against llamd_quant::dot_q6k_q8k.
+//
+// THE IDENTITY. Q6_K stores w in 0..63 before the -32; Q8_K activations are
+// signed int8 and become unsigned as b = a + 128 (exactly a XOR 0x80). Over a
+// 16-value scale group:
+//
+//   S sc*(w-32)*a = sc * [ S w*b - 128*S w - 32*S b + 32*128*16 ]
+//
+// `S w*b` is dotPacked4x8AccSatEXT per sequence; `S w` is the same instruction
+// against 0x01010101 and is SHARED by every sequence; `S b` is precomputed.
+// RADV reports integerDotProduct4x8BitPackedUnsignedAccelerated = true, so this
+// is the hardware instruction and not an emulation.
+//
+// WHY PLANAR. Four weights pack into a uint only if their value indices are
+// consecutive and share a scale group. ggml's 210-byte interleaved blocks are
+// 2-byte aligned and give neither; the planar repack gives sixteen consecutive
+// indices, which is exactly one scale group. It also lets every load here be a
+// plain uint from an std430 buffer with no byte addressing.
+//
+// PROVENANCE: the Q6_K layout is from llama.cpp / ggml (MIT, (c) 2023-2026 The
+// ggml authors).
+
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256) in;
+
+const int MAX_SEQ = 8;
+
+// The whole planar weight tensor, addressed as uints. Plane offsets arrive as
+// push constants already divided by 4.
+layout(std430, binding = 0) readonly buffer W  { uint  w[];  };
+// Activation, biased to unsigned and packed 4 bytes per uint.
+layout(std430, binding = 1) readonly buffer QB { uint  qb[]; };
+// Per-16 group sums of the biased activation.
+layout(std430, binding = 2) readonly buffer SB { int   sb[]; };
+// Per-block activation scale.
+layout(std430, binding = 3) readonly buffer AD { float ad[]; };
+layout(std430, binding = 4) writeonly buffer O { float outv[]; };
+
+layout(push_constant) uniform Push {
+    uint ql_u;      // plane offsets, in uints
+    uint qh_u;
+    uint sc_u;
+    uint d_u;
+    uint blocks;
+    uint rows;
+    uint nseq;
+    uint row_base;  // first row this dispatch covers
+} pc;
+
+// One int8 scale out of the sc plane.
+int sc_at(uint base_u, uint idx) {
+    uint word = w[base_u + (idx >> 2u)];
+    return bitfieldExtract(int(word), int(8u * (idx & 3u)), 8);
+}
+
+// One f16 super-block scale out of the d plane.
+float d_at(uint base_u, uint idx) {
+    uint word = w[base_u + (idx >> 1u)];
+    vec2 pair = unpackHalf2x16(word);
+    return ((idx & 1u) == 0u) ? pair.x : pair.y;
+}
+
+void main() {
+    // One subgroup per output row. gl_NumSubgroups adapts to whatever subgroup
+    // size the driver gives us, so the shader is correct at wave32 and wave64
+    // and the host only has to match the dispatch to it.
+    uint row = pc.row_base + gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
+    if (row >= pc.rows) return;
+
+    uint blocks = pc.blocks;
+    uint n_u4   = blocks * 8u;          // 128 ql bytes per block / 16
+    uint gper   = blocks * 16u;         // scale groups per row
+    uint aper_u = blocks * 64u;         // activation uints per sequence
+
+    uint ql_row = pc.ql_u + row * blocks * 32u;
+    uint qh_row = pc.qh_u + row * blocks * 16u;
+    uint sc_row = pc.sc_u + row * blocks * 4u;
+
+    float acc[MAX_SEQ];
+    for (int s = 0; s < MAX_SEQ; ++s) acc[s] = 0.0;
+
+    for (uint u = gl_SubgroupInvocationID; u < n_u4; u += gl_SubgroupSize) {
+        uint b   = u >> 3u;
+        uint jb0 = (u & 7u) << 4u;
+        uint h   = jb0 >> 6u;
+        uint m0  = jb0 & 63u;
+        uint shl = (m0 >= 32u) ? 2u : 0u;
+
+        uint q0 = w[ql_row + u * 4u + 0u];
+        uint q1 = w[ql_row + u * 4u + 1u];
+        uint q2 = w[ql_row + u * 4u + 2u];
+        uint q3 = w[ql_row + u * 4u + 3u];
+
+        uint hb = qh_row + b * 16u + h * 8u + ((m0 & 31u) >> 2u);
+        uint h0 = w[hb + 0u], h1 = w[hb + 1u], h2 = w[hb + 2u], h3 = w[hb + 3u];
+
+        // Unpack four weights at a time with whole-word bit operations. The
+        // byte-at-a-time form in the HIP kernel costs sixteen extractions here;
+        // masking the packed word costs four.
+        uint lo0 = (q0 & 0x0F0F0F0Fu) | (((h0 >> shl) & 0x03030303u) << 4u);
+        uint lo1 = (q1 & 0x0F0F0F0Fu) | (((h1 >> shl) & 0x03030303u) << 4u);
+        uint lo2 = (q2 & 0x0F0F0F0Fu) | (((h2 >> shl) & 0x03030303u) << 4u);
+        uint lo3 = (q3 & 0x0F0F0F0Fu) | (((h3 >> shl) & 0x03030303u) << 4u);
+        uint sh4 = shl + 4u;
+        uint hi0 = ((q0 >> 4u) & 0x0F0F0F0Fu) | (((h0 >> sh4) & 0x03030303u) << 4u);
+        uint hi1 = ((q1 >> 4u) & 0x0F0F0F0Fu) | (((h1 >> sh4) & 0x03030303u) << 4u);
+        uint hi2 = ((q2 >> 4u) & 0x0F0F0F0Fu) | (((h2 >> sh4) & 0x03030303u) << 4u);
+        uint hi3 = ((q3 >> 4u) & 0x0F0F0F0Fu) | (((h3 >> sh4) & 0x03030303u) << 4u);
+
+        // S w — independent of the activation, so computed once for all
+        // sequences. This is the register tile.
+        uint swl = dotPacked4x8AccSatEXT(lo0, 0x01010101u, 0u);
+        swl = dotPacked4x8AccSatEXT(lo1, 0x01010101u, swl);
+        swl = dotPacked4x8AccSatEXT(lo2, 0x01010101u, swl);
+        swl = dotPacked4x8AccSatEXT(lo3, 0x01010101u, swl);
+        uint swh = dotPacked4x8AccSatEXT(hi0, 0x01010101u, 0u);
+        swh = dotPacked4x8AccSatEXT(hi1, 0x01010101u, swh);
+        swh = dotPacked4x8AccSatEXT(hi2, 0x01010101u, swh);
+        swh = dotPacked4x8AccSatEXT(hi3, 0x01010101u, swh);
+
+        uint base_u = b * 64u + h * 32u + (m0 >> 2u);   // activation, in uints
+        uint glo = b * 16u + h * 8u + (m0 >> 4u);
+        int  scl = sc_at(sc_row, b * 16u + h * 8u + (m0 >> 4u));
+        int  sch = sc_at(sc_row, b * 16u + h * 8u + (m0 >> 4u) + 4u);
+        float dw = d_at(pc.d_u, row * blocks + b);
+
+        int corr_lo = -128 * int(swl) + 32 * 128 * 16;
+        int corr_hi = -128 * int(swh) + 32 * 128 * 16;
+
+        for (uint s = 0u; s < pc.nseq; ++s) {
+            uint ab = s * aper_u + base_u;
+            uint wbl = dotPacked4x8AccSatEXT(lo0, qb[ab + 0u], 0u);
+            wbl = dotPacked4x8AccSatEXT(lo1, qb[ab + 1u], wbl);
+            wbl = dotPacked4x8AccSatEXT(lo2, qb[ab + 2u], wbl);
+            wbl = dotPacked4x8AccSatEXT(lo3, qb[ab + 3u], wbl);
+            uint abh = ab + 16u;
+            uint wbh = dotPacked4x8AccSatEXT(hi0, qb[abh + 0u], 0u);
+            wbh = dotPacked4x8AccSatEXT(hi1, qb[abh + 1u], wbh);
+            wbh = dotPacked4x8AccSatEXT(hi2, qb[abh + 2u], wbh);
+            wbh = dotPacked4x8AccSatEXT(hi3, qb[abh + 3u], wbh);
+
+            int sbl = sb[s * gper + glo];
+            int sbh = sb[s * gper + glo + 4u];
+            int ilo = scl * (int(wbl) + corr_lo - 32 * sbl);
+            int ihi = sch * (int(wbh) + corr_hi - 32 * sbh);
+            acc[s] += dw * ad[s * blocks + b] * float(ilo + ihi);
+        }
+    }
+
+    for (uint s = 0u; s < pc.nseq; ++s) {
+        float t = subgroupAdd(acc[s]);
+        if (subgroupElect()) outv[s * pc.rows + row] = t;
+    }
+}

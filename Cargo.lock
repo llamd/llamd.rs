@@ -54,6 +54,7 @@ dependencies = [
  "llamd-core",
  "llamd-gguf",
  "llamd-quant",
+ "llamd-runtime",
 ]
 
 [[package]]
@@ -120,6 +121,7 @@ dependencies = [
  "llamd-quant",
  "llamd-rocm",
  "llamd-tensor",
+ "llamd-vulkan",
 ]
 
 [[package]]
@@ -161,6 +163,7 @@ dependencies = [
  "llamd-runtime",
  "llamd-tensor",
  "llamd-tokenizer",
+ "llamd-vulkan",
  "serde_json",
 ]
 
@@ -171,6 +174,14 @@ dependencies = [
  "llamd-core",
  "llamd-gguf",
  "unicode-general-category",
+]
+
+[[package]]
+name = "llamd-vulkan"
+version = "0.1.0"
+dependencies = [
+ "llamd-core",
+ "llamd-quant",
 ]
 
 [[package]]

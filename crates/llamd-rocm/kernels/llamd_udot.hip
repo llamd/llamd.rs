@@ -213,23 +213,23 @@ __device__ __forceinline__ void q6k_udot_lane(
 
         // Pack 16 low and 16 high 6-bit weights into 4 + 4 uint32. Done ONCE
         // and reused by every sequence — this is the register tile.
+        //
+        // WHOLE-WORD, not byte-at-a-time. The first version extracted each of
+        // the sixteen bytes separately: sixteen masks, sixteen shifts, sixteen
+        // ORs per group. Because the packed word already holds the bytes in the
+        // order the dot product wants, the same transform applies to all four at
+        // once — four operations instead of sixteen. This was noticed while
+        // writing the Vulkan shader, where the whole-word form was the obvious
+        // one, and ported back so a Vulkan-versus-ROCm comparison measures the
+        // backend rather than which kernel got the better unpack.
+        const unsigned *qlw = (const unsigned *)&qlv;
+        const unsigned *qhw = (const unsigned *)&qhv;
+        const unsigned shl4 = shl + 4;
         unsigned wlo[4], whi[4];
-        const uint8_t *qlb = (const uint8_t *)&qlv;
-        const uint8_t *qhb = (const uint8_t *)&qhv;
         #pragma unroll
         for (int g = 0; g < 4; ++g) {
-            unsigned pl = 0, ph = 0;
-            #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const int t = g * 4 + j;
-                const int hb = qhb[t];
-                const unsigned lo = (unsigned)((qlb[t] & 0x0F) | (((hb >> shl) & 3) << 4));
-                const unsigned hi = (unsigned)((qlb[t] >> 4) | (((hb >> (shl + 4)) & 3) << 4));
-                pl |= lo << (8 * j);
-                ph |= hi << (8 * j);
-            }
-            wlo[g] = pl;
-            whi[g] = ph;
+            wlo[g] = (qlw[g] & 0x0F0F0F0Fu) | (((qhw[g] >> shl) & 0x03030303u) << 4);
+            whi[g] = ((qlw[g] >> 4) & 0x0F0F0F0Fu) | (((qhw[g] >> shl4) & 0x03030303u) << 4);
         }
 
         // S w, shared by every sequence.
@@ -323,20 +323,13 @@ __device__ __forceinline__ void q6k_udot_lane_tiled(
 
             const uint4 qlv = *(const uint4 *)(ql_row + (size_t)u * 16);
             const uint4 qhv = *(const uint4 *)(qh_row + (size_t)b * 64 + h * 32 + (m0 & 31));
-            const uint8_t *qlb = (const uint8_t *)&qlv;
-            const uint8_t *qhb = (const uint8_t *)&qhv;
+            const unsigned *qlw = (const unsigned *)&qlv;
+            const unsigned *qhw = (const unsigned *)&qhv;
+            const unsigned shl4 = shl + 4;
             #pragma unroll
             for (int g = 0; g < 4; ++g) {
-                unsigned pl = 0, ph = 0;
-                #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    const int t = g * 4 + j;
-                    const int hb = qhb[t];
-                    pl |= (unsigned)((qlb[t] & 0x0F) | (((hb >> shl) & 3) << 4)) << (8 * j);
-                    ph |= (unsigned)((qlb[t] >> 4) | (((hb >> (shl + 4)) & 3) << 4)) << (8 * j);
-                }
-                wlo[r][g] = pl;
-                whi[r][g] = ph;
+                wlo[r][g] = (qlw[g] & 0x0F0F0F0Fu) | (((qhw[g] >> shl) & 0x03030303u) << 4);
+                whi[r][g] = ((qlw[g] >> 4) & 0x0F0F0F0Fu) | (((qhw[g] >> shl4) & 0x03030303u) << 4);
             }
             unsigned a = 0, c = 0;
             #pragma unroll
@@ -667,6 +660,54 @@ void llamd_u_grouped_pa(const void *base, const size_t *off, const int32_t *ids,
                        0, ustream(), (const uint8_t *)base,
                        off[0], off[1], off[2], off[3], ids, qb, sb, ad, out,
                        blocks, rows, n_used, nseq);
+}
+
+// Kernel-only timing for the udot matvec, so the Vulkan and ROCm backends can
+// be compared with the same discipline: upload once, dispatch `iters` times with
+// nothing between, one synchronise at the end.
+int llamd_u_matvec_bench(const void *base, const size_t *off,
+                         const int8_t *h_qs, const float *h_ad,
+                         int blocks, int rows, int nseq, int iters, float *ms_out)
+{
+    const size_t qbytes = (size_t)nseq * blocks * QK_K;
+    const size_t gbytes = (size_t)nseq * blocks * (QK_K / 16) * sizeof(int32_t);
+    const size_t abytes = (size_t)nseq * blocks * sizeof(float);
+    const size_t obytes = (size_t)nseq * rows * sizeof(float);
+    int8_t *d_qs=nullptr; uint8_t *d_qb=nullptr; int32_t *d_sb=nullptr;
+    float *d_ad=nullptr, *d_out=nullptr;
+    hipEvent_t t0, t1;
+    int rc = -1;
+    if (hipMalloc((void**)&d_qs, qbytes) != hipSuccess) goto out;
+    if (hipMalloc((void**)&d_qb, qbytes) != hipSuccess) goto out;
+    if (hipMalloc((void**)&d_sb, gbytes) != hipSuccess) goto out;
+    if (hipMalloc((void**)&d_ad, abytes) != hipSuccess) goto out;
+    if (hipMalloc((void**)&d_out, obytes) != hipSuccess) goto out;
+    if (hipMemcpy(d_qs, h_qs, qbytes, hipMemcpyHostToDevice) != hipSuccess) goto out;
+    if (hipMemcpy(d_ad, h_ad, abytes, hipMemcpyHostToDevice) != hipSuccess) goto out;
+    hipLaunchKernelGGL(uk_bias_sums, dim3(nseq*blocks), dim3(QK_K), 0, 0,
+                       d_qs, d_qb, d_sb, nseq*blocks);
+    if (hipDeviceSynchronize() != hipSuccess) goto out;
+    if (hipEventCreate(&t0) != hipSuccess) goto out;
+    if (hipEventCreate(&t1) != hipSuccess) goto out;
+    hipLaunchKernelGGL(uk_matvec, dim3((rows + UROWS - 1) / UROWS), dim3(WAVE * UWAVES),
+                       0, 0, (const uint8_t *)base, off[0], off[1], off[2], off[3],
+                       d_qb, d_sb, d_ad, d_out, blocks, rows, nseq);
+    if (hipDeviceSynchronize() != hipSuccess) goto out;
+    (void)hipEventRecord(t0, 0);
+    for (int i = 0; i < iters; ++i) {
+        hipLaunchKernelGGL(uk_matvec, dim3((rows + UROWS - 1) / UROWS), dim3(WAVE * UWAVES),
+                           0, 0, (const uint8_t *)base, off[0], off[1], off[2], off[3],
+                           d_qb, d_sb, d_ad, d_out, blocks, rows, nseq);
+    }
+    (void)hipEventRecord(t1, 0);
+    if (hipEventSynchronize(t1) != hipSuccess) goto out;
+    if (hipGetLastError() != hipSuccess) goto out;
+    if (hipEventElapsedTime(ms_out, t0, t1) != hipSuccess) goto out;
+    rc = 0;
+out:
+    if(d_qs)(void)hipFree(d_qs); if(d_qb)(void)hipFree(d_qb); if(d_sb)(void)hipFree(d_sb);
+    if(d_ad)(void)hipFree(d_ad); if(d_out)(void)hipFree(d_out);
+    return rc;
 }
 
 // Host-in, host-out rms_norm + quantize, for the same reason.

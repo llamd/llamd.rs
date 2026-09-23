@@ -149,3 +149,74 @@ GGUF layout, numerical procedures — carries a file-header attribution naming t
 upstream file and the revision it was derived from. See
 [provenance.md](provenance.md). The vendored clone is a git checkout, not a
 copy: it is excluded from LLAMD's own history.
+
+---
+
+## Backends: Vulkan first, ROCm capable, CPU as the reference
+
+**Vulkan is the default GPU compute path.** It is the API this class of AMD card
+exposes natively through RADV, it is vendor-neutral, and on gfx1201 it provides
+everything the ROCm path relies on — verified by query, not assumed:
+
+| feature | gfx1201 via RADV |
+|---|---|
+| `integerDotProduct4x8BitPackedUnsignedAccelerated` | **true** — the `udot4` equivalent, in hardware |
+| `shaderInt8`, `storageBuffer8BitAccess` | true |
+| subgroup arithmetic / ballot / shuffle | true |
+| `subgroupSizeControl`, `computeFullSubgroups` | true |
+| device-local heap | 31.75 GiB |
+| compute-only queue family | present |
+| `VK_KHR_cooperative_matrix` | present (unused so far) |
+
+So choosing Vulkan as primary costs no arithmetic, and it lets the kernels and
+memory strategy be tuned hard for one vendor's hardware without binding the
+engine to that vendor's runtime.
+
+**ROCm remains fully supported** — a selectable execution path and the
+benchmarking reference. Both backends implement the *same identity* over the
+*same planar layout* and are validated against the *same scalar reference*, so a
+comparison between them on identical hardware measures the backend rather than
+the algorithm.
+
+**CPU is the fallback and the correctness reference.** It is the path that agrees
+with llama.cpp token for token, and every device kernel is held to it.
+
+### Selection
+
+`llamd_runtime::backend` — `Vulkan`, then `Rocm`, then `Cpu`, first available
+wins. `LLAMD_BACKEND=vulkan|rocm|cpu` overrides.
+
+An explicit request that is unavailable is an **error, not a silent downgrade**.
+Someone who asked for ROCm in order to benchmark it, and silently got Vulkan,
+would publish a number labelled with the wrong backend. `select_from` is pure so
+the policy is testable without mutating the environment — which this crate could
+not do anyway, being `#![forbid(unsafe_code)]`.
+
+```
+  vulkan  AMD Radeon AI PRO R9700 (RADV GFX1201) via radv Mesa 26.0.8 — 31.75 GiB, subgroup 64  <- selected
+  rocm    AMD Radeon AI PRO R9700 — 31.86 GiB, 32 WGPs (64 CUs), wave32, gfx1201
+  cpu     scalar reference, always available
+```
+
+### What stays backend-agnostic, and what deliberately does not
+
+Backend-agnostic, and unchanged by adding Vulkan: GGUF parsing (`llamd-gguf`),
+the quantization formats and scalar reference (`llamd-quant`), hyperparameters
+and model description (`llamd-models`), tensor shapes (`llamd-tensor`), the
+tokenizer, sampling, and the decode loop's structure.
+
+**Not abstracted, on purpose:** the device operation set. A single trait over
+both APIs would force each backend to the shape of the other, and the point of a
+Vulkan-first design is that Vulkan-specific kernels, descriptor strategies and
+memory layouts can be optimised aggressively. Each backend crate owns its own op
+surface; what they share is the planar data layout and the arithmetic, which is
+what makes them comparable.
+
+### No new dependencies
+
+The workspace policy is that the numerical path carries none. The Vulkan host is
+therefore C++ behind a small C API with a thin safe Rust wrapper — exactly the
+shape `llamd-rocm` already had — and the SPIR-V is compiled by `build.rs` with
+`glslc` and embedded in the library. `llamd-vulkan` adds zero crates, and builds
+to a stub that reports unavailability when the toolchain is absent, so
+`cargo build --workspace` still works on a machine with no GPU.

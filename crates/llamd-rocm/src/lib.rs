@@ -752,6 +752,54 @@ impl PlanarWeights {
         }
     }
 
+    /// Kernel-only milliseconds for `iters` udot launches, matching the Vulkan
+    /// backend's timing discipline so the two are comparable.
+    pub fn bench_udot(
+        &self,
+        acts: &[llamd_quant::BlockQ8K],
+        nseq: usize,
+        iters: u32,
+    ) -> Result<f32> {
+        if nseq == 0 || acts.len() != self.blocks * nseq || iters == 0 {
+            return Err(Error::malformed("udot bench args", "invalid"));
+        }
+        let mut qs = Vec::with_capacity(acts.len() * llamd_quant::QK_K);
+        let mut ad = Vec::with_capacity(acts.len());
+        for b in acts {
+            qs.extend_from_slice(&b.qs);
+            ad.push(b.d);
+        }
+        #[cfg(not(rocm))]
+        {
+            let _ = (qs, ad);
+            Err(Error::unsupported("rocm", "not built with ROCm support"))
+        }
+        #[cfg(rocm)]
+        {
+            let mut ms = 0.0f32;
+            let _guard = SCRATCH.lock().expect("scratch mutex");
+            // SAFETY: as `matvec_udot`; buffers sized from blocks*nseq and rows.
+            #[allow(unsafe_code)]
+            let rc = unsafe {
+                crate::udot::ffi::llamd_u_matvec_bench(
+                    self.buf.ptr(),
+                    self.off.as_ptr(),
+                    qs.as_ptr(),
+                    ad.as_ptr(),
+                    self.blocks as i32,
+                    self.rows as i32,
+                    nseq as i32,
+                    iters as i32,
+                    &mut ms,
+                )
+            };
+            if rc != 0 {
+                return Err(Error::other("HIP udot bench failed"));
+            }
+            Ok(ms)
+        }
+    }
+
     /// Kernel-only milliseconds for `iters` planar launches.
     pub fn bench(&self, act: &[llamd_quant::BlockQ8K], iters: u32) -> Result<f32> {
         if act.len() != self.blocks || iters == 0 {

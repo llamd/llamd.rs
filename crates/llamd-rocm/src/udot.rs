@@ -111,6 +111,18 @@ pub(crate) mod ffi {
             sb: *mut i32,
             d: *mut f32,
         ) -> c_int;
+        #[allow(clippy::too_many_arguments)]
+        pub fn llamd_u_matvec_bench(
+            base: *const c_void,
+            off: *const usize,
+            qs: *const i8,
+            ad: *const f32,
+            blocks: c_int,
+            rows: c_int,
+            nseq: c_int,
+            iters: c_int,
+            ms_out: *mut f32,
+        ) -> c_int;
         pub fn llamd_u_quantize_host(
             x: *const f32,
             nblocks: c_int,

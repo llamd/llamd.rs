@@ -5,6 +5,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod backend;
+pub use backend::Backend;
 pub mod device;
 pub use device::DeviceModel;
 pub mod attention;

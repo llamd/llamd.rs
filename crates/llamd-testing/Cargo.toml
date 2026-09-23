@@ -16,6 +16,7 @@ serde_json.workspace = true
 
 [dev-dependencies]
 llamd-rocm.workspace = true
+llamd-vulkan.workspace = true
 half.workspace = true
 llamd-runtime.workspace = true
 llamd-models.workspace = true

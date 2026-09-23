@@ -1,0 +1,13 @@
+[package]
+name         = "llamd-vulkan"
+description  = "The Vulkan compute backend: the primary GPU path on AMD hardware."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[dependencies]
+llamd-core.workspace  = true
+llamd-quant.workspace = true
