@@ -110,7 +110,7 @@ Against the scalar CPU reference, on the real projection shapes:
   attn_out    [4096→2048]      0.175 ms    38.8x     39.3 GB/s
   expert_gate [2048→768]       0.173 ms     6.8x      7.5 GB/s
   expert_down [768→2048]       0.166 ms     7.1x      7.8 GB/s
-  output      [2048→151936]    1.430 ms   180.1x    178.5 GB/s
+  output      [2048→151936]    0.823 ms   252.0x    310.1 GB/s
 ```
 
 **A floor of ~0.16 ms remains** on every small shape — launch plus
@@ -132,19 +132,32 @@ llama.cpp built with `GGML_HIP=ON` for gfx1201, on this card:
     tg32    73.04 ±  11.23 t/s
 ```
 
-**LLAMD has no end-to-end number to set against that yet.** The GPU kernel is
-validated but is not wired into the forward pass, which still runs on the CPU
-reference at ~3.0 s/token — about 0.33 t/s. Quoting the kernel speedups as
-though they were a comparison with llama.cpp would be dishonest: they are
-measured against a deliberately unoptimised path.
+A live `llama-server` on the same card, configured as a user would run one
+(98304-token context, `-ctk q8_0 -ctv q8_0 -fa on`), measures **57.7 t/s**
+instead. The bar depends on configuration, so both are recorded.
+
+**LLAMD has no end-to-end GPU number to set against that yet.** The GPU kernel
+is validated but is not wired into the forward pass, which runs on the CPU
+reference at **2.755 s/token — 0.363 t/s**, now measured end to end by
+`llamd-testing/tests/throughput.rs` rather than inferred from a single forward.
+For scale, llama.cpp on the same CPU with 12 threads reaches 0.75 t/s: the
+single-threaded scalar reference is within ~2× of it on one twelfth of the
+cores. Quoting the kernel speedups as though they were a comparison with
+llama.cpp would still be dishonest — they are measured against that
+deliberately unoptimised path.
 
 What the kernel bandwidth does say is more useful. A MoE token touches roughly
-2.5 GiB of active weights, so at the 178 GB/s measured on the output
-projection the arithmetic alone would permit **~66 t/s** — the same order as
-the reference's 73. **The kernel is not the bottleneck; the missing
-integration is.** That makes the next step concrete rather than speculative:
-hold weights resident across the whole model, run the forward pass on the
-device, and only then is there a number that tests the premise.
+2.5 GiB of active weights, so at the **310–319 GB/s** measured on the output
+projection the arithmetic alone would permit **~118 t/s — 1.6× the reference's
+73**. (An earlier figure of 178 GB/s here was a hardcoded constant that had
+drifted from what the benchmark measured; it now prints the measurement.)
+**The kernel is not the bottleneck; the missing integration is.** That makes
+the next step concrete rather than speculative: hold weights resident across the
+whole model, run the forward pass on the device, and only then is there a number
+that tests the premise.
+
+Full methodology, the live token-agreement re-derivation, and the near-tie
+experiment that shows why the tolerance discipline matters: **[benchmarks.md](benchmarks.md)**.
 
 ## Gaps worth knowing about
 

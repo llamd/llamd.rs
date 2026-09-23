@@ -17,3 +17,7 @@ models/
 .env
 *.log
 .state/
+
+# rumima working files: history snapshots and the open-map lock
+*.rmmx.d/
+*.rmmx.lock
