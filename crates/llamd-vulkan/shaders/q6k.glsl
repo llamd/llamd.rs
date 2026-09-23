@@ -15,6 +15,7 @@
 // a near-tied expert and change the emitted token.
 //
 // WB   the weight buffer (uint[])
+// QLU/QHU/SCU/DU  that buffer's four plane offsets, in uints
 // RI   the row's flat block index, i.e. row*blocks (or expert_row*blocks)
 // AQ   activation base, in uints
 // AS   activation group-sum base
@@ -30,13 +31,21 @@
 // one field for both meanings is how the row-space bound and the accumulation
 // loop end up disagreeing.
 //
-// Requires pc.ql_u/qh_u/sc_u/d_u (plane offsets in uints) and pc.blocks.
-#define Q6K_ACC(WB, RI, AQ, AS, AA, NS, ACC)                                   \
+// THE PLANE OFFSETS ARE PARAMETERS, not pc fields. The fused Q/K/V shader binds
+// three different weight tensors, each with its own offsets; reading pc.ql_u
+// would silently use Q's planes for K and V and produce fluent, wrong output.
+//
+// The scale and super-scale reads are inlined for the same reason: as functions
+// they closed over the global `w`, which is only correct when there is one
+// weight buffer.
+//
+// Requires pc.blocks.
+#define Q6K_ACC(WB, QLU, QHU, SCU, DU, RI, AQ, AS, AA, NS, ACC)                \
 {                                                                              \
     uint _nu4 = pc.blocks * 8u;                                                \
-    uint _qlr = pc.ql_u + (RI) * 32u;                                          \
-    uint _qhr = pc.qh_u + (RI) * 16u;                                          \
-    uint _scr = pc.sc_u + (RI) * 4u;                                           \
+    uint _qlr = (QLU) + (RI) * 32u;                                            \
+    uint _qhr = (QHU) + (RI) * 16u;                                            \
+    uint _scr = (SCU) + (RI) * 4u;                                             \
     for (uint _u = gl_SubgroupInvocationID; _u < _nu4; _u += gl_SubgroupSize) { \
         uint _b = _u >> 3u;                                                    \
         uint _j = (_u & 7u) << 4u;                                             \
@@ -73,9 +82,15 @@
         _swh = dotPacked4x8AccSatEXT(_i3, 0x01010101u, _swh);                   \
         uint _bu = _b * 64u + _h * 32u + (_m >> 2u);                             \
         uint _g  = _b * 16u + _h * 8u + (_m >> 4u);                              \
-        int _scl = sc_at(_scr, _b * 16u + _h * 8u + (_m >> 4u));                 \
-        int _sch = sc_at(_scr, _b * 16u + _h * 8u + (_m >> 4u) + 4u);            \
-        float _dw = d_at(pc.d_u, (RI) + _b);                                     \
+        uint _si = _b * 16u + _h * 8u + (_m >> 4u);                              \
+        int _scl = bitfieldExtract(int(WB[_scr + (_si >> 2u)]),                  \
+                                   int(8u * (_si & 3u)), 8);                     \
+        uint _sj = _si + 4u;                                                     \
+        int _sch = bitfieldExtract(int(WB[_scr + (_sj >> 2u)]),                  \
+                                   int(8u * (_sj & 3u)), 8);                     \
+        uint _di = (DU) + (((RI) + _b) >> 1u);                                   \
+        vec2 _dp = unpackHalf2x16(WB[_di]);                                      \
+        float _dw = ((((RI) + _b) & 1u) == 0u) ? _dp.x : _dp.y;                  \
         int _cl = -128 * int(_swl) + 32 * 128 * 16;                              \
         int _ch = -128 * int(_swh) + 32 * 128 * 16;                              \
         for (uint _s = 0u; _s < uint(NS); ++_s) {                                 \
@@ -98,15 +113,8 @@
     }                                                                            \
 }
 
-// One int8 group scale out of the sc plane.
-int sc_at(uint base_u, uint idx) {
-    uint word = w[base_u + (idx >> 2u)];
-    return bitfieldExtract(int(word), int(8u * (idx & 3u)), 8);
-}
-
-// One f16 super-block scale out of the d plane.
-float d_at(uint base_u, uint idx) {
-    uint word = w[base_u + (idx >> 1u)];
-    vec2 pair = unpackHalf2x16(word);
-    return ((idx & 1u) == 0u) ? pair.x : pair.y;
-}
+// NOTE. The `sc_at` / `d_at` helpers that used to live here closed over a global
+// `w`, which is only correct when a shader has exactly one weight buffer. The
+// fused Q/K/V dispatch has three, so the macro above inlines those reads against
+// its WB parameter instead. `embed.comp` is the only shader that still wants them
+// as functions and declares them itself.

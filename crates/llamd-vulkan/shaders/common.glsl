@@ -16,7 +16,18 @@
 // (MIT, (c) 2023-2026 The ggml authors).
 
 #define QK_K 256
-#define MAX_SEQ 8
+// The widest tile the shaders' accumulator arrays are sized for.
+//
+// It bounds two different things: how many independent sequences decode together,
+// and how many tokens of one prompt prefill together. The second is what makes it
+// worth raising — prefill shares a weight read across the whole tile, so 32
+// shares four times as much as 8.
+//
+// The cost is registers: `float acc[MAX_SEQ]` per invocation, indexed by a loop
+// bound that is a push constant, so the compiler cannot unroll and the array may
+// land in scratch. Whether raising it pays is therefore a question for the
+// engine, not for arithmetic — measured in vulkan_prefill.rs.
+#define MAX_SEQ 32
 #define WG 256
 
 // Q8_K quantization, shared by the two shaders that produce activations.

@@ -21,6 +21,10 @@
 
 #![deny(unsafe_code)]
 
+/// The widest tile the shaders' accumulator arrays are sized for — must match
+/// `MAX_SEQ` in `shaders/common.glsl`, asserted by `max_seq_matches_the_shaders`.
+pub const MAX_SEQ: usize = 32;
+
 pub mod ops;
 pub use ops::{Pipeline, Push, begin, end_and_wait, subgroup_size};
 
@@ -361,7 +365,7 @@ impl PlanarWeights {
         nseq: usize,
         iters: usize,
     ) -> Result<()> {
-        if nseq == 0 || nseq > 8 {
+        if nseq == 0 || nseq > MAX_SEQ {
             return Err(Error::malformed("vulkan matvec", format!("nseq {nseq}")));
         }
         if out.bytes() < self.rows * nseq * 4 {

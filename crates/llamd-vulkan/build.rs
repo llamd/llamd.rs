@@ -14,6 +14,7 @@ use std::process::Command;
 /// `pipeline_ids_match_the_build_order` asserts it.
 const SHADERS: &[&str] = &[
     "q6k_matvec",
+    "q6k_x3",
     "q6k_grouped",
     "q6k_grouped_pa",
     "matvec_f32",

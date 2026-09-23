@@ -76,6 +76,16 @@ pub struct VulkanModel {
     max_seq: usize,
     s: Scratch,
     weight_bytes: usize,
+    /// Tokens per prefill pass. Defaults to `max_seq`; smaller trades weight
+    /// sharing for registers, and which wins is measured rather than argued.
+    pub prefill_tile: usize,
+    /// Issue Q, K and V as one dispatch rather than three.
+    ///
+    /// Switchable so the two can be A/B'd IN ONE PROCESS. Comparing across
+    /// separate runs is how this project twice accepted a change that
+    /// measurement later rejected: run-to-run drift on this card is larger than
+    /// the effect being looked for.
+    pub fuse_qkv: bool,
 }
 
 const ARGMAX_CHUNKS: usize = 512;
@@ -115,7 +125,7 @@ impl VulkanModel {
                 "only MoE models are wired up",
             ));
         }
-        if max_kv == 0 || max_seq == 0 || max_seq > 8 {
+        if max_kv == 0 || max_seq == 0 || max_seq > llamd_vulkan::MAX_SEQ {
             return Err(Error::malformed(
                 "vulkan model",
                 format!("max_kv {max_kv}, max_seq {max_seq}"),
@@ -257,6 +267,8 @@ impl VulkanModel {
             max_seq,
             s,
             weight_bytes,
+            prefill_tile: max_seq,
+            fuse_qkv: true,
         })
     }
 
@@ -266,10 +278,30 @@ impl VulkanModel {
 
     /// One pass over `nseq` independent sequences, returning a token each.
     pub fn forward_batch(&mut self, tokens: &[u32], positions: &[usize]) -> Result<Vec<u32>> {
+        let kv_dim = self.hp.kv_dim();
+        let stride = self.max_kv * kv_dim;
+        self.run(tokens, positions, stride, true)?
+            .ok_or_else(|| Error::other("no logits produced"))
+    }
+
+    /// The shared engine behind `forward_batch` and `prefill`.
+    ///
+    /// `kv_stride` is the distance between one slot's cache slice and the next:
+    /// `max_kv * kv_dim` for independent sequences, 0 for prefill where the slots
+    /// are positions in one sequence. `want_logits` false skips the final norm,
+    /// the output projection and the argmax, which is what makes a non-final
+    /// prefill tile cheap.
+    fn run(
+        &mut self,
+        tokens: &[u32],
+        positions: &[usize],
+        kv_stride: usize,
+        want_logits: bool,
+    ) -> Result<Option<Vec<u32>>> {
         let nseq = tokens.len();
         if nseq == 0 || nseq != positions.len() || nseq > self.max_seq {
             return Err(Error::malformed(
-                "vulkan forward",
+                "vulkan run",
                 format!(
                     "{nseq} tokens, {} positions, max {}",
                     positions.len(),
@@ -329,9 +361,26 @@ impl VulkanModel {
                     n_embd,
                     nseq,
                 )?;
-                ops::matvec(&l.attn_q, &s.qb, &s.sb, &s.ad, &s.q, n_head * hd, nseq)?;
-                ops::matvec(&l.attn_k, &s.qb, &s.sb, &s.ad, &s.k, kv_dim, nseq)?;
-                ops::matvec(&l.attn_v, &s.qb, &s.sb, &s.ad, &s.v, kv_dim, nseq)?;
+                // ONE dispatch for all three, or three — measured, not assumed.
+                // Separately they are 1024, 128 and 128 workgroups; fused, the
+                // row space is 5120 so K and V fill the card alongside Q, and
+                // two compute barriers disappear. The same change was worth 23%
+                // on the ROCm side.
+                if self.fuse_qkv {
+                    ops::matvec_x3(
+                        (&l.attn_q, &l.attn_k, &l.attn_v),
+                        &s.qb,
+                        &s.sb,
+                        &s.ad,
+                        (&s.q, &s.k, &s.v),
+                        (n_head * hd, kv_dim, kv_dim),
+                        nseq,
+                    )?;
+                } else {
+                    ops::matvec(&l.attn_q, &s.qb, &s.sb, &s.ad, &s.q, n_head * hd, nseq)?;
+                    ops::matvec(&l.attn_k, &s.qb, &s.sb, &s.ad, &s.k, kv_dim, nseq)?;
+                    ops::matvec(&l.attn_v, &s.qb, &s.sb, &s.ad, &s.v, kv_dim, nseq)?;
+                }
 
                 // QK-norm then RoPE, then the cache, then attend.
                 ops::norm_rope(
@@ -357,6 +406,7 @@ impl VulkanModel {
                     nseq,
                     fb,
                     eps,
+                    kv_stride,
                 )?;
                 ops::attention(
                     &s.q,
@@ -370,6 +420,7 @@ impl VulkanModel {
                     hd,
                     max_kv,
                     nseq,
+                    kv_stride,
                 )?;
 
                 ops::quantize(&s.attn, &s.qb, &s.sb, &s.ad, ((n_head * hd) / 256) * nseq)?;
@@ -480,16 +531,72 @@ impl VulkanModel {
         queued?;
         submitted?;
 
+        if !want_logits {
+            return Ok(None);
+        }
         let mut got = vec![0i32; nseq];
-        s.out_token.download_i32(&mut got)?;
+        self.s.out_token.download_i32(&mut got)?;
         let mut out = Vec::with_capacity(nseq);
         for (i, &g) in got.iter().enumerate() {
-            if g < 0 || g as usize >= hp.n_vocab {
-                return Err(Error::other(format!("sequence {i} argmax returned {g}")));
+            if g < 0 || g as usize >= self.hp.n_vocab {
+                return Err(Error::other(format!("slot {i} argmax returned {g}")));
             }
             out.push(g as u32);
         }
-        Ok(out)
+        Ok(Some(out))
+    }
+
+    /// Process `tokens` of ONE sequence in tiles, returning the token that
+    /// follows them.
+    ///
+    /// WHY THIS EXISTS, and it is the gap that mattered most. `forward_batch`
+    /// decodes independent sequences; a prompt is not that. Without prefill a
+    /// 512-token prompt had to be fed one token at a time, reading the whole
+    /// 2.485 GB of active weights for every one of them — 4.5 s against
+    /// llama.cpp's 0.31 s. Decode speed is irrelevant if ingesting the prompt
+    /// costs fourteen times more.
+    ///
+    /// PREFILL IS BATCHING WITH A SHARED CACHE. The layer loop is the same code:
+    /// every token multiplies the same weights, so one read serves the whole
+    /// tile. The single difference is that the slots are POSITIONS IN ONE
+    /// SEQUENCE rather than separate streams, so they share the KV cache —
+    /// expressed as `kv_stride = 0`.
+    ///
+    /// CAUSALITY NEEDS NO MASK. Each slot's `n_kv` is its own position plus one,
+    /// so token i reads exactly positions 0..pos_i. Every slot writes its K and V
+    /// before the attention dispatch — the barrier between them guarantees it —
+    /// so what token i reads is the earlier tokens of the same tile.
+    ///
+    /// Returns the argmax of the LAST token, which is the first token to generate.
+    pub fn prefill(&mut self, tokens: &[u32], base_pos: usize) -> Result<u32> {
+        if tokens.is_empty() {
+            return Err(Error::malformed("prefill", "no tokens"));
+        }
+        if base_pos + tokens.len() > self.max_kv {
+            return Err(Error::malformed(
+                "prefill",
+                format!(
+                    "{} tokens from {base_pos} exceeds the {} allocated",
+                    tokens.len(),
+                    self.max_kv
+                ),
+            ));
+        }
+        let tile = self.prefill_tile.clamp(1, self.max_seq);
+        let mut last = None;
+        for (chunk, toks) in tokens.chunks(tile).enumerate() {
+            let start = base_pos + chunk * tile;
+            let positions: Vec<usize> = (0..toks.len()).map(|i| start + i).collect();
+            // Only the final tile needs logits: the output projection is 255 MB,
+            // 10% of a token's traffic, and every earlier token's logits are
+            // discarded. Skipping it on the other tiles is free correctness.
+            let is_last = start + toks.len() == base_pos + tokens.len();
+            let out = self.run(toks, &positions, 0, is_last)?;
+            if is_last {
+                last = out.map(|v| v[toks.len() - 1]);
+            }
+        }
+        last.ok_or_else(|| Error::other("prefill produced no logits"))
     }
 
     /// The logits for the last pass, copied back. For comparing against the CPU

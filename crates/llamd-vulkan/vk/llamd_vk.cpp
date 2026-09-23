@@ -296,8 +296,11 @@ int llamd_vk_init() {
     fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     if (vkCreateFence(g.dev, &fi, nullptr, &g.fence) != VK_SUCCESS) return -1;
 
-    VkDescriptorSetLayoutBinding binds[8]{};
-    for (int i = 0; i < 8; ++i) {
+    // TWELVE bindings, not eight. The fused Q/K/V dispatch needs three weight
+    // buffers, three activation buffers and three outputs; eight was an
+    // arbitrary first choice and the device allows 8388606 per stage.
+    VkDescriptorSetLayoutBinding binds[12]{};
+    for (int i = 0; i < 12; ++i) {
         binds[i].binding = (uint32_t)i;
         binds[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         binds[i].descriptorCount = 1;
@@ -305,7 +308,7 @@ int llamd_vk_init() {
     }
     VkDescriptorSetLayoutCreateInfo dli{};
     dli.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dli.bindingCount = 8;
+    dli.bindingCount = 12;
     dli.pBindings = binds;
     // PUSH DESCRIPTORS: the buffer handles travel inside the command buffer, so
     // there is no pool, no set allocation and nothing to recycle between
@@ -317,7 +320,9 @@ int llamd_vk_init() {
     VkPushConstantRange pcr{};
     pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     pcr.offset = 0;
-    pcr.size = 16 * sizeof(uint32_t);   // 64 bytes; the device guarantees 128
+    // 128 bytes: three sets of four plane offsets plus shapes do not fit in 64.
+    // The Vulkan minimum guarantee is 128 and this device reports 256.
+    pcr.size = 32 * sizeof(uint32_t);
     VkPipelineLayoutCreateInfo pli{};
     pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     pli.setLayoutCount = 1;
@@ -446,11 +451,11 @@ int llamd_vk_dispatch(int pipe, void *const *bufs, int nbuf,
 {
     if (!g.ok || !g.recording) return -1;
     if (pipe < 0 || pipe >= llamd_vk_pipeline_count()) return -1;
-    if (nbuf < 0 || nbuf > 8) return -1;
+    if (nbuf < 0 || nbuf > 12) return -1;
     if (gx == 0 || gy == 0) return 0;          // nothing to do, not an error
 
-    VkDescriptorBufferInfo bi[8]{};
-    VkWriteDescriptorSet wr[8]{};
+    VkDescriptorBufferInfo bi[12]{};
+    VkWriteDescriptorSet wr[12]{};
     for (int i = 0; i < nbuf; ++i) {
         Buf *b = (Buf *)bufs[i];
         if (!b || b->buf == VK_NULL_HANDLE) return -1;
@@ -467,7 +472,7 @@ int llamd_vk_dispatch(int pipe, void *const *bufs, int nbuf,
     vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pipes[(size_t)pipe]);
     g.push_desc(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.playout, 0, (uint32_t)nbuf, wr);
     vkCmdPushConstants(g.cmd, g.playout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                       16 * sizeof(uint32_t), push);
+                       32 * sizeof(uint32_t), push);
     vkCmdDispatch(g.cmd, gx, gy, 1);
 
     VkMemoryBarrier mb{};
@@ -495,7 +500,7 @@ int llamd_vk_matvec(void *w, const uint64_t *off, void *qb, void *sb, void *ad,
                     void *out, int blocks, int rows, int nseq, int iters)
 {
     if (!g.ok) return -1;
-    uint32_t pc[16] = {0};
+    uint32_t pc[32] = {0};
     pc[0] = (uint32_t)(off[0] / 4);
     pc[1] = (uint32_t)(off[1] / 4);
     pc[2] = (uint32_t)(off[2] / 4);

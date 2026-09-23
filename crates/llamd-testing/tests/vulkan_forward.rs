@@ -170,3 +170,58 @@ fn vulkan_generation_throughput() {
     }
     eprintln!("  llama.cpp: 94.4-95.6 single stream, 145.8/229.5/290.9 at batch 2/4/8");
 }
+
+#[test]
+#[ignore = "uploads 23 GiB to the device; needs a free GPU and the real model"]
+fn fusing_qkv_measured_in_one_process() {
+    // A/B IN ONE PROCESS, alternating, several repeats each. Comparing across
+    // separate runs is how this project twice accepted a change that later
+    // measurement rejected — the drift between runs on this card is larger than
+    // the effect being looked for. Alternating also cancels any slow drift
+    // (clocks, thermals) that would otherwise land entirely on one arm.
+    let Some((model, mut vk)) = open(68, 8) else {
+        skip(
+            "fusing_qkv_measured_in_one_process",
+            "no model or no Vulkan",
+        );
+        return;
+    };
+    let _ = &model;
+    const N: usize = 64;
+    const REPS: usize = 4;
+
+    eprintln!(
+        "\n  {:<6} {:>12} {:>12} {:>9}",
+        "batch", "fused ms", "split ms", "fused/split"
+    );
+    for nseq in [1usize, 2, 4, 8] {
+        let mut best = [f64::MAX; 2]; // [fused, split]
+        for _ in 0..REPS {
+            for (arm, fuse) in [(0usize, true), (1usize, false)] {
+                vk.fuse_qkv = fuse;
+                let mut toks: Vec<u32> = (0..nseq).map(|i| CASES[i % CASES.len()].1).collect();
+                for pos in 0..6 {
+                    toks = vk.forward_batch(&toks, &vec![pos; nseq]).expect("warm");
+                }
+                let t = std::time::Instant::now();
+                for pos in 0..N {
+                    toks = vk.forward_batch(&toks, &vec![pos; nseq]).expect("timed");
+                }
+                let ms = t.elapsed().as_secs_f64() * 1e3 / N as f64;
+                // BEST of the repeats, not the mean: the noise here is other
+                // work stealing the GPU, which only ever makes a run slower.
+                if ms < best[arm] {
+                    best[arm] = ms;
+                }
+            }
+        }
+        eprintln!(
+            "  {nseq:<6} {:>12.3} {:>12.3} {:>8.3}x",
+            best[0],
+            best[1],
+            best[0] / best[1]
+        );
+    }
+    vk.fuse_qkv = true;
+    eprintln!("  (< 1.00x means fusing is faster)");
+}

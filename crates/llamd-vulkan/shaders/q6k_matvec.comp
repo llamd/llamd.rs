@@ -62,7 +62,7 @@ void main() {
 
     float acc[MAX_SEQ];
     for (int i = 0; i < MAX_SEQ; ++i) acc[i] = 0.0;
-    Q6K_ACC(w, row * pc.blocks, 0u, 0u, 0u, pc.nseq, acc)
+    Q6K_ACC(w, pc.ql_u, pc.qh_u, pc.sc_u, pc.d_u, row * pc.blocks, 0u, 0u, 0u, pc.nseq, acc)
 
     for (uint s = 0u; s < pc.nseq; ++s) {
         float t = subgroupAdd(acc[s]);

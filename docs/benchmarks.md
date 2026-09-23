@@ -1160,3 +1160,105 @@ makes the column above a measurement of the backend.
 
 The CPU path remains the correctness reference — the one that agrees with
 llama.cpp token for token, and the one every device kernel is held to.
+
+---
+
+## 15. Batched prefill: the gap that mattered most
+
+Every number before this one measured decode. That made the engine look better
+than it was: without prefill a prompt had to be fed **one token at a time**, so a
+512-token prompt read all 2.485 GB of active weights 512 times.
+
+```
+  512-token prompt, before:   5.83 s    (87.9 tok/s)
+  512-token prompt, after:    1.05 s    (485.9 tok/s)     5.6x
+  llama.cpp pp512:            0.31 s    (1632 tok/s)
+```
+
+### Prefill is batching with a shared cache
+
+The whole layer loop is the same code `forward_batch` already ran. Every token in
+the tile multiplies the same weights, so one weight read serves all of them — the
+sharing that made batch-8 decode fast is exactly the sharing a prompt needs.
+
+The only difference is that the slots are **positions in one sequence** rather
+than separate streams, so they share the KV cache instead of owning slices of it.
+Expressed as one push constant, `kv_stride`: `max_kv * kv_dim` for independent
+sequences, **0** for prefill. Two shaders changed; none were added.
+
+**Causality needs no mask.** Each slot's `n_kv` is its own position plus one, so
+token *i* reads exactly positions 0..pos_i and never a later one. Every slot
+writes its K and V before the attention dispatch — the barrier between them
+guarantees it — so what token *i* reads is the earlier tokens of the same tile.
+
+Non-final tiles skip the final norm, the output projection and the argmax. The
+output projection is 255 MB, 10% of a token's traffic, and every token's logits
+but the last are discarded.
+
+### The tile is the whole story
+
+| tile | 512 tokens | tok/s |
+|---|---|---|
+| 1 | 5.827 s | 87.9 |
+| 4 | 2.119 | 241.7 |
+| 8 | 1.429 | 358.3 |
+| 16 | 1.087 | 471.0 |
+| **32** | **1.054** | **485.9** |
+
+Raising `MAX_SEQ` from 8 to 32 was worth 36%. The returns flatten from 16 to 32
+(+3%), which says the limit has moved: the routed experts do not share across
+tokens the way the attention projections do, and attention cost grows with
+context.
+
+| prompt | prefill | tok/s | one at a time | |
+|---|---|---|---|---|
+| 64 | 0.104 s | **613.7** | 119.4 | 5.14× |
+| 128 | 0.209 | **611.1** | 112.5 | 5.43× |
+| 256 | 0.466 | **549.9** | 101.0 | 5.45× |
+| 512 | 1.050 | **487.8** | 87.4 | 5.58× |
+
+Shorter prompts ingest faster per token because attention cost grows with `n_kv`.
+A prompt shorter than the tile is slower per token again — 11 tokens managed only
+232 tok/s — because the tile is not full and the fixed costs per pass dominate.
+
+### Correctness: equivalence, not plausibility
+
+A prefill that gets causality wrong — a token seeing one that follows it — still
+produces fluent text and would pass any eyeball test. So the bar is that prefill
+returns **exactly** what sequential decode returns:
+
+**20 (tile, length) cases, tiles 1 through 32**, each straddling a tile boundary
+— below it, exactly it, one over, and a ragged last chunk. All exact.
+
+The intermediate predictions are visibly sensible too, which is a useful smell
+test on top: *"The quick brown fox jumps over the"* → `" lazy"` → `" dog"` → `"."`.
+
+And the two paths compose — generation continues from the cache prefill built:
+
+> `" The sky appears blue due to a phenomenon called Rayleigh scattering. When
+> sunlight enters Earth's atmosphere, it collides with tiny gas molecules,
+> primarily nitrogen and oxygen. Sunlight contains all colors of the rainbow, but
+> blue light has a shorter wavelength"`
+
+### Where this leaves llamd against llama.cpp
+
+**Prefill is still 3.3× behind** — 487.8 tok/s against 1632. llama.cpp processes
+the whole prompt in one GEMM; llamd processes it in tiles of 32 with a
+matrix-vector kernel that happens to carry 32 accumulators.
+
+That makes the comparison depend on the shape of the request:
+
+| | llamd | llama.cpp |
+|---|---|---|
+| 512-token prompt | 1.05 s | 0.31 s |
+| then 128 tokens out | 1.13 s | 1.35 s |
+| **total** | **2.18 s** | **1.66 s** |
+
+llama.cpp wins that one. The break-even is around **440 generated tokens**: below
+it llama.cpp's faster prefill dominates, above it llamd's faster decode does.
+
+The honest summary is that llamd now has a prefill path rather than a good one.
+The next step is the one llama.cpp already took — a real tiled GEMM over tokens,
+with the activation staged in shared memory and specialization constants so the
+accumulator loop is compile-time bounded and stays in registers rather than
+scratch.

@@ -21,23 +21,24 @@ use crate::{DeviceInfo, Error, PlanarWeights, Result, VkBuf, device_info, init};
 #[repr(i32)]
 pub enum Pipeline {
     Q6kMatvec = 0,
-    Q6kGrouped = 1,
-    Q6kGroupedPa = 2,
-    MatvecF32 = 3,
-    Embed = 4,
-    RmsScale = 5,
-    NormQuant = 6,
-    Quantize = 7,
-    RmsNormMul = 8,
-    NormRope = 9,
-    KNormRopeStore = 10,
-    Attention = 11,
-    Add = 12,
-    SiluMul = 13,
-    Router = 14,
-    MoeCombineAdd = 15,
-    Argmax = 16,
-    ArgmaxFinal = 17,
+    Q6kX3 = 1,
+    Q6kGrouped = 2,
+    Q6kGroupedPa = 3,
+    MatvecF32 = 4,
+    Embed = 5,
+    RmsScale = 6,
+    NormQuant = 7,
+    Quantize = 8,
+    RmsNormMul = 9,
+    NormRope = 10,
+    KNormRopeStore = 11,
+    Attention = 12,
+    Add = 13,
+    SiluMul = 14,
+    Router = 15,
+    MoeCombineAdd = 16,
+    Argmax = 17,
+    ArgmaxFinal = 18,
 }
 
 impl Pipeline {
@@ -45,6 +46,7 @@ impl Pipeline {
     pub fn shader_name(self) -> &'static str {
         match self {
             Pipeline::Q6kMatvec => "q6k_matvec",
+            Pipeline::Q6kX3 => "q6k_x3",
             Pipeline::Q6kGrouped => "q6k_grouped",
             Pipeline::Q6kGroupedPa => "q6k_grouped_pa",
             Pipeline::MatvecF32 => "matvec_f32",
@@ -65,8 +67,9 @@ impl Pipeline {
         }
     }
 
-    pub const ALL: [Pipeline; 18] = [
+    pub const ALL: [Pipeline; 19] = [
         Pipeline::Q6kMatvec,
+        Pipeline::Q6kX3,
         Pipeline::Q6kGrouped,
         Pipeline::Q6kGroupedPa,
         Pipeline::MatvecF32,
@@ -163,11 +166,11 @@ pub fn end_and_wait() -> Result<()> {
 
 /// Push constants: sixteen 32-bit slots, interpreted per shader.
 #[derive(Default, Clone, Copy)]
-pub struct Push([u32; 16]);
+pub struct Push([u32; 32]);
 
 impl Push {
     pub fn new() -> Self {
-        Push([0; 16])
+        Push([0; 32])
     }
     pub fn u(mut self, i: usize, v: usize) -> Self {
         self.0[i] = v as u32;
@@ -180,10 +183,10 @@ impl Push {
 }
 
 fn dispatch(p: Pipeline, bufs: &[&VkBuf], push: Push, gx: u32, gy: u32) -> Result<()> {
-    if bufs.len() > 8 {
+    if bufs.len() > 12 {
         return Err(Error::malformed(
             "dispatch",
-            format!("{} buffers exceeds the 8 bindings", bufs.len()),
+            format!("{} buffers exceeds the 12 bindings", bufs.len()),
         ));
     }
     #[cfg(not(vulkan))]
@@ -331,6 +334,61 @@ pub fn matvec(
     )
 }
 
+/// Q, K and V in one dispatch.
+///
+/// All three multiply the same activation. Issued separately they are 1024, 128
+/// and 128 subgroups, and the two small ones leave most of a 32-WGP card idle;
+/// fused, the row space is 5120 and they fill it alongside Q. Each matrix carries
+/// its OWN plane offsets — sharing one set would silently use Q's planes for K
+/// and V.
+#[allow(clippy::too_many_arguments)]
+pub fn matvec_x3(
+    w: (&PlanarWeights, &PlanarWeights, &PlanarWeights),
+    qb: &VkBuf,
+    sb: &VkBuf,
+    ad: &VkBuf,
+    out: (&VkBuf, &VkBuf, &VkBuf),
+    rows: (usize, usize, usize),
+    nseq: usize,
+) -> Result<()> {
+    if w.1.blocks() != w.0.blocks() || w.2.blocks() != w.0.blocks() {
+        return Err(Error::malformed(
+            "matvec_x3",
+            "all three matrices must share the activation's block count",
+        ));
+    }
+    let mut p = Push::new();
+    for (i, m) in [w.0, w.1, w.2].iter().enumerate() {
+        let o = m.offsets();
+        for j in 0..4 {
+            p = p.u(i * 4 + j, (o[j] / 4) as usize);
+        }
+    }
+    let p = p
+        .u(12, w.0.blocks())
+        .u(13, rows.0)
+        .u(14, rows.1)
+        .u(15, rows.2)
+        .u(16, nseq);
+    dispatch(
+        Pipeline::Q6kX3,
+        &[
+            w.0.buf(),
+            w.1.buf(),
+            w.2.buf(),
+            qb,
+            sb,
+            ad,
+            out.0,
+            out.1,
+            out.2,
+        ],
+        p,
+        groups_for_rows(rows.0 + rows.1 + rows.2),
+        1,
+    )
+}
+
 /// Expert gate or up: shared activation, per-(sequence, expert) weights.
 #[allow(clippy::too_many_arguments)]
 pub fn grouped(
@@ -447,6 +505,7 @@ pub fn k_norm_rope_store(
     nseq: usize,
     freq_base: f32,
     eps: f32,
+    kv_stride: usize,
 ) -> Result<()> {
     let wb = w.unwrap_or(k);
     let p = Push::new()
@@ -457,7 +516,8 @@ pub fn k_norm_rope_store(
         .u(4, nseq)
         .u(5, usize::from(w.is_some()))
         .f(6, freq_base)
-        .f(7, eps);
+        .f(7, eps)
+        .u(8, kv_stride);
     dispatch(
         Pipeline::KNormRopeStore,
         &[k, wb, v, kc, vc, meta],
@@ -480,6 +540,7 @@ pub fn attention(
     hd: usize,
     max_kv: usize,
     nseq: usize,
+    kv_stride: usize,
 ) -> Result<()> {
     if n_head % n_head_kv != 0 {
         return Err(Error::malformed(
@@ -493,7 +554,8 @@ pub fn attention(
         .u(2, hd)
         .u(3, max_kv)
         .u(4, nseq)
-        .u(5, n_head / n_head_kv);
+        .u(5, n_head / n_head_kv)
+        .u(6, kv_stride);
     dispatch(
         Pipeline::Attention,
         &[q, kc, vc, out, scores, meta],
@@ -640,7 +702,7 @@ mod tests {
             return;
         }
         let b = VkBuf::new(256).expect("buf");
-        let many: Vec<&VkBuf> = (0..9).map(|_| &b).collect();
+        let many: Vec<&VkBuf> = (0..13).map(|_| &b).collect();
         assert!(dispatch(Pipeline::Add, &many, Push::new(), 1, 1).is_err());
     }
 
@@ -710,5 +772,32 @@ mod recording_tests {
         let second = begin();
         let _ = end_and_wait();
         assert!(second.is_err(), "nested begin was allowed");
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    /// The Rust cap and the shader's `MAX_SEQ` must agree: the shaders size their
+    /// accumulator arrays by it, so a Rust side that allowed more would write past
+    /// them. Parsed from the shader source rather than restated.
+    #[test]
+    fn max_seq_matches_the_shaders() {
+        let src = include_str!("../shaders/common.glsl");
+        let line = src
+            .lines()
+            .find(|l| l.trim_start().starts_with("#define MAX_SEQ"))
+            .expect("MAX_SEQ is defined in common.glsl");
+        let n: usize = line
+            .split_whitespace()
+            .nth(2)
+            .expect("a value")
+            .parse()
+            .expect("a number");
+        assert_eq!(
+            n,
+            crate::MAX_SEQ,
+            "shaders/common.glsl says MAX_SEQ {n}, lib.rs says {}",
+            crate::MAX_SEQ
+        );
     }
 }

@@ -36,7 +36,7 @@ void main() {
     for (int i = 0; i < MAX_SEQ; ++i) acc[i] = 0.0;
     // NS = 1: this row belongs to one sequence, whose activation the bases
     // below select. pc.nseq still bounds the row space above.
-    Q6K_ACC(w, ri, s * pc.blocks * 64u, s * pc.blocks * 16u, s * pc.blocks, 1u, acc)
+    Q6K_ACC(w, pc.ql_u, pc.qh_u, pc.sc_u, pc.d_u, ri, s * pc.blocks * 64u, s * pc.blocks * 16u, s * pc.blocks, 1u, acc)
     float t = subgroupAdd(acc[0]);
     if (subgroupElect()) outv[grow] = t;
 }

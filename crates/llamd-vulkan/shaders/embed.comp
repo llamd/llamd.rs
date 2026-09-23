@@ -11,6 +11,18 @@ layout(push_constant) uniform Push {
 #include "common.glsl"
 #include "q6k.glsl"
 
+// Declared here rather than in q6k.glsl: these close over this shader's single
+// `w` binding, and a shader with three weight buffers cannot use them.
+int sc_at(uint base_u, uint idx) {
+    uint word = w[base_u + (idx >> 2u)];
+    return bitfieldExtract(int(word), int(8u * (idx & 3u)), 8);
+}
+float d_at(uint base_u, uint idx) {
+    uint word = w[base_u + (idx >> 1u)];
+    vec2 pair = unpackHalf2x16(word);
+    return ((idx & 1u) == 0u) ? pair.x : pair.y;
+}
+
 // Embedding lookup: dequantize one planar Q6_K row per sequence.
 //
 // THE INDEX MAPPING, derived rather than copied, because the dot product walks

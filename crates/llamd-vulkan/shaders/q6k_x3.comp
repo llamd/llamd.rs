@@ -1,0 +1,81 @@
+#version 450
+//
+// Q, K and V in ONE dispatch.
+//
+// WHY. All three multiply the same activation, so a weight read already serves
+// every sequence — but issued separately they are 4096, 512 and 512 rows, which
+// at one subgroup per row is 1024, 128 and 128 subgroups. On a 32-WGP card the
+// two small ones leave most of it idle for the whole projection. Fused, the row
+// space is 5120 and K and V fill the card alongside Q. The same change on the
+// ROCm side was worth 23% — the largest single win in that path — and the reason
+// was occupancy, not the two launches saved.
+//
+// THE PLANE OFFSETS ARE PER MATRIX. Q, K and V are separate tensors with
+// separate planar layouts, so each carries its own four offsets. Reading one
+// set for all three is the obvious bug here and would produce fluent, wrong
+// output; the macro takes them as parameters for exactly that reason.
+//
+// THE MACRO IS INSTANTIATED THREE TIMES, once per branch, because GLSL has no
+// pointers to buffers. Only one branch runs per subgroup, and the arithmetic is
+// one source.
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0)  readonly  buffer W0 { uint  w0[]; };
+layout(std430, binding = 1)  readonly  buffer W1 { uint  w1[]; };
+layout(std430, binding = 2)  readonly  buffer W2 { uint  w2[]; };
+layout(std430, binding = 3)  readonly  buffer QB { uint  qb[]; };
+layout(std430, binding = 4)  readonly  buffer SB { int   sb[]; };
+layout(std430, binding = 5)  readonly  buffer AD { float ad[]; };
+layout(std430, binding = 6)  writeonly buffer O0 { float o0[]; };
+layout(std430, binding = 7)  writeonly buffer O1 { float o1[]; };
+layout(std430, binding = 8)  writeonly buffer O2 { float o2[]; };
+
+layout(push_constant) uniform Push {
+    uint q_ql; uint q_qh; uint q_sc; uint q_d;      // Q's planes
+    uint k_ql; uint k_qh; uint k_sc; uint k_d;      // K's
+    uint v_ql; uint v_qh; uint v_sc; uint v_d;      // V's
+    uint blocks; uint rows0; uint rows1; uint rows2;
+    uint nseq;
+} pc;
+#include "common.glsl"
+#include "q6k.glsl"
+
+void main() {
+    uint grow = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
+    uint total = pc.rows0 + pc.rows1 + pc.rows2;
+    if (grow >= total) return;
+
+    float acc[MAX_SEQ];
+    for (int i = 0; i < MAX_SEQ; ++i) acc[i] = 0.0;
+
+    if (grow < pc.rows0) {
+        Q6K_ACC(w0, pc.q_ql, pc.q_qh, pc.q_sc, pc.q_d, grow * pc.blocks,
+                0u, 0u, 0u, pc.nseq, acc)
+        for (uint s = 0u; s < pc.nseq; ++s) {
+            float t = subgroupAdd(acc[s]);
+            if (subgroupElect()) o0[s * pc.rows0 + grow] = t;
+        }
+    } else if (grow < pc.rows0 + pc.rows1) {
+        uint row = grow - pc.rows0;
+        Q6K_ACC(w1, pc.k_ql, pc.k_qh, pc.k_sc, pc.k_d, row * pc.blocks,
+                0u, 0u, 0u, pc.nseq, acc)
+        for (uint s = 0u; s < pc.nseq; ++s) {
+            float t = subgroupAdd(acc[s]);
+            if (subgroupElect()) o1[s * pc.rows1 + row] = t;
+        }
+    } else {
+        uint row = grow - pc.rows0 - pc.rows1;
+        Q6K_ACC(w2, pc.v_ql, pc.v_qh, pc.v_sc, pc.v_d, row * pc.blocks,
+                0u, 0u, 0u, pc.nseq, acc)
+        for (uint s = 0u; s < pc.nseq; ++s) {
+            float t = subgroupAdd(acc[s]);
+            if (subgroupElect()) o2[s * pc.rows2 + row] = t;
+        }
+    }
+}

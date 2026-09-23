@@ -9,6 +9,13 @@ layout(std430, binding = 5) readonly buffer M  { int   meta[]; };
 layout(push_constant) uniform P {
     uint n_head_kv; uint hd; uint kv_dim; uint max_kv;
     uint nseq; uint has_norm; float freq_base; float eps;
+    // Stride between one slot's cache slice and the next, in floats.
+    //
+    // max_kv*kv_dim for independent sequences, which each own a slice. ZERO for
+    // prefill, where every slot is a POSITION IN ONE SEQUENCE and they share the
+    // cache — each writes at its own pos, and the later causal read falls out of
+    // each token's own n_kv.
+    uint kv_stride;
 } pc;
 shared float sh[128];
 
@@ -44,8 +51,7 @@ void main() {
     }
     barrier();
 
-    // Each sequence owns a max_kv * kv_dim slice.
-    uint ks = s * pc.max_kv * pc.kv_dim;
+    uint ks = s * pc.kv_stride;
     uint vs = s * pc.kv_dim;
     for (uint i = t; i < pc.hd; i += 128u) {
         uint off = head * pc.hd + i;
