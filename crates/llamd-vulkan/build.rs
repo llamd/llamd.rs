@@ -33,6 +33,9 @@ const SHADERS: &[&str] = &[
     "moe_combine_add",
     "argmax",
     "argmax_final",
+    "moe_group",
+    "q6k_expert_major",
+    "q6k_expert_major_pa",
 ];
 
 fn main() {

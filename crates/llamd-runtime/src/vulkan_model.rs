@@ -62,6 +62,12 @@ struct Scratch {
     out_token: VkBuf,
     /// `[token, pos]` per sequence — the only per-token host write.
     meta: VkBuf,
+    /// The tile's (token, slot) pairs sorted by expert, built on the device
+    /// between the router and the expert matmuls.
+    g_start: VkBuf,
+    g_count: VkBuf,
+    p_token: VkBuf,
+    p_slot: VkBuf,
 }
 
 pub struct VulkanModel {
@@ -76,6 +82,26 @@ pub struct VulkanModel {
     max_seq: usize,
     s: Scratch,
     weight_bytes: usize,
+    /// Tokens per pass at or above which the expert matmuls are grouped BY
+    /// EXPERT rather than by token. `usize::MAX` never, `1` always.
+    ///
+    /// EXPERT-MAJOR ONLY PAYS WHEN EXPERTS ARE SHARED. Token-major reads an
+    /// expert's weights once per token that chose it; expert-major reads them
+    /// once for all of them, which is worth 2.3 reads at 32 tokens and exactly
+    /// one at a single token. Measured on a 512-token prompt:
+    ///
+    ///   tile  8   348.6 -> 351.2 t/s   1.01x
+    ///   tile 16   465.8 -> 520.9 t/s   1.12x
+    ///   tile 32   481.7 -> 591.3 t/s   1.23x
+    ///
+    /// and in decode, where nothing is shared, it is a 1.41x LOSS: 122.3 tok/s
+    /// token-major against 86.5 expert-major, because the grouping dispatch and
+    /// the gathered activation reads are then pure overhead.
+    ///
+    /// So the default is 16: prefill tiles take the expert-major path and decode
+    /// does not. The threshold is a field rather than a constant so the two can
+    /// still be A/B'd in one process.
+    pub expert_major_min_tokens: usize,
     /// Tokens per prefill pass. Defaults to `max_seq`; smaller trades weight
     /// sharing for registers, and which wins is measured rather than argued.
     pub prefill_tile: usize,
@@ -246,6 +272,10 @@ impl VulkanModel {
             amax_i: VkBuf::new(ARGMAX_CHUNKS * 4 * max_seq)?,
             out_token: VkBuf::new(4 * max_seq)?,
             meta: VkBuf::new(8 * max_seq)?,
+            g_start: VkBuf::new(n_expert * 4)?,
+            g_count: VkBuf::new(n_expert * 4)?,
+            p_token: VkBuf::new(n_used * max_seq * 4)?,
+            p_slot: VkBuf::new(n_used * max_seq * 4)?,
         };
 
         let mut kc = Vec::with_capacity(hp.n_layer);
@@ -267,6 +297,7 @@ impl VulkanModel {
             max_seq,
             s,
             weight_bytes,
+            expert_major_min_tokens: 16,
             prefill_tile: max_seq,
             fuse_qkv: true,
         })
@@ -337,6 +368,8 @@ impl VulkanModel {
         let eps = hp.rms_eps;
         let fb = hp.rope_freq_base;
         let max_kv = self.max_kv;
+        // Decided once per pass, from the token count.
+        let expert_major = self.expert_major_min_tokens > 0 && nseq >= self.expert_major_min_tokens;
         let s = &self.s;
 
         ops::begin()?;
@@ -458,28 +491,68 @@ impl VulkanModel {
                     nseq,
                 )?;
 
-                ops::grouped(
-                    &l.ffn_gate_exps,
-                    &s.qb,
-                    &s.sb,
-                    &s.ad,
-                    &s.e_gate,
-                    &s.expert_ids,
-                    n_ffe,
-                    n_used,
-                    nseq,
-                )?;
-                ops::grouped(
-                    &l.ffn_up_exps,
-                    &s.qb,
-                    &s.sb,
-                    &s.ad,
-                    &s.e_up,
-                    &s.expert_ids,
-                    n_ffe,
-                    n_used,
-                    nseq,
-                )?;
+                let grp = (&s.g_start, &s.g_count, &s.p_token, &s.p_slot);
+                if expert_major {
+                    // Sort the tile's (token, slot) pairs by expert, then read each
+                    // expert's weights once for every token that chose it.
+                    ops::moe_group(
+                        &s.expert_ids,
+                        &s.g_start,
+                        &s.g_count,
+                        &s.p_token,
+                        &s.p_slot,
+                        n_expert,
+                        n_used,
+                        nseq,
+                    )?;
+                    ops::expert_major(
+                        &l.ffn_gate_exps,
+                        &s.qb,
+                        &s.sb,
+                        &s.ad,
+                        &s.e_gate,
+                        grp,
+                        n_ffe,
+                        n_used,
+                        nseq,
+                        n_expert,
+                    )?;
+                    ops::expert_major(
+                        &l.ffn_up_exps,
+                        &s.qb,
+                        &s.sb,
+                        &s.ad,
+                        &s.e_up,
+                        grp,
+                        n_ffe,
+                        n_used,
+                        nseq,
+                        n_expert,
+                    )?;
+                } else {
+                    ops::grouped(
+                        &l.ffn_gate_exps,
+                        &s.qb,
+                        &s.sb,
+                        &s.ad,
+                        &s.e_gate,
+                        &s.expert_ids,
+                        n_ffe,
+                        n_used,
+                        nseq,
+                    )?;
+                    ops::grouped(
+                        &l.ffn_up_exps,
+                        &s.qb,
+                        &s.sb,
+                        &s.ad,
+                        &s.e_up,
+                        &s.expert_ids,
+                        n_ffe,
+                        n_used,
+                        nseq,
+                    )?;
+                }
                 // SiLU on the GATE only, then elementwise with up.
                 ops::silu_mul(&s.e_gate, &s.e_up, &s.e_act, n_used * n_ffe * nseq)?;
                 // Each expert's down input is its OWN activation.
@@ -490,17 +563,35 @@ impl VulkanModel {
                     &s.ad,
                     ((n_used * n_ffe) / 256) * nseq,
                 )?;
-                ops::grouped_per_act(
-                    &l.ffn_down_exps,
-                    &s.qb,
-                    &s.sb,
-                    &s.ad,
-                    &s.e_down,
-                    &s.expert_ids,
-                    n_embd,
-                    n_used,
-                    nseq,
-                )?;
+                if expert_major {
+                    // The grouping above still holds: the router has not run again. The
+                    // activation here is per (token, slot), NOT per token, because each
+                    // expert consumed its own silu(gate)*up.
+                    ops::expert_major_per_act(
+                        &l.ffn_down_exps,
+                        &s.qb,
+                        &s.sb,
+                        &s.ad,
+                        &s.e_down,
+                        (&s.g_start, &s.g_count, &s.p_token, &s.p_slot),
+                        n_embd,
+                        n_used,
+                        nseq,
+                        n_expert,
+                    )?;
+                } else {
+                    ops::grouped_per_act(
+                        &l.ffn_down_exps,
+                        &s.qb,
+                        &s.sb,
+                        &s.ad,
+                        &s.e_down,
+                        &s.expert_ids,
+                        n_embd,
+                        n_used,
+                        nseq,
+                    )?;
+                }
                 ops::moe_combine_add(&s.e_down, &s.expert_w, &s.x, &s.x, n_used, n_embd, nseq)?;
             }
 

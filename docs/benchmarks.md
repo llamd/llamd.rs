@@ -1351,3 +1351,88 @@ arithmetic about bytes or instructions predicted a win, and occupancy or latency
 decided otherwise. The arithmetic that *did* hold up was the traffic breakdown
 above — which was available before the kernel was written, and would have said
 not to write it.
+
+---
+
+## 17. Expert-major grouping: prefill 598.5 tok/s
+
+§16 got the target wrong and said so: the tiled GEMM optimised the attention
+projections, which are 3.5% of a prefill tile's weight traffic, while the routed
+experts are 96.5%. This is the fix that follows from that arithmetic.
+
+### The idea
+
+Token-major runs one row per `(token, expert)` pair, so an expert chosen by three
+tokens has its weights read three times. Expert-major sorts the tile's pairs by
+expert and reads each expert's weights ONCE for every token that chose it. At 32
+tokens, 112 distinct experts serve 256 pairs — **2.3 tokens per read**.
+
+**The grouping has to happen on the device.** The routing is chosen by the router
+shader, so it only exists on the GPU; reading the expert ids back to sort on the
+host would mean a submit-and-wait per layer, 48 per tile, which is the stall the
+whole engine is built to avoid. `moe_group.comp` is a counting sort in ONE
+workgroup — at most 256 pairs over 128 experts, so shared-memory atomics for the
+histogram and the scatter, one thread for the prefix sum, no global
+synchronisation.
+
+The dispatch then uses `gl_WorkGroupID.y` as the expert id, with empty groups
+returning immediately. That avoids needing the group count — which only exists on
+the device — back on the host to size the grid. At 32 tokens only 16 of 128
+workgroups are empty.
+
+### Results, A/B in one process
+
+| tile | token-major | expert-major | |
+|---|---|---|---|
+| 8 | 348.6 t/s | 351.2 | 1.01× |
+| 16 | 465.8 | **520.9** | 1.12× |
+| 32 | 481.7 | **591.3** | **1.23×** |
+
+And in decode, where a pass holds one token and no expert is shared, it is a
+**1.41× loss** — 122.3 tok/s token-major against 86.5 — because the grouping
+dispatch and the gathered activation reads are then pure overhead.
+
+So the policy is a threshold, set from the measurement: expert-major at **16 or
+more tokens per pass**, token-major below. Prefill tiles take one path and decode
+the other.
+
+### Prompt ingestion, end to end
+
+| prompt | before §15 | after §15 | **now** | vs one-at-a-time |
+|---|---|---|---|---|
+| 64 | — | 613.7 | **810.7** | 7.10× |
+| 128 | — | 611.1 | **774.4** | 7.32× |
+| 256 | — | 549.9 | **695.7** | 6.98× |
+| 512 | 87.9 | 487.8 | **598.5** | 6.99× |
+
+A 512-token prompt: **5.83 s → 0.855 s.**
+
+### Correctness
+
+A gather/scatter that feeds the wrong token's activation to an expert, or writes a
+result into the wrong slot, still produces fluent text. So the bar is that the two
+groupings agree **exactly**: every tile width from 1 to 32, at lengths straddling
+each boundary, plus a decode step where the grouping degenerates to 8 groups of 1
+— the case most likely to expose an off-by-one in the prefix sum. All exact. And
+prefill still equals sequential decode across 20 (tile, length) cases, and decode
+still matches llama.cpp on all five prompts.
+
+### Where llamd now stands against llama.cpp
+
+| | llamd | llama.cpp |
+|---|---|---|
+| decode, 1 stream | **109 – 113** | 94.4 – 95.6 |
+| decode, batch 8 | **397** | 290.9 |
+| **prefill (pp512)** | 598.5 | **1632** |
+
+Prefill is still **2.7× behind**, improved from 3.3×. For a request of a 512-token
+prompt and 128 generated tokens, llama.cpp is still ahead overall — 1.66 s against
+1.99 s — and the **break-even is now 323 generated tokens**, down from 441.
+
+What remains on the prefill path is the part expert-major does not address: an
+expert serving 2.3 tokens still runs a matrix-VECTOR kernel 2.3 times rather than
+one matrix-matrix kernel over 2.3 columns. §16 established that widening that
+kernel costs more in latency hiding than it saves in instructions at this tile
+size, so the next thing worth trying is a larger tile — which needs the
+accumulator loop compile-time bounded through specialization constants, and is now
+a measurement about the expert path rather than the attention path.

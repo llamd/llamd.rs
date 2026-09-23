@@ -40,6 +40,9 @@ pub enum Pipeline {
     MoeCombineAdd = 17,
     Argmax = 18,
     ArgmaxFinal = 19,
+    MoeGroup = 20,
+    Q6kExpertMajor = 21,
+    Q6kExpertMajorPa = 22,
 }
 
 impl Pipeline {
@@ -66,10 +69,13 @@ impl Pipeline {
             Pipeline::MoeCombineAdd => "moe_combine_add",
             Pipeline::Argmax => "argmax",
             Pipeline::ArgmaxFinal => "argmax_final",
+            Pipeline::MoeGroup => "moe_group",
+            Pipeline::Q6kExpertMajor => "q6k_expert_major",
+            Pipeline::Q6kExpertMajorPa => "q6k_expert_major_pa",
         }
     }
 
-    pub const ALL: [Pipeline; 20] = [
+    pub const ALL: [Pipeline; 23] = [
         Pipeline::Q6kMatvec,
         Pipeline::Q6kX3,
         Pipeline::Q6kGemm,
@@ -90,6 +96,9 @@ impl Pipeline {
         Pipeline::MoeCombineAdd,
         Pipeline::Argmax,
         Pipeline::ArgmaxFinal,
+        Pipeline::MoeGroup,
+        Pipeline::Q6kExpertMajor,
+        Pipeline::Q6kExpertMajorPa,
     ];
 }
 
@@ -224,6 +233,19 @@ fn dispatch(p: Pipeline, bufs: &[&VkBuf], push: Push, gx: u32, gy: u32) -> Resul
         }
         Ok(())
     }
+}
+
+/// Guard an output buffer against what a shader will write. An undersized
+/// storage buffer is not a fault in Vulkan — the write is simply dropped or
+/// clamped — so it would surface as wrong numbers, not an error.
+fn need(b: &VkBuf, floats: usize, what: &str) -> Result<()> {
+    if b.bytes() < floats * 4 {
+        return Err(Error::malformed(
+            "vulkan buffer",
+            format!("{what}: holds {} floats, needs {floats}", b.bytes() / 4),
+        ));
+    }
+    Ok(())
 }
 
 /// Plane offsets in uints, the first four push slots every Q6_K shader expects.
@@ -845,4 +867,107 @@ mod cap_tests {
             crate::MAX_SEQ
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Expert-major routing: group the tile's tokens by expert, then read each
+// expert's weights once for all of them.
+// ---------------------------------------------------------------------------
+
+/// Sort the tile's `(token, slot)` pairs by expert, on the device.
+///
+/// Runs between the router and the expert matmuls, inside the same recording:
+/// the routing only exists on the GPU, so reading it back to sort on the host
+/// would cost a submit-and-wait per layer.
+#[allow(clippy::too_many_arguments)]
+pub fn moe_group(
+    ids: &VkBuf,
+    gstart: &VkBuf,
+    gcount: &VkBuf,
+    ptoken: &VkBuf,
+    pslot: &VkBuf,
+    n_expert: usize,
+    n_used: usize,
+    nseq: usize,
+) -> Result<()> {
+    if n_expert > 1024 {
+        return Err(Error::malformed(
+            "moe_group",
+            format!("{n_expert} experts exceeds the kernel's 1024 shared slots"),
+        ));
+    }
+    let npair = nseq * n_used;
+    if gstart.bytes() < n_expert * 4 || gcount.bytes() < n_expert * 4 {
+        return Err(Error::malformed("moe_group", "group buffers too small"));
+    }
+    if ptoken.bytes() < npair * 4 || pslot.bytes() < npair * 4 {
+        return Err(Error::malformed("moe_group", "pair buffers too small"));
+    }
+    dispatch(
+        Pipeline::MoeGroup,
+        &[ids, gstart, gcount, ptoken, pslot],
+        Push::new().u(0, n_expert).u(1, n_used).u(2, nseq),
+        1,
+        1,
+    )
+}
+
+/// Expert gate or up, expert-major. The activation is gathered per TOKEN.
+#[allow(clippy::too_many_arguments)]
+pub fn expert_major(
+    w: &PlanarWeights,
+    qb: &VkBuf,
+    sb: &VkBuf,
+    ad: &VkBuf,
+    out: &VkBuf,
+    g: (&VkBuf, &VkBuf, &VkBuf, &VkBuf), // gstart, gcount, ptoken, pslot
+    rows: usize,
+    n_used: usize,
+    nseq: usize,
+    n_expert: usize,
+) -> Result<()> {
+    need(out, rows * n_used * nseq, "expert_major out")?;
+    let p = planes(w)
+        .u(4, w.blocks())
+        .u(5, rows)
+        .u(6, n_used)
+        .u(7, nseq);
+    dispatch(
+        Pipeline::Q6kExpertMajor,
+        &[w.buf(), qb, sb, ad, out, g.0, g.1, g.2, g.3],
+        p,
+        groups_for_rows(rows),
+        n_expert as u32,
+    )
+}
+
+/// The expert down projection, expert-major. The activation is gathered per
+/// `(token, slot)` PAIR, because each expert consumed its own silu(gate)*up —
+/// indexing it by token instead is the bug that produces fluent nonsense.
+#[allow(clippy::too_many_arguments)]
+pub fn expert_major_per_act(
+    w: &PlanarWeights,
+    qb: &VkBuf,
+    sb: &VkBuf,
+    ad: &VkBuf,
+    out: &VkBuf,
+    g: (&VkBuf, &VkBuf, &VkBuf, &VkBuf),
+    rows: usize,
+    n_used: usize,
+    nseq: usize,
+    n_expert: usize,
+) -> Result<()> {
+    need(out, rows * n_used * nseq, "expert_major_pa out")?;
+    let p = planes(w)
+        .u(4, w.blocks())
+        .u(5, rows)
+        .u(6, n_used)
+        .u(7, nseq);
+    dispatch(
+        Pipeline::Q6kExpertMajorPa,
+        &[w.buf(), qb, sb, ad, out, g.0, g.1, g.2, g.3],
+        p,
+        groups_for_rows(rows),
+        n_expert as u32,
+    )
 }

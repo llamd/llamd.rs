@@ -230,3 +230,147 @@ fn prefill_throughput_against_one_at_a_time() {
     }
     eprintln!("  llama.cpp pp512: 1632 t/s");
 }
+
+#[test]
+#[ignore = "uploads 23 GiB to the device; needs a free GPU and the real model"]
+fn expert_major_equals_token_major() {
+    // A gather/scatter that mixes up which token's activation feeds which expert,
+    // or writes a result into the wrong slot, still produces fluent text. So the
+    // bar is that the two groupings agree EXACTLY, token for token, at every tile
+    // width — held against each other rather than against a tolerance, because
+    // they perform the identical arithmetic in a different order of experts.
+    let Some((model, mut vk)) = open(320, llamd_vulkan::MAX_SEQ) else {
+        skip("expert_major_equals_token_major", "no model or no Vulkan");
+        return;
+    };
+    let vocab = llamd_tokenizer::Vocab::from_gguf(model.gguf()).expect("vocab");
+    let all = vocab.encode(
+        "The capital of France is Paris and the capital of Japan is Tokyo while \
+         the largest ocean on Earth is the Pacific",
+        false,
+    );
+
+    let mut wrong = Vec::new();
+    for tile in [1usize, 4, 8, 16, 32] {
+        if tile > llamd_vulkan::MAX_SEQ {
+            continue;
+        }
+        vk.prefill_tile = tile;
+        for &n in &[1usize, tile, tile + 1, 2 * tile + 1] {
+            if n > all.len() {
+                continue;
+            }
+            vk.expert_major_min_tokens = usize::MAX;
+            let want = vk.prefill(&all[..n], 0).expect("token-major");
+            vk.expert_major_min_tokens = 1;
+            let got = vk.prefill(&all[..n], 0).expect("expert-major");
+            if got != want {
+                wrong.push(format!(
+                    "tile {tile}, {n} tokens: token-major {want} {:?}, expert-major {got} {:?}",
+                    vocab.text_of(want).unwrap_or("?"),
+                    vocab.text_of(got).unwrap_or("?")
+                ));
+            }
+        }
+    }
+    // And a decode step, where every tile holds exactly one token: the grouping
+    // degenerates to 8 groups of 1, which is the case most likely to expose an
+    // off-by-one in the prefix sum.
+    vk.expert_major_min_tokens = usize::MAX;
+    let d_want = vk
+        .forward_batch(&[13048], &[0])
+        .expect("token-major decode")[0];
+    vk.expert_major_min_tokens = 1;
+    let d_got = vk
+        .forward_batch(&[13048], &[0])
+        .expect("expert-major decode")[0];
+    if d_got != d_want {
+        wrong.push(format!(
+            "decode: token-major {d_want}, expert-major {d_got}"
+        ));
+    }
+
+    for w in &wrong {
+        eprintln!("  MISMATCH {w}");
+    }
+    assert!(wrong.is_empty(), "{} cases disagree", wrong.len());
+    eprintln!("  expert-major == token-major at every tile width, and in decode");
+}
+
+#[test]
+#[ignore = "uploads 23 GiB to the device; needs a free GPU and the real model"]
+fn expert_major_against_token_major() {
+    // A/B in one process, alternating, best of several — the only comparison this
+    // card's run-to-run drift does not swamp, and the discipline four earlier
+    // optimisations had to learn the hard way.
+    let Some((model, mut vk)) = open(600, llamd_vulkan::MAX_SEQ) else {
+        skip("expert_major_against_token_major", "no model or no Vulkan");
+        return;
+    };
+    let vocab = llamd_tokenizer::Vocab::from_gguf(model.gguf()).expect("vocab");
+    let unit = vocab.encode(
+        "Grouping the expert matmuls by expert rather than by token reads each \
+         expert's weights once for every token that chose it. ",
+        false,
+    );
+    let mut prompt: Vec<u32> = Vec::new();
+    while prompt.len() < 512 {
+        prompt.extend_from_slice(&unit);
+    }
+    prompt.truncate(512);
+
+    eprintln!(
+        "\n  512-token prompt.  {:>7} {:>12} {:>12} {:>9}",
+        "tile", "token-major", "expert-major", "speedup"
+    );
+    for tile in [8usize, 16, 32] {
+        if tile > llamd_vulkan::MAX_SEQ {
+            continue;
+        }
+        vk.prefill_tile = tile;
+        let mut best = [f64::MAX; 2]; // [token-major, expert-major]
+        for _ in 0..3 {
+            for (arm, em) in [(0usize, false), (1usize, true)] {
+                vk.expert_major_min_tokens = if em { 1 } else { usize::MAX };
+                let _ = vk.prefill(&prompt[..64], 0); // warm this configuration
+                let t = std::time::Instant::now();
+                vk.prefill(&prompt, 0).expect("prefill");
+                let sec = t.elapsed().as_secs_f64();
+                if sec < best[arm] {
+                    best[arm] = sec;
+                }
+            }
+        }
+        eprintln!(
+            "  {:>14} {:>9.1} t/s {:>9.1} t/s {:>8.2}x",
+            tile,
+            prompt.len() as f64 / best[0],
+            prompt.len() as f64 / best[1],
+            best[0] / best[1]
+        );
+    }
+    vk.expert_major_min_tokens = 1;
+    eprintln!("  llama.cpp pp512: 1632 t/s");
+
+    // And the effect on decode, where a tile holds one token and the grouping has
+    // nothing to share — it should be neutral or a small loss, and it matters that
+    // it is not a large one.
+    eprintln!("\n  decode, 32 tokens:");
+    for (name, em) in [("token-major", false), ("expert-major", true)] {
+        vk.expert_major_min_tokens = if em { 1 } else { usize::MAX };
+        let mut tk = vec![13048u32];
+        for pos in 0..8 {
+            tk = vk.forward_batch(&tk, &[pos]).expect("warm");
+        }
+        let t = std::time::Instant::now();
+        for pos in 0..32 {
+            tk = vk.forward_batch(&tk, &[pos]).expect("timed");
+        }
+        let ms = t.elapsed().as_secs_f64() * 1e3 / 32.0;
+        eprintln!(
+            "  {name:<14} {ms:>7.2} ms/token  {:>7.2} tok/s",
+            1000.0 / ms
+        );
+    }
+    vk.expert_major_min_tokens = 1;
+}

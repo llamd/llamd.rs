@@ -1,0 +1,82 @@
+#version 450
+//
+// Group the tile's (token, slot) pairs by expert — a counting sort in one
+// workgroup.
+//
+// WHY ON DEVICE. The routing is chosen by the router shader, so the grouping
+// depends on data that only exists on the GPU. Reading the expert ids back to
+// sort them on the host would mean a submit-and-wait per layer, 48 per prefill
+// tile, which is exactly the stall the whole engine is built to avoid. So the
+// sort happens here, between the router and the expert matmuls, inside the same
+// command buffer.
+//
+// IT IS TINY. At most nseq * n_used = 32 * 8 = 256 pairs over 128 experts, so one
+// workgroup of 256 threads does the histogram, the prefix sum and the scatter
+// with shared-memory atomics and no global synchronisation.
+//
+// WHAT COMES OUT. `pair_slot` and `pair_token` sorted so that equal experts are
+// contiguous, plus per-expert `grp_start` and `grp_count`. The matmul then reads
+// an expert's weights ONCE and multiplies them against every token that chose it.
+
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer IDS { int ids[];   };   // [nseq][n_used]
+layout(std430, binding = 1) writeonly buffer GS  { int gstart[]; };  // [n_expert]
+layout(std430, binding = 2) writeonly buffer GC  { int gcount[]; };  // [n_expert]
+layout(std430, binding = 3) writeonly buffer PT  { int ptoken[]; };  // [nseq*n_used]
+layout(std430, binding = 4) writeonly buffer PS  { int pslot[];  };  // [nseq*n_used]
+
+layout(push_constant) uniform P { uint n_expert; uint n_used; uint nseq; } pc;
+#include "common.glsl"
+
+shared int  s_count[1024];
+shared int  s_start[1024];
+shared int  s_fill[1024];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint npair = pc.nseq * pc.n_used;
+    if (pc.n_expert > 1024u) return;
+
+    for (uint e = t; e < pc.n_expert; e += 256u) s_count[e] = 0;
+    barrier();
+
+    // Histogram. Shared atomics, so no ordering assumption between threads.
+    for (uint p = t; p < npair; p += 256u) {
+        int e = ids[p];
+        if (e >= 0 && uint(e) < pc.n_expert) atomicAdd(s_count[uint(e)], 1);
+    }
+    barrier();
+
+    // Exclusive prefix sum over the experts. 128 of them, so a single thread is
+    // cheaper than a parallel scan's barriers.
+    if (t == 0u) {
+        int run = 0;
+        for (uint e = 0u; e < pc.n_expert; ++e) {
+            s_start[e] = run;
+            s_fill[e] = run;
+            run += s_count[e];
+        }
+    }
+    barrier();
+
+    // Scatter. atomicAdd on the fill cursor gives each pair a distinct slot; the
+    // order WITHIN an expert is unspecified, which is fine — every pair carries
+    // the output slot it must be written back to.
+    for (uint p = t; p < npair; p += 256u) {
+        int e = ids[p];
+        if (e < 0 || uint(e) >= pc.n_expert) continue;
+        int at = atomicAdd(s_fill[uint(e)], 1);
+        // p is (token * n_used + slot): the token supplies the activation, and p
+        // itself is the output slot the result belongs in.
+        ptoken[at] = int(p / pc.n_used);
+        pslot[at] = int(p);
+    }
+    barrier();
+
+    for (uint e = t; e < pc.n_expert; e += 256u) {
+        gstart[e] = s_start[e];
+        gcount[e] = s_count[e];
+    }
+}
