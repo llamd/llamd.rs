@@ -594,3 +594,185 @@ longer integration:
 
 Those three plausibly reach ~8 ms, i.e. ~125 tok/s. 140 would need the expert
 path near 480 GB/s, which nothing has yet demonstrated at a 10 MB shape.
+
+---
+
+## 9. Attempting 140: two more measurements that said no
+
+§8 named the next lever: `attn_q` measures 230 GB/s where the output projection
+reaches 480, and closing that should be worth ~1 ms. The lever was built,
+measured, and does not exist.
+
+### Split-k: several waves per output row
+
+`attn_out` is [4096 → 2048]. At one wave per row that is 2048 waves — 65536
+threads against this card's 131072-thread capacity, so half the GPU is idle for
+the whole projection. Row count is fixed by the model, so the only way to fill
+the card on a short matrix is to put several waves on one row, each summing a
+strided subset of the row's blocks, combining through LDS.
+
+Kernel-only, every legal `nsub`:
+
+| shape | rows | blocks | nsub=1 | best | gain |
+|---|---|---|---|---|---|
+| `attn_q` [2048→4096] | 4096 | 8 | 38.8 µs / 177 GB/s | **nsub=4: 25.5 µs / 269** | **1.52×** |
+| `attn_out` [4096→2048] | 2048 | 16 | 21.9 µs / 314 | nsub=4: 19.7 µs / 350 | 1.11× |
+| `expert_gate` ×8 | 6144 | 8 | 44.5 µs / 232 | **nsub=2: 31.3 µs / 330** | **1.42×** |
+| `expert_down` ×8 | 16384 | 3 | 41.8 µs / 247 | nsub=2: 35.0 µs / 295 | 1.19× |
+| `output` [2048→151936] | 151936 | 8 | **608 µs / 419** | nsub=1 | — |
+
+A clear result, pointing at a 1.4–1.5× gain on the two phases that carry most of
+the traffic. **Applied to the engine it made things slower.**
+
+| nsub (q/k/v, gate+up, down) | ms/token | tok/s |
+|---|---|---|
+| **(1, 1, 1)** | **9.432** | **106.02** |
+| (1, 2, 1) | 9.566 | 104.54 |
+| (2, 1, 1) | 9.942 | 100.58 |
+| (1, 1, 2) | 10.261 | 97.45 |
+| (4, 2, 2) | 10.317 | 96.93 |
+| (2, 2, 2) | 10.800 | 92.60 |
+
+Every split-k configuration lost. Split-k is off.
+
+### Why the benchmark lied, and it is not the kernel's fault
+
+**The R9700 has 64 MB of Infinity Cache.** The benchmark loops one matrix 1000
+times, so after the first iteration a 6.6 MiB projection is entirely resident:
+it measures cache bandwidth. Every shape in that table except the 243 MiB output
+projection fits — which is exactly why `output` is the one shape where the
+benchmark and the engine agree that nsub=1 wins.
+
+In a real token, each layer's weights are read **once**, cold, from HBM. There is
+no reuse to cache: 2.5 GB streams through per token and 48 layers never revisit
+each other's weights. Split-k adds LDS reductions and barriers for parallelism
+that a bandwidth-bound cold read cannot use.
+
+This also retires the "230 GB/s vs 480 GB/s" gap §8 pointed at. That comparison
+was between a cache-resident 6.6 MiB matrix and a genuinely HBM-bound 243 MiB
+one — not between a slow kernel and a fast one.
+
+A second, smaller finding from the same exercise: the split-k kernels cost ~5% at
+`nsub=1`, because they still write to LDS, barrier, and run a combine loop with
+nothing to combine. `nsub == 1` now dispatches to the dedicated kernel.
+
+### Where this leaves 140
+
+**Final: 102.6 – 103.3 tok/s, 1.07 – 1.08× llama.cpp**, three consecutive runs,
+warmed, 64 generated tokens, tokens identical to llama.cpp throughout.
+
+140 tok/s needs 7.14 ms/token. The engine is at 9.68–9.75 ms and reads 2.5 GB of
+weights per token, so 140 requires **355 GB/s sustained on a cold stream**. The
+only shape ever measured above that here was the output projection at 419–480
+GB/s — 243 MiB, and the one shape large enough that its number is honest.
+
+So the remaining 26% is not an integration problem and not an occupancy problem.
+It is the cold-stream bandwidth of the Q6_K dot product itself, and nothing
+tried so far moves it. Candidates, in order of expected return at the time:
+
+1. **Wider loads** — the inner loop reads `ql` and `qh` a byte at a time.
+   **Attempted; see §10. It does not help the engine.**
+2. `__builtin_nontemporal_load` for weights that are read once and never reused.
+3. **Two tokens at a time.** Batch-2 decode halves the weight traffic per token
+   outright — a change to the engine's shape rather than a kernel.
+
+---
+
+## 10. Planar Q6_K: a 1.16× kernel that the engine does not feel
+
+§9 ended by naming load width as the most promising remaining lever, and the
+reasoning was sound enough to be worth building.
+
+### The measurement that motivated it
+
+A cold streaming read on this card, 2 GiB buffer so nothing caches:
+
+| load width | GB/s | of the 640 GB/s spec |
+|---|---|---|
+| `uint4` (16 bytes) | **637.8** | **100%** |
+
+The card delivers its full rated bandwidth. The Q6_K matvec sustains ~260 GB/s
+in the engine, and the reason it cannot use a wide load is alignment: ggml
+stores Q6_K as **210-byte blocks**, so block `b` sits at `b × 210` and
+`210 % 16 = 2`. Every block has a different alignment mod 16 and the kernel is
+forced into single-byte loads.
+
+### The fix, and it is a clean one
+
+`repack_q6k_planar` splits the four components into separate planes — 128 bytes
+of low nibbles, 64 of high bits, 16 scales, one f16 — whose per-block strides all
+divide 16. `ql`, `qh` and `sc` become 16-byte aligned everywhere. It is a
+**permutation**: total bytes, and therefore VRAM, are unchanged, asserted
+byte-for-byte by `planar_repack_is_a_permutation`.
+
+The kernel then reads one `uint4` of `ql`, one of `qh` and two of activation per
+32 multiply-accumulates, where the interleaved kernel spends 14 byte loads per 8.
+
+Measured on a 243 MiB tensor, and it agrees with the scalar reference on every
+shape the model uses (3, 8 and 16 blocks per row):
+
+| | µs | GB/s | of 637.8 |
+|---|---|---|---|
+| interleaved | 580.5 | 439.7 | 69% |
+| **planar** | **499.9** | **510.6** | **80%** |
+| speedup | | **1.16×** | |
+
+### In the engine it is worth nothing
+
+| | tok/s (3 runs) | mean |
+|---|---|---|
+| interleaved | 102.56, 103.31, 103.27 | **103.1** |
+| planar | 100.80, 102.52, 102.58 | 102.0 |
+
+No better, and 18.3 s of host-side repack at load against 3.8 s. The engine runs
+interleaved; the planar path is kept, tested and documented, because the finding
+is worth more than the code.
+
+The detail that explains it: the `output+argmax` phase — the one place a single
+243 MiB projection dominates, the exact shape the benchmark measured 1.16× on —
+did not move. 0.495–0.500 ms planar against 0.498–0.502 interleaved.
+
+### Which means even the 243 MiB benchmark was cache-assisted
+
+This card has **64 MB of Infinity Cache**. A 50-iteration loop over 243 MiB keeps
+about a quarter of it resident, and the planar layout's contiguous plane scans
+benefit from that far more than a single cold pass does. §9 already caught this
+at 6.6 MiB and compensated by going to 243 MiB. That was not enough.
+
+**The rule this establishes for this repo: a repeated-iteration microbenchmark on
+this card cannot be trusted at any tensor size.** Only whole-token timing can
+decide a kernel change. `examples/splitk.rs` and `tests/planar.rs` both carry
+that warning now.
+
+There is a second, more interesting reading. Planar reaches 510 GB/s on one big
+matrix, and the engine averages 260 GB/s across 2.5 GB of weight traffic. The
+gap is not layout and not load width — it is that **most of the model is small
+matrices**. 46.4 MB per layer arrives as tensors of 0.86 to 10.3 MB, where the
+fixed costs of a launch, an occupancy ramp and a reduction dominate whatever the
+bytes are doing.
+
+### Final state, and the honest answer about 140
+
+**101.1 – 102.1 tok/s, 1.06 – 1.07× llama.cpp's 94.4 – 95.6.** Tokens identical
+to llama.cpp and to the CPU reference on all five agreement prompts, every run.
+
+Three optimisations were built and measured against the engine in this round and
+the last. All three were rejected by measurement:
+
+| | standalone | in the engine |
+|---|---|---|
+| HIP graph capture | — | slower, then neutral |
+| split-k, several waves per row | up to **1.52×** | 5–13% slower |
+| planar Q6_K, 16-byte loads | **1.16×** | neutral |
+
+140 tok/s needs 7.14 ms/token against today's 9.80–9.89, i.e. 355 GB/s sustained
+on 2.5 GB of cold weight traffic. Nothing measured here reaches that outside a
+cache-assisted benchmark, and the three most plausible kernel-level routes are
+now closed.
+
+**The remaining route is not a kernel.** Decoding two tokens per pass halves the
+weight traffic per token: the same 2.5 GB serves two tokens, so 140 tok/s would
+need ~180 GB/s, well under the ~260 already achieved. That is a change to the
+engine's shape — a second KV position, activations in pairs, and a batch
+dimension through every kernel — and it is the only path to 140 on this card that
+the measurements support.

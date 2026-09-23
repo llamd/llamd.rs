@@ -613,6 +613,184 @@ pub fn quantize_q8k_on_device(x: &[f32]) -> Result<Vec<llamd_quant::BlockQ8K>> {
     }
 }
 
+/// A planar-repacked Q6_K tensor on the device, with its plane offsets.
+///
+/// Separate from [`DeviceWeights`] because the kernels index it differently:
+/// four planes at fixed offsets rather than 210-byte interleaved blocks. The
+/// repack happens on the host during upload and is a permutation, so the bytes
+/// on the device are the same bytes the file holds.
+pub struct PlanarWeights {
+    buf: crate::forward::DevBuf,
+    off: [usize; 4],
+    rows: usize,
+    blocks: usize,
+}
+
+impl PlanarWeights {
+    /// Repack interleaved Q6_K bytes and upload.
+    pub fn upload(src: &[u8], rows: usize, blocks: usize) -> Result<Self> {
+        let packed = llamd_quant::repack_q6k_planar(src, rows, blocks)?;
+        let l = llamd_quant::PlanarQ6K::layout(rows, blocks);
+        let buf = crate::forward::DevBuf::from_bytes(&packed)?;
+        Ok(PlanarWeights {
+            buf,
+            off: [l.ql, l.qh, l.sc, l.d],
+            rows,
+            blocks,
+        })
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+    pub fn blocks(&self) -> usize {
+        self.blocks
+    }
+    pub fn offsets(&self) -> &[usize; 4] {
+        &self.off
+    }
+    pub fn buf(&self) -> &crate::forward::DevBuf {
+        &self.buf
+    }
+
+    /// Host-in, host-out planar matvec, for validation against the scalar path.
+    pub fn matvec(&self, act: &[llamd_quant::BlockQ8K]) -> Result<Vec<f32>> {
+        if act.len() != self.blocks {
+            return Err(Error::Shape {
+                expected: vec![self.blocks],
+                got: vec![act.len()],
+            });
+        }
+        let mut aq = Vec::with_capacity(self.blocks * llamd_quant::QK_K);
+        let mut ad = Vec::with_capacity(self.blocks);
+        for b in act {
+            aq.extend_from_slice(&b.qs);
+            ad.push(b.d);
+        }
+        #[cfg(not(rocm))]
+        {
+            let _ = (aq, ad);
+            Err(Error::unsupported("rocm", "not built with ROCm support"))
+        }
+        #[cfg(rocm)]
+        {
+            let mut out = vec![0.0f32; self.rows];
+            let _guard = SCRATCH.lock().expect("scratch mutex");
+            // SAFETY: the buffer holds a full planar repack of rows*blocks
+            // blocks; `off` came from the same layout call, so every plane read
+            // stays inside it. aq/ad/out are sized from blocks and rows.
+            #[allow(unsafe_code)]
+            let rc = unsafe {
+                crate::forward::ffi::llamd_rocm_planar_matvec(
+                    self.buf.ptr(),
+                    self.off.as_ptr(),
+                    aq.as_ptr(),
+                    ad.as_ptr(),
+                    out.as_mut_ptr(),
+                    self.blocks as i32,
+                    self.rows as i32,
+                )
+            };
+            if rc != 0 {
+                return Err(Error::other("HIP planar matvec failed"));
+            }
+            Ok(out)
+        }
+    }
+
+    /// Kernel-only milliseconds for `iters` planar launches.
+    pub fn bench(&self, act: &[llamd_quant::BlockQ8K], iters: u32) -> Result<f32> {
+        if act.len() != self.blocks || iters == 0 {
+            return Err(Error::malformed("planar bench args", "invalid"));
+        }
+        let mut aq = Vec::with_capacity(self.blocks * llamd_quant::QK_K);
+        let mut ad = Vec::with_capacity(self.blocks);
+        for b in act {
+            aq.extend_from_slice(&b.qs);
+            ad.push(b.d);
+        }
+        #[cfg(not(rocm))]
+        {
+            let _ = (aq, ad);
+            Err(Error::unsupported("rocm", "not built with ROCm support"))
+        }
+        #[cfg(rocm)]
+        {
+            let mut ms = 0.0f32;
+            let _guard = SCRATCH.lock().expect("scratch mutex");
+            // SAFETY: as `matvec`, with no host output buffer.
+            #[allow(unsafe_code)]
+            let rc = unsafe {
+                crate::forward::ffi::llamd_rocm_planar_bench(
+                    self.buf.ptr(),
+                    self.off.as_ptr(),
+                    aq.as_ptr(),
+                    ad.as_ptr(),
+                    self.blocks as i32,
+                    self.rows as i32,
+                    iters as i32,
+                    &mut ms,
+                )
+            };
+            if rc != 0 {
+                return Err(Error::other("HIP planar bench failed"));
+            }
+            Ok(ms)
+        }
+    }
+}
+
+impl DeviceWeights {
+    /// Kernel-only milliseconds for `iters` split-k launches with `nsub` waves
+    /// per row. Exists so `nsub` is chosen by measurement: reasoning about
+    /// occupancy predicted a gain on attn_out and delivered a small loss.
+    pub fn bench_splitk(
+        &self,
+        act: &[llamd_quant::BlockQ8K],
+        nsub: u32,
+        iters: u32,
+    ) -> Result<f32> {
+        if act.len() != self.blocks || iters == 0 || nsub == 0 || 8 % nsub != 0 {
+            return Err(Error::malformed("splitk bench args", "invalid"));
+        }
+        let mut aq = Vec::with_capacity(self.blocks * llamd_quant::QK_K);
+        let mut ad = Vec::with_capacity(self.blocks);
+        for b in act {
+            aq.extend_from_slice(&b.qs);
+            ad.push(b.d);
+        }
+        #[cfg(not(rocm))]
+        {
+            let _ = (aq, ad);
+            Err(Error::unsupported("rocm", "not built with ROCm support"))
+        }
+        #[cfg(rocm)]
+        {
+            let mut ms = 0.0f32;
+            let _guard = SCRATCH.lock().expect("scratch mutex");
+            // SAFETY: as the other bench entry points — live upload, buffers
+            // sized from the same `blocks`/`rows`.
+            #[allow(unsafe_code)]
+            let rc = unsafe {
+                crate::forward::ffi::llamd_rocm_splitk_bench(
+                    self.ptr,
+                    aq.as_ptr(),
+                    ad.as_ptr(),
+                    self.blocks as i32,
+                    self.rows as i32,
+                    nsub as i32,
+                    iters as i32,
+                    &mut ms,
+                )
+            };
+            if rc != 0 {
+                return Err(Error::other("HIP split-k bench failed"));
+            }
+            Ok(ms)
+        }
+    }
+}
+
 impl Drop for DeviceWeights {
     fn drop(&mut self) {
         #[cfg(rocm)]

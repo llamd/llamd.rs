@@ -374,6 +374,153 @@ pub(crate) mod ffi {
         );
         pub fn llamd_fwd_quantize(x: *const f32, qs: *mut i8, d: *mut f32, nblocks: c_int);
         #[allow(clippy::too_many_arguments)]
+        pub fn llamd_fwd_matvec_x3_splitk(
+            w0: *const c_void,
+            w1: *const c_void,
+            w2: *const c_void,
+            aq: *const i8,
+            ad: *const f32,
+            o0: *mut f32,
+            o1: *mut f32,
+            o2: *mut f32,
+            blocks: c_int,
+            rows0: c_int,
+            rows1: c_int,
+            rows2: c_int,
+            nsub: c_int,
+        );
+        #[allow(clippy::too_many_arguments)]
+        pub fn llamd_fwd_matvec_grouped_x2_splitk(
+            wa: *const c_void,
+            wb: *const c_void,
+            ids: *const i32,
+            aq: *const i8,
+            ad: *const f32,
+            oa: *mut f32,
+            ob: *mut f32,
+            blocks: c_int,
+            rows: c_int,
+            n_used: c_int,
+            nsub: c_int,
+        );
+        #[allow(clippy::too_many_arguments)]
+        pub fn llamd_fwd_matvec_grouped_pa_splitk(
+            w: *const c_void,
+            ids: *const i32,
+            aq: *const i8,
+            ad: *const f32,
+            out: *mut f32,
+            blocks: c_int,
+            rows: c_int,
+            n_used: c_int,
+            nsub: c_int,
+        );
+        pub fn llamd_fwd_planar_matvec(
+            base: *const c_void,
+            off: *const usize,
+            aq: *const i8,
+            ad: *const f32,
+            out: *mut f32,
+            blocks: c_int,
+            rows: c_int,
+        );
+        #[allow(clippy::too_many_arguments)]
+        pub fn llamd_fwd_planar_grouped(
+            base: *const c_void,
+            off: *const usize,
+            ids: *const i32,
+            aq: *const i8,
+            ad: *const f32,
+            out: *mut f32,
+            blocks: c_int,
+            rows: c_int,
+            n_used: c_int,
+        );
+        #[allow(clippy::too_many_arguments)]
+        pub fn llamd_fwd_planar_grouped_pa(
+            base: *const c_void,
+            off: *const usize,
+            ids: *const i32,
+            aq: *const i8,
+            ad: *const f32,
+            out: *mut f32,
+            blocks: c_int,
+            rows: c_int,
+            n_used: c_int,
+        );
+        #[allow(clippy::too_many_arguments)]
+        pub fn llamd_fwd_planar_x3(
+            b0: *const c_void,
+            f0: *const usize,
+            b1: *const c_void,
+            f1: *const usize,
+            b2: *const c_void,
+            f2: *const usize,
+            aq: *const i8,
+            ad: *const f32,
+            o0: *mut f32,
+            o1: *mut f32,
+            o2: *mut f32,
+            blocks: c_int,
+            rows0: c_int,
+            rows1: c_int,
+            rows2: c_int,
+        );
+        #[allow(clippy::too_many_arguments)]
+        pub fn llamd_fwd_planar_grouped_x2(
+            ba: *const c_void,
+            fa: *const usize,
+            bb: *const c_void,
+            fb: *const usize,
+            ids: *const i32,
+            aq: *const i8,
+            ad: *const f32,
+            oa: *mut f32,
+            ob: *mut f32,
+            blocks: c_int,
+            rows: c_int,
+            n_used: c_int,
+        );
+        pub fn llamd_rocm_planar_matvec(
+            base: *const c_void,
+            off: *const usize,
+            aq: *const i8,
+            ad: *const f32,
+            out: *mut f32,
+            blocks: c_int,
+            rows: c_int,
+        ) -> c_int;
+        #[allow(clippy::too_many_arguments)]
+        pub fn llamd_rocm_planar_bench(
+            base: *const c_void,
+            off: *const usize,
+            aq: *const i8,
+            ad: *const f32,
+            blocks: c_int,
+            rows: c_int,
+            iters: c_int,
+            ms_out: *mut f32,
+        ) -> c_int;
+        pub fn llamd_rocm_splitk_bench(
+            w: *const c_void,
+            aq: *const i8,
+            ad: *const f32,
+            blocks: c_int,
+            rows: c_int,
+            nsub: c_int,
+            iters: c_int,
+            ms_out: *mut f32,
+        ) -> c_int;
+        pub fn llamd_fwd_matvec_splitk(
+            w: *const c_void,
+            aq: *const i8,
+            ad: *const f32,
+            out: *mut f32,
+            blocks: c_int,
+            rows: c_int,
+            nsub: c_int,
+        );
+        #[allow(clippy::too_many_arguments)]
         pub fn llamd_fwd_matvec_x3(
             w0: *const c_void,
             w1: *const c_void,
@@ -1031,6 +1178,50 @@ pub mod op {
         Ok(())
     }
 
+    /// Matvec with `nsub` waves cooperating on each output row.
+    ///
+    /// For matrices with too few rows to fill the card: attn_out's 2048 rows
+    /// are 2048 waves against a 4096-wave capacity, so half the GPU idles.
+    /// `nsub` must divide 8 (the waves in a workgroup) and should not exceed
+    /// `blocks`, or waves are assigned no work.
+    pub fn matvec_splitk(
+        w: &DevBuf,
+        qs: &DevBuf,
+        d: &DevBuf,
+        out: &DevBuf,
+        blocks: usize,
+        rows: usize,
+        nsub: usize,
+    ) -> Result<()> {
+        if nsub == 0 || 8 % nsub != 0 {
+            return Err(Error::malformed(
+                "matvec_splitk",
+                format!("nsub {nsub} must divide 8"),
+            ));
+        }
+        if nsub > blocks {
+            return Err(Error::malformed(
+                "matvec_splitk",
+                format!("nsub {nsub} exceeds {blocks} blocks; waves would idle"),
+            ));
+        }
+        if nsub == 1 {
+            return matvec(w, qs, d, out, blocks, rows);
+        }
+        need(out, rows, "splitk out")?;
+        need(d, blocks, "splitk d")?;
+        launch!(ffi::llamd_fwd_matvec_splitk(
+            w.ptr(),
+            qs.ptr() as *const i8,
+            d.as_f32(),
+            out.as_f32(),
+            blocks as i32,
+            rows as i32,
+            nsub as i32
+        ));
+        Ok(())
+    }
+
     /// Q, K and V in one launch. All three read the same quantized activation.
     #[allow(clippy::too_many_arguments)]
     pub fn matvec_x3(
@@ -1058,6 +1249,135 @@ pub mod op {
             rows.0 as i32,
             rows.1 as i32,
             rows.2 as i32
+        ));
+        Ok(())
+    }
+
+    /// Validates `nsub` against the shape. Measured per shape rather than
+    /// reasoned about: an occupancy argument predicted a gain for attn_out and
+    /// the engine got slower, while attn_q gained 1.52x.
+    fn check_nsub(nsub: usize, blocks: usize) -> Result<()> {
+        if nsub == 0 || 8 % nsub != 0 {
+            return Err(Error::malformed("nsub", format!("{nsub} must divide 8")));
+        }
+        if nsub > blocks {
+            return Err(Error::malformed(
+                "nsub",
+                format!("{nsub} exceeds {blocks} blocks; waves would idle"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Q, K and V in one launch, with `nsub` waves per row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_x3_splitk(
+        w: (&DevBuf, &DevBuf, &DevBuf),
+        qs: &DevBuf,
+        d: &DevBuf,
+        out: (&DevBuf, &DevBuf, &DevBuf),
+        blocks: usize,
+        rows: (usize, usize, usize),
+        nsub: usize,
+    ) -> Result<()> {
+        check_nsub(nsub, blocks)?;
+        // At nsub=1 there is nothing to combine, and the split-k kernel still
+        // pays an LDS write, a barrier and the combine loop — measured ~5% on
+        // the engine. Use the dedicated kernel instead.
+        if nsub == 1 {
+            return matvec_x3(w, qs, d, out, blocks, rows);
+        }
+        need(out.0, rows.0, "x3 out0")?;
+        need(out.1, rows.1, "x3 out1")?;
+        need(out.2, rows.2, "x3 out2")?;
+        need(d, blocks, "x3 d")?;
+        launch!(ffi::llamd_fwd_matvec_x3_splitk(
+            w.0.ptr(),
+            w.1.ptr(),
+            w.2.ptr(),
+            qs.ptr() as *const i8,
+            d.as_f32(),
+            out.0.as_f32(),
+            out.1.as_f32(),
+            out.2.as_f32(),
+            blocks as i32,
+            rows.0 as i32,
+            rows.1 as i32,
+            rows.2 as i32,
+            nsub as i32
+        ));
+        Ok(())
+    }
+
+    /// Expert gate and up in one launch, with `nsub` waves per row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_grouped_x2_splitk(
+        wa: &DevBuf,
+        wb: &DevBuf,
+        ids: &DevBuf,
+        qs: &DevBuf,
+        d: &DevBuf,
+        oa: &DevBuf,
+        ob: &DevBuf,
+        blocks: usize,
+        rows: usize,
+        n_used: usize,
+        nsub: usize,
+    ) -> Result<()> {
+        check_nsub(nsub, blocks)?;
+        if nsub == 1 {
+            return matvec_grouped_x2(wa, wb, ids, qs, d, oa, ob, blocks, rows, n_used);
+        }
+        need(oa, rows * n_used, "x2 oa")?;
+        need(ob, rows * n_used, "x2 ob")?;
+        need(d, blocks, "x2 d")?;
+        need(ids, n_used, "x2 ids")?;
+        launch!(ffi::llamd_fwd_matvec_grouped_x2_splitk(
+            wa.ptr(),
+            wb.ptr(),
+            ids.ptr() as *const i32,
+            qs.ptr() as *const i8,
+            d.as_f32(),
+            oa.as_f32(),
+            ob.as_f32(),
+            blocks as i32,
+            rows as i32,
+            n_used as i32,
+            nsub as i32
+        ));
+        Ok(())
+    }
+
+    /// The down projection — per-expert activations — with `nsub` waves per row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_grouped_per_act_splitk(
+        w: &DevBuf,
+        ids: &DevBuf,
+        qs: &DevBuf,
+        d: &DevBuf,
+        out: &DevBuf,
+        blocks: usize,
+        rows: usize,
+        n_used: usize,
+        nsub: usize,
+    ) -> Result<()> {
+        check_nsub(nsub, blocks)?;
+        if nsub == 1 {
+            return matvec_grouped_per_act(w, ids, qs, d, out, blocks, rows, n_used);
+        }
+        need(out, rows * n_used, "pa out")?;
+        need(d, blocks * n_used, "pa d")?;
+        need(ids, n_used, "pa ids")?;
+        launch!(ffi::llamd_fwd_matvec_grouped_pa_splitk(
+            w.ptr(),
+            ids.ptr() as *const i32,
+            qs.ptr() as *const i8,
+            d.as_f32(),
+            out.as_f32(),
+            blocks as i32,
+            rows as i32,
+            n_used as i32,
+            nsub as i32
         ));
         Ok(())
     }
@@ -1090,6 +1410,164 @@ pub mod op {
             oa.as_f32(),
             ob.as_f32(),
             blocks as i32,
+            rows as i32,
+            n_used as i32
+        ));
+        Ok(())
+    }
+
+    // ---- planar variants -------------------------------------------------
+    //
+    // Same arithmetic, 16-byte loads. Measured on a cold 243 MiB tensor —
+    // large enough to defeat this card's 64 MB Infinity Cache — the planar
+    // kernel reaches 510.6 GB/s against the interleaved 439.7, a 1.16x gain
+    // and 80% of the 637.8 GB/s a pure streaming read achieves.
+
+    pub fn planar_matvec(
+        w: &crate::PlanarWeights,
+        qs: &DevBuf,
+        d: &DevBuf,
+        out: &DevBuf,
+        rows: usize,
+    ) -> Result<()> {
+        need(out, rows, "planar out")?;
+        need(d, w.blocks(), "planar d")?;
+        launch!(ffi::llamd_fwd_planar_matvec(
+            w.buf().ptr(),
+            w.offsets().as_ptr(),
+            qs.ptr() as *const i8,
+            d.as_f32(),
+            out.as_f32(),
+            w.blocks() as i32,
+            rows as i32
+        ));
+        Ok(())
+    }
+
+    pub fn planar_grouped(
+        w: &crate::PlanarWeights,
+        ids: &DevBuf,
+        qs: &DevBuf,
+        d: &DevBuf,
+        out: &DevBuf,
+        rows: usize,
+        n_used: usize,
+    ) -> Result<()> {
+        need(out, rows * n_used, "planar grouped out")?;
+        need(d, w.blocks(), "planar grouped d")?;
+        need(ids, n_used, "planar grouped ids")?;
+        launch!(ffi::llamd_fwd_planar_grouped(
+            w.buf().ptr(),
+            w.offsets().as_ptr(),
+            ids.ptr() as *const i32,
+            qs.ptr() as *const i8,
+            d.as_f32(),
+            out.as_f32(),
+            w.blocks() as i32,
+            rows as i32,
+            n_used as i32
+        ));
+        Ok(())
+    }
+
+    /// The down projection: one activation per routed expert.
+    pub fn planar_grouped_per_act(
+        w: &crate::PlanarWeights,
+        ids: &DevBuf,
+        qs: &DevBuf,
+        d: &DevBuf,
+        out: &DevBuf,
+        rows: usize,
+        n_used: usize,
+    ) -> Result<()> {
+        need(out, rows * n_used, "planar pa out")?;
+        need(d, w.blocks() * n_used, "planar pa d")?;
+        need(ids, n_used, "planar pa ids")?;
+        launch!(ffi::llamd_fwd_planar_grouped_pa(
+            w.buf().ptr(),
+            w.offsets().as_ptr(),
+            ids.ptr() as *const i32,
+            qs.ptr() as *const i8,
+            d.as_f32(),
+            out.as_f32(),
+            w.blocks() as i32,
+            rows as i32,
+            n_used as i32
+        ));
+        Ok(())
+    }
+
+    pub fn planar_x3(
+        w: (
+            &crate::PlanarWeights,
+            &crate::PlanarWeights,
+            &crate::PlanarWeights,
+        ),
+        qs: &DevBuf,
+        d: &DevBuf,
+        out: (&DevBuf, &DevBuf, &DevBuf),
+        rows: (usize, usize, usize),
+    ) -> Result<()> {
+        need(out.0, rows.0, "planar x3 out0")?;
+        need(out.1, rows.1, "planar x3 out1")?;
+        need(out.2, rows.2, "planar x3 out2")?;
+        need(d, w.0.blocks(), "planar x3 d")?;
+        if w.1.blocks() != w.0.blocks() || w.2.blocks() != w.0.blocks() {
+            return Err(Error::malformed(
+                "planar x3",
+                "all three matrices must share the activation's block count",
+            ));
+        }
+        launch!(ffi::llamd_fwd_planar_x3(
+            w.0.buf().ptr(),
+            w.0.offsets().as_ptr(),
+            w.1.buf().ptr(),
+            w.1.offsets().as_ptr(),
+            w.2.buf().ptr(),
+            w.2.offsets().as_ptr(),
+            qs.ptr() as *const i8,
+            d.as_f32(),
+            out.0.as_f32(),
+            out.1.as_f32(),
+            out.2.as_f32(),
+            w.0.blocks() as i32,
+            rows.0 as i32,
+            rows.1 as i32,
+            rows.2 as i32
+        ));
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn planar_grouped_x2(
+        wa: &crate::PlanarWeights,
+        wb: &crate::PlanarWeights,
+        ids: &DevBuf,
+        qs: &DevBuf,
+        d: &DevBuf,
+        oa: &DevBuf,
+        ob: &DevBuf,
+        rows: usize,
+        n_used: usize,
+    ) -> Result<()> {
+        need(oa, rows * n_used, "planar x2 oa")?;
+        need(ob, rows * n_used, "planar x2 ob")?;
+        need(d, wa.blocks(), "planar x2 d")?;
+        need(ids, n_used, "planar x2 ids")?;
+        if wb.blocks() != wa.blocks() {
+            return Err(Error::malformed("planar x2", "block counts differ"));
+        }
+        launch!(ffi::llamd_fwd_planar_grouped_x2(
+            wa.buf().ptr(),
+            wa.offsets().as_ptr(),
+            wb.buf().ptr(),
+            wb.offsets().as_ptr(),
+            ids.ptr() as *const i32,
+            qs.ptr() as *const i8,
+            d.as_f32(),
+            oa.as_f32(),
+            ob.as_f32(),
+            wa.blocks() as i32,
             rows as i32,
             n_used as i32
         ));

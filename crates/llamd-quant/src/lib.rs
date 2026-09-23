@@ -20,7 +20,9 @@
 use llamd_core::{Error, Result};
 
 pub mod dot;
-pub use dot::{BlockQ8K, Q8K_BLOCK_BYTES, dot_q6k_q8k, quantize_q8_k};
+pub use dot::{
+    BlockQ8K, PlanarQ6K, Q8K_BLOCK_BYTES, dot_q6k_q8k, quantize_q8_k, repack_q6k_planar,
+};
 
 /// Super-block size for the k-quant family. `QK_K` in ggml.
 pub const QK_K: usize = 256;

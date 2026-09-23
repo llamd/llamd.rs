@@ -117,6 +117,7 @@ dependencies = [
  "llamd-cpu",
  "llamd-gguf",
  "llamd-models",
+ "llamd-quant",
  "llamd-rocm",
  "llamd-tensor",
 ]

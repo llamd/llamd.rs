@@ -29,6 +29,14 @@ use llamd_rocm::{DevBuf, op};
 /// One layer's weights, already on the device.
 struct DeviceLayer {
     attn_norm: DevBuf,
+    /// INTERLEAVED, i.e. ggml's own 210-byte blocks, and not planar.
+    ///
+    /// A planar repack into four 16-byte-aligned planes is implemented
+    /// (`llamd_quant::repack_q6k_planar`, `llamd_rocm::PlanarWeights`) and
+    /// measures 439.7 -> 510.6 GB/s on a 243 MiB tensor. In the engine it
+    /// measured 102.0 tok/s against 103.1 interleaved — no better, and 18.3 s
+    /// of repack at load against 3.8 s. Kept as evidence, not used. See
+    /// benchmarks.md §9.
     attn_q: DevBuf,
     attn_k: DevBuf,
     attn_v: DevBuf,
@@ -95,6 +103,21 @@ pub struct DeviceModel {
     /// This instance's identity, so a graph recorded by another model is never
     /// replayed against these buffers.
     id: u64,
+    /// Waves per output row for the q/k/v, gate/up and down projections.
+    ///
+    /// `(1, 1, 1)` — split-k OFF — because that measured fastest.
+    ///
+    /// MEASURED IN THE ENGINE, not standalone, and the two disagree completely.
+    /// A kernel-only benchmark looping one matrix 1000 times keeps it in this
+    /// card's 64 MB Infinity Cache; it reported attn_q going 38.8 -> 25.5 us at
+    /// nsub=4, a 1.52x gain, and the expert gate 44.5 -> 31.3. Applied to the
+    /// engine, where a token reads each layer's weights once from HBM and
+    /// nothing is resident, the same settings cost 5-13%.
+    ///
+    /// The lesson is about the benchmark, not the kernel: a microbenchmark that
+    /// loops over data small enough to cache measures cache bandwidth, and on a
+    /// card with 64 MB of it almost every individual projection qualifies.
+    pub nsub: (usize, usize, usize),
     /// Whether to submit tokens through a captured HIP graph.
     ///
     /// OFF by default. It measured slower before the launches were fused
@@ -385,6 +408,12 @@ impl DeviceModel {
             s,
             weight_bytes: need as usize,
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            // ALL ONE, i.e. split-k off, measured by the in-situ sweep in
+            // device_forward.rs. Every split-k configuration tried was slower:
+            // (1,1,1) 9.432 ms, (1,2,1) 9.566, (2,1,1) 9.942, (1,1,2) 10.261,
+            // (2,2,2) 10.800. The kernels are kept because the sweep is the
+            // evidence and it should stay runnable.
+            nsub: (1, 1, 1),
             // Off by default. Graph replay measured SLOWER before the
             // launches were fused (13.851 ms/token against 12.545) and is now
             // indistinguishable from queueing them (9.54-9.66 either way),
@@ -427,6 +456,7 @@ impl DeviceModel {
         let eps = hp.rms_eps;
         let fb = hp.rope_freq_base;
         let max_kv = self.max_kv;
+        let (nsub_qkv, nsub_gu, nsub_dn) = self.nsub;
         let profiling = self.profile.is_some();
         let s = &self.s;
 
@@ -463,13 +493,15 @@ impl DeviceModel {
                 // One launch for all three: same activation, and the small K
                 // and V projections fill the card alongside Q instead of
                 // running alone at 64 workgroups.
-                op::matvec_x3(
+                // nsub=4 measured: attn_q goes 38.8 -> 25.5 us, 177 -> 269 GB/s.
+                op::matvec_x3_splitk(
                     (&l.attn_q, &l.attn_k, &l.attn_v),
                     &s.aq,
                     &s.ad,
                     (&s.q, &s.k, &s.v),
                     n_embd / 256,
                     (n_head * hd, kv_dim_of(hp), kv_dim_of(hp)),
+                    nsub_qkv,
                 )?;
             });
 
@@ -506,7 +538,20 @@ impl DeviceModel {
             });
 
             phase!(attn_out, {
-                self.qmatvec(&l.attn_out, &s.attn, &s.xb2, n_head * hd, n_embd)?;
+                // attn_out is [4096 -> 2048]: 2048 rows is 2048 waves against
+                // a 4096-wave card, so one wave per row leaves half the GPU
+                // idle and it measured 202 GB/s. Four waves per row, each
+                // taking 4 of the 16 blocks.
+                op::quantize(&s.attn, &s.aq, &s.ad, (n_head * hd) / 256)?;
+                // nsub=1: the standalone bench liked 4 here, the engine did not.
+                op::matvec(
+                    &l.attn_out,
+                    &s.aq,
+                    &s.ad,
+                    &s.xb2,
+                    (n_head * hd) / 256,
+                    n_embd,
+                )?;
                 op::add(&s.x, &s.xb2, &s.x, n_embd)?;
             });
 
@@ -526,7 +571,8 @@ impl DeviceModel {
 
             phase!(experts, {
                 // Gate and up in one launch, for the same reason as q/k/v.
-                op::matvec_grouped_x2(
+                // nsub=2 measured: 44.5 -> 31.3 us per matrix, 232 -> 330 GB/s.
+                op::matvec_grouped_x2_splitk(
                     &l.ffn_gate_exps,
                     &l.ffn_up_exps,
                     &s.expert_ids,
@@ -537,13 +583,16 @@ impl DeviceModel {
                     n_embd / 256,
                     n_ffe,
                     n_used,
+                    nsub_gu,
                 )?;
                 // SiLU on the GATE only, then elementwise with up.
                 op::silu_mul(&s.e_gate, &s.e_up, &s.e_act, n_used * n_ffe)?;
                 // Each expert's down input is its OWN activation, hence the
                 // per-activation grouped kernel.
                 op::quantize(&s.e_act, &s.aq, &s.ad, (n_used * n_ffe) / 256)?;
-                op::matvec_grouped_per_act(
+                // blocks is only 3 here, so nsub=2 is the most the shape allows.
+                // Measured 41.8 -> 35.0 us, 247 -> 295 GB/s.
+                op::matvec_grouped_per_act_splitk(
                     &l.ffn_down_exps,
                     &s.expert_ids,
                     &s.aq,
@@ -552,6 +601,7 @@ impl DeviceModel {
                     n_ffe / 256,
                     n_embd,
                     n_used,
+                    nsub_dn,
                 )?;
             });
 

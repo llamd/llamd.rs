@@ -46,6 +46,7 @@
 //!    rule taught.
 
 use crate::{Q6K_BLOCK_BYTES, QK_K};
+use llamd_core::{Error, Result};
 
 /// Serialized size of one `block_q8_K`: `d(f32) + qs[256] + bsums[16](i16)`.
 pub const Q8K_BLOCK_BYTES: usize = 4 + QK_K + (QK_K / 16) * 2;
@@ -342,5 +343,141 @@ mod tests {
             (two - 2.0 * one).abs() < 1e-3 * one.abs().max(1.0),
             "{two} vs 2x{one}"
         );
+    }
+}
+
+/// Byte offsets of the four planes in a planar-repacked Q6_K tensor.
+///
+/// WHY REPACK AT ALL. ggml stores Q6_K as 210-byte blocks: 128 bytes of low
+/// nibbles, 64 of high bits, 16 int8 scales, one f16. 210 is not a multiple of
+/// 4, so block `b` sits at `b * 210` and is only 2-byte aligned — every block
+/// after the first has a different alignment mod 16, and a 16-byte vector load
+/// is impossible. The kernel is forced into single-byte loads.
+///
+/// That costs most of the card. Measured on this R9700: a cold streaming read
+/// reaches 637.8 GB/s with `uint4` (16-byte) loads — 100% of the 640 GB/s the
+/// memory spec allows — while the Q6_K matvec sustains 259 GB/s in the engine.
+///
+/// Splitting the four components into separate planes fixes the alignment
+/// without padding: each plane's per-block stride (128, 64, 16, 2) divides
+/// evenly, so `ql`, `qh` and `sc` are all 16-byte aligned everywhere and can be
+/// read as `uint4`. Total bytes are unchanged — this is a permutation, not an
+/// expansion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanarQ6K {
+    /// Low nibbles: `rows * blocks * 128` bytes at offset 0.
+    pub ql: usize,
+    /// High bits: `rows * blocks * 64`.
+    pub qh: usize,
+    /// Per-group int8 scales: `rows * blocks * 16`.
+    pub sc: usize,
+    /// Per-block f16 super-scale: `rows * blocks * 2`.
+    pub d: usize,
+    pub total: usize,
+}
+
+impl PlanarQ6K {
+    pub fn layout(rows: usize, blocks: usize) -> PlanarQ6K {
+        let n = rows * blocks;
+        let ql = 0;
+        let qh = ql + n * (QK_K / 2);
+        let sc = qh + n * (QK_K / 4);
+        let d = sc + n * (QK_K / 16);
+        PlanarQ6K {
+            ql,
+            qh,
+            sc,
+            d,
+            total: d + n * 2,
+        }
+    }
+}
+
+/// Repack interleaved Q6_K blocks into the four planes above.
+///
+/// Pure permutation: every byte of the input appears exactly once in the
+/// output, at a different offset. `planar_repack_is_a_permutation` asserts that.
+pub fn repack_q6k_planar(src: &[u8], rows: usize, blocks: usize) -> Result<Vec<u8>> {
+    let n = rows * blocks;
+    let want = n * Q6K_BLOCK_BYTES;
+    if src.len() < want {
+        return Err(Error::Shape {
+            expected: vec![want],
+            got: vec![src.len()],
+        });
+    }
+    let l = PlanarQ6K::layout(rows, blocks);
+    let mut out = vec![0u8; l.total];
+    for i in 0..n {
+        let b = &src[i * Q6K_BLOCK_BYTES..(i + 1) * Q6K_BLOCK_BYTES];
+        out[l.ql + i * (QK_K / 2)..l.ql + (i + 1) * (QK_K / 2)].copy_from_slice(&b[..QK_K / 2]);
+        out[l.qh + i * (QK_K / 4)..l.qh + (i + 1) * (QK_K / 4)]
+            .copy_from_slice(&b[QK_K / 2..QK_K / 2 + QK_K / 4]);
+        let sc0 = QK_K / 2 + QK_K / 4;
+        out[l.sc + i * (QK_K / 16)..l.sc + (i + 1) * (QK_K / 16)]
+            .copy_from_slice(&b[sc0..sc0 + QK_K / 16]);
+        let d0 = sc0 + QK_K / 16;
+        out[l.d + i * 2..l.d + i * 2 + 2].copy_from_slice(&b[d0..d0 + 2]);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod planar_tests {
+    use super::*;
+
+    #[test]
+    fn planar_repack_is_a_permutation() {
+        // Every input byte must appear once in the output. A repack that loses
+        // or duplicates a byte would change weights, and the symptom would be
+        // degraded text rather than an error.
+        let (rows, blocks) = (7usize, 5usize);
+        let mut src = vec![0u8; rows * blocks * Q6K_BLOCK_BYTES];
+        for (i, b) in src.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let out = repack_q6k_planar(&src, rows, blocks).expect("repack");
+        let l = PlanarQ6K::layout(rows, blocks);
+        assert_eq!(out.len(), src.len(), "repack must not change the size");
+        assert_eq!(l.total, src.len());
+
+        let mut hist_in = [0usize; 256];
+        let mut hist_out = [0usize; 256];
+        for &b in &src {
+            hist_in[b as usize] += 1;
+        }
+        for &b in &out {
+            hist_out[b as usize] += 1;
+        }
+        assert_eq!(hist_in, hist_out, "byte multiset changed");
+
+        // And spot-check that a specific block landed where the layout says.
+        let i = 3usize;
+        let blk = &src[i * Q6K_BLOCK_BYTES..(i + 1) * Q6K_BLOCK_BYTES];
+        assert_eq!(&out[l.ql + i * 128..l.ql + i * 128 + 128], &blk[..128]);
+        assert_eq!(&out[l.qh + i * 64..l.qh + i * 64 + 64], &blk[128..192]);
+        assert_eq!(&out[l.sc + i * 16..l.sc + i * 16 + 16], &blk[192..208]);
+        assert_eq!(&out[l.d + i * 2..l.d + i * 2 + 2], &blk[208..210]);
+    }
+
+    #[test]
+    fn planar_layout_keeps_every_plane_16_byte_aligned() {
+        // The whole point: uint4 loads need 16-byte alignment, and the
+        // interleaved 210-byte layout cannot provide it.
+        for (rows, blocks) in [(1usize, 1usize), (4096, 8), (2048, 16), (151936, 8)] {
+            let l = PlanarQ6K::layout(rows, blocks);
+            assert_eq!(l.ql % 16, 0, "ql plane");
+            assert_eq!(l.qh % 16, 0, "qh plane {rows}x{blocks}");
+            assert_eq!(l.sc % 16, 0, "sc plane {rows}x{blocks}");
+            // Per-block strides are what the kernel indexes by.
+            assert_eq!((QK_K / 2) % 16, 0);
+            assert_eq!((QK_K / 4) % 16, 0);
+            assert_eq!((QK_K / 16) % 16, 0);
+        }
+    }
+
+    #[test]
+    fn a_short_source_is_refused() {
+        assert!(repack_q6k_planar(&[0u8; 10], 1, 1).is_err());
     }
 }

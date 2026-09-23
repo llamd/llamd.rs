@@ -140,11 +140,12 @@ A live `llama-server` on the same card, configured as a user would run one
 (98304-token context, `-ctk q8_0 -ctv q8_0 -fa on`), measures **57.7 t/s**
 instead. The bar depends on configuration, so both are recorded.
 
-**LLAMD is faster than llama.cpp on this card: 101.9-103.9 tok/s against
+**LLAMD is faster than llama.cpp on this card: 101.1-102.1 tok/s against
 94.4-95.6**, measured warmed over 64 generated tokens, emitting the same tokens
 as the CPU reference and llama.cpp on all five agreement prompts. That is
-1.07-1.10x. See [benchmarks.md](benchmarks.md) §8, including the HIP graph that
-measured slower and was abandoned.
+1.07-1.10x. See [benchmarks.md](benchmarks.md) §8-§10, including three
+optimisations that measured well standalone and were rejected by the engine: HIP
+graph capture, split-k, and a planar Q6_K repack for 16-byte loads.
 
 The earlier milestone, kept for the reasoning that produced it:
 

@@ -205,6 +205,45 @@ fn device_generation_throughput() {
     assert!(tg > 0.0 && tg < 10000.0, "implausible throughput {tg}");
     assert!(!text.is_empty());
 
+    // IN-SITU nsub SWEEP. The standalone kernel benchmark reported large gains
+    // for split-k and the engine got slower, because 1000 iterations of one
+    // matrix fit the card's Infinity Cache while a real token reads each
+    // layer's weights once from HBM. Sweeping here measures what matters.
+    eprintln!("\n  nsub sweep (q/k/v, gate+up, down), 32 tokens each:");
+    let mut best = ((1usize, 1usize, 1usize), f64::MAX);
+    for cand in [
+        (1usize, 1usize, 1usize),
+        (2, 1, 1),
+        (1, 2, 1),
+        (1, 1, 2),
+        (2, 2, 2),
+        (4, 2, 2),
+    ] {
+        dev.nsub = cand;
+        let mut tk = 13048u32;
+        for pos in 0..8 {
+            tk = dev.forward(tk, pos).expect("warm");
+        }
+        let t = std::time::Instant::now();
+        for pos in 0..32 {
+            tk = dev.forward(tk, pos).expect("timed");
+        }
+        let ms = t.elapsed().as_secs_f64() * 1e3 / 32.0;
+        let mark = if ms < best.1 {
+            best = (cand, ms);
+            "  <-"
+        } else {
+            ""
+        };
+        eprintln!(
+            "    {:?}  {ms:>7.3} ms/token  ->  {:>6.2} tok/s{mark}",
+            cand,
+            1000.0 / ms
+        );
+    }
+    eprintln!("    best {:?} at {:.3} ms/token", best.0, best.1);
+    dev.nsub = best.0;
+
     // Graph against no graph, same model, same prompt. The launch-overhead
     // estimate that motivated graph capture was inferred, not measured; this
     // measures it.
