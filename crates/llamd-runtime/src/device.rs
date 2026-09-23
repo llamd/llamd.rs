@@ -62,12 +62,21 @@ struct Scratch {
     e_up: DevBuf,
     e_act: DevBuf,
     e_down: DevBuf,
-    moe_out: DevBuf,
     scores: DevBuf,
     logits: DevBuf,
     amax_v: DevBuf,
     amax_i: DevBuf,
     out_token: DevBuf,
+    /// One float: 1/rms, handed from fk_rms_scale to fk_norm_quant.
+    inv: DevBuf,
+    /// `[token, pos]`, device-resident.
+    ///
+    /// WHY THESE LIVE ON THE DEVICE. A captured HIP graph freezes its kernel
+    /// arguments. While the token id and position were arguments, the graph had
+    /// to be re-recorded every token, which costs more than it saves. Kernels
+    /// read them from here instead, so the graph is structurally invariant and
+    /// the per-token host work is an 8-byte upload.
+    meta: DevBuf,
 }
 
 pub struct DeviceModel {
@@ -83,6 +92,18 @@ pub struct DeviceModel {
     s: Scratch,
     /// Bytes of weights uploaded, for reporting.
     weight_bytes: usize,
+    /// This instance's identity, so a graph recorded by another model is never
+    /// replayed against these buffers.
+    id: u64,
+    /// Whether to submit tokens through a captured HIP graph.
+    ///
+    /// OFF by default. It measured slower before the launches were fused
+    /// (13.851 ms/token against 12.545) and is now indistinguishable from
+    /// queueing them individually — fusion took ~1200 launches per token down
+    /// to ~750, which removed the overhead a graph would have amortised. Kept,
+    /// with the capture machinery, so the comparison stays reproducible and a
+    /// future ROCm can be retested by flipping one flag.
+    pub use_graph: bool,
     /// Per-phase timings, filled only when profiling.
     ///
     /// WHY THIS IS OPT-IN. Measuring a phase means synchronising after it,
@@ -151,6 +172,26 @@ impl Profile {
 
 const ARGMAX_BLOCKS: usize = 512;
 
+/// Which `DeviceModel` the captured graph belongs to.
+///
+/// WHY THIS IS NEEDED, and it was found by a memory fault rather than by
+/// thinking. The HIP graph is a process-global object holding raw pointers into
+/// the buffers of whichever model recorded it. Load a model, capture, drop it,
+/// load another: the new model sees a graph already instantiated, replays it,
+/// and the kernels read freed memory. The fault surfaced as
+/// `HSA_STATUS_ERROR_MEMORY_FAULT ... kernel: fk_embed_q6k_meta` — reading an
+/// embedding table that no longer existed.
+///
+/// A comment saying "do not do that" would not have prevented it. Each model
+/// takes an id, and a graph recorded by a different id is discarded rather than
+/// replayed.
+static GRAPH_OWNER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn kv_dim_of(hp: &llamd_models::Hparams) -> usize {
+    hp.kv_dim()
+}
+
 /// Raw quantized bytes for a tensor, as stored in the file.
 fn raw<'a>(model: &'a Model, name: &str) -> Result<&'a [u8]> {
     let info = model.info(name)?;
@@ -174,6 +215,10 @@ impl DeviceModel {
     /// serve — the KV cache is allocated once, because growing it mid-token
     /// would mean a device allocation inside the hot path.
     pub fn load(model: &Model, max_kv: usize) -> Result<Self> {
+        // Everything queues on a stream of our own: the default stream cannot
+        // be captured into a graph.
+        llamd_rocm::stream_init()?;
+
         let hp = model.hparams.clone();
         if !hp.arch.is_moe() {
             return Err(Error::unsupported(
@@ -311,12 +356,13 @@ impl DeviceModel {
             e_up: f(n_used * n_ffe)?,
             e_act: f(n_used * n_ffe)?,
             e_down: f(n_used * n_embd)?,
-            moe_out: f(n_embd)?,
             scores: f(n_head * max_kv)?,
             logits: f(hp.n_vocab)?,
             amax_v: f(ARGMAX_BLOCKS)?,
             amax_i: DevBuf::zeroed(ARGMAX_BLOCKS * 4)?,
             out_token: DevBuf::zeroed(4)?,
+            meta: DevBuf::zeroed(8)?,
+            inv: f(1)?,
         };
 
         let mut kc = Vec::with_capacity(hp.n_layer);
@@ -338,6 +384,13 @@ impl DeviceModel {
             max_kv,
             s,
             weight_bytes: need as usize,
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            // Off by default. Graph replay measured SLOWER before the
+            // launches were fused (13.851 ms/token against 12.545) and is now
+            // indistinguishable from queueing them (9.54-9.66 either way),
+            // because fusion removed the launches that would have justified it.
+            // Neutral and more machinery to go wrong, so not the default.
+            use_graph: false,
             profile: None,
         })
     }
@@ -362,42 +415,21 @@ impl DeviceModel {
         Ok(())
     }
 
-    /// Matvec against the activation ALREADY quantized in the scratch.
+    /// Queue one token's worth of work. Does not synchronise.
     ///
-    /// WHY THIS EXISTS. Q, K and V all consume the same normalised x, so
-    /// `qmatvec` for each of them quantized identical data three times. The
-    /// phase breakdown put q/k/v at 4.07 ms of a 23.8 ms profiled token, well
-    /// above the 2.16 ms its matmuls need — two thirds of the excess was
-    /// redundant quantization. Quantize once, then use this.
-    fn matvec_pre(&self, w: &DevBuf, out: &DevBuf, k: usize, rows: usize) -> Result<()> {
-        op::matvec(w, &self.s.aq, &self.s.ad, out, k / 256, rows)?;
-        Ok(())
-    }
-
-    /// One token. Queues every operation, synchronises once, returns the argmax.
-    ///
-    /// `pos` is the position in the sequence; the KV cache for every layer is
-    /// written at that position before the layer attends, because a layer reads
-    /// only its own keys.
-    pub fn forward(&mut self, token: u32, pos: usize) -> Result<u32> {
-        if pos >= self.max_kv {
-            return Err(Error::malformed(
-                "device forward",
-                format!("position {pos} beyond the {} allocated", self.max_kv),
-            ));
-        }
+    /// Split out from `forward` so graph capture can record exactly this and
+    /// nothing else. Reads the token and position from the device-resident
+    /// `meta` buffer, so the recorded graph is valid for every later token.
+    fn queue_token(&mut self) -> Result<()> {
         let hp = &self.hp;
         let (n_embd, n_head, n_head_kv, hd) = (hp.n_embd, hp.n_head, hp.n_head_kv, hp.n_head_dim);
-        let kv_dim = hp.kv_dim();
         let (n_expert, n_used, n_ffe) = (hp.n_expert, hp.n_expert_used, hp.n_ff_expert);
         let eps = hp.rms_eps;
-        let n_kv = pos + 1;
+        let fb = hp.rope_freq_base;
+        let max_kv = self.max_kv;
         let profiling = self.profile.is_some();
         let s = &self.s;
 
-        // When profiling, each phase ends with a synchronise so its cost can
-        // be attributed. Otherwise this closure is a no-op and the whole token
-        // stays queued, which is the point of the module.
         macro_rules! phase {
             ($field:ident, $body:block) => {{
                 if profiling {
@@ -414,63 +446,73 @@ impl DeviceModel {
         }
 
         phase!(embed, {
-            op::embed(&self.tok_embd, token, &s.x, self.embd_blocks)?;
+            op::embed_meta(&self.tok_embd, &s.meta, &s.x, self.embd_blocks)?;
         });
 
         for il in 0..hp.n_layer {
             let l = &self.layers[il];
 
-            // ── attention norm ───────────────────────────────────────────
+            // ── attention norm, emitting f32 and quantized in one pass ───
+            // Q, K and V all read the same activation, so one norm and one
+            // quantization serve all three.
             phase!(norms, {
-                op::rms_norm_mul(&s.x, &l.attn_norm, &s.xb, n_embd, eps)?;
+                op::rms_norm_quant(&s.x, &l.attn_norm, &s.xb, &s.aq, &s.ad, &s.inv, n_embd, eps)?;
             });
 
-            // ── projections ──────────────────────────────────────────────
             phase!(qkv, {
-                // One quantization for all three projections: they read the
-                // same normalised x.
-                op::quantize(&s.xb, &s.aq, &s.ad, n_embd / 256)?;
-                self.matvec_pre(&l.attn_q, &s.q, n_embd, n_head * hd)?;
-                self.matvec_pre(&l.attn_k, &s.k, n_embd, kv_dim)?;
-                self.matvec_pre(&l.attn_v, &s.v, n_embd, kv_dim)?;
+                // One launch for all three: same activation, and the small K
+                // and V projections fill the card alongside Q instead of
+                // running alone at 64 workgroups.
+                op::matvec_x3(
+                    (&l.attn_q, &l.attn_k, &l.attn_v),
+                    &s.aq,
+                    &s.ad,
+                    (&s.q, &s.k, &s.v),
+                    n_embd / 256,
+                    (n_head * hd, kv_dim_of(hp), kv_dim_of(hp)),
+                )?;
             });
 
-            // ── QK-norm, per head, BEFORE RoPE ───────────────────────────
+            // ── QK-norm then RoPE, fused; K also stores into the cache ───
             phase!(qk_norm_rope, {
-                if let Some(qn) = &l.attn_q_norm {
-                    op::head_rms_norm_mul(&s.q, qn, &s.q, n_head, hd, eps)?;
-                }
-                if let Some(kn) = &l.attn_k_norm {
-                    op::head_rms_norm_mul(&s.k, kn, &s.k, n_head_kv, hd, eps)?;
-                }
-                op::rope(&s.q, pos as u32, n_head, hd, hp.rope_freq_base)?;
-                op::rope(&s.k, pos as u32, n_head_kv, hd, hp.rope_freq_base)?;
-                op::kv_store(&self.kc[il], &self.vc[il], &s.k, &s.v, pos, kv_dim)?;
+                op::norm_rope(&s.q, l.attn_q_norm.as_ref(), &s.meta, n_head, hd, fb, eps)?;
+                op::k_norm_rope_store(
+                    &s.k,
+                    l.attn_k_norm.as_ref(),
+                    &s.v,
+                    &self.kc[il],
+                    &self.vc[il],
+                    &s.meta,
+                    n_head_kv,
+                    hd,
+                    fb,
+                    eps,
+                )?;
             });
 
             phase!(attention, {
-                op::attention(
+                op::attention_meta(
                     &s.q,
                     &self.kc[il],
                     &self.vc[il],
                     &s.attn,
                     &s.scores,
+                    &s.meta,
                     n_head,
                     n_head_kv,
                     hd,
-                    n_kv,
+                    max_kv,
                 )?;
             });
 
-            // ── output projection and residual ───────────────────────────
             phase!(attn_out, {
                 self.qmatvec(&l.attn_out, &s.attn, &s.xb2, n_head * hd, n_embd)?;
                 op::add(&s.x, &s.xb2, &s.x, n_embd)?;
             });
 
-            // ── FFN norm and routing ─────────────────────────────────────
+            // ── FFN norm (f32 for the router, quantized for the experts) ──
             phase!(router, {
-                op::rms_norm_mul(&s.x, &l.ffn_norm, &s.xb, n_embd, eps)?;
+                op::rms_norm_quant(&s.x, &l.ffn_norm, &s.xb, &s.aq, &s.ad, &s.inv, n_embd, eps)?;
                 op::matvec_f32(&l.ffn_gate_inp, &s.xb, &s.router_logits, n_embd, n_expert)?;
                 op::router(
                     &s.router_logits,
@@ -482,38 +524,24 @@ impl DeviceModel {
                 )?;
             });
 
-            // ── the experts, all of them in one launch each ──────────────
             phase!(experts, {
-                let blocks_in = n_embd / 256;
-                op::quantize(&s.xb, &s.aq, &s.ad, blocks_in)?;
-                op::matvec_grouped(
+                // Gate and up in one launch, for the same reason as q/k/v.
+                op::matvec_grouped_x2(
                     &l.ffn_gate_exps,
-                    &s.expert_ids,
-                    &s.aq,
-                    &s.ad,
-                    &s.e_gate,
-                    blocks_in,
-                    n_ffe,
-                    n_used,
-                )?;
-                op::matvec_grouped(
                     &l.ffn_up_exps,
                     &s.expert_ids,
                     &s.aq,
                     &s.ad,
+                    &s.e_gate,
                     &s.e_up,
-                    blocks_in,
+                    n_embd / 256,
                     n_ffe,
                     n_used,
                 )?;
-                // SiLU on the GATE only, then elementwise with up. SwiGLU is not
-                // symmetric: the other order still produces fluent text.
+                // SiLU on the GATE only, then elementwise with up.
                 op::silu_mul(&s.e_gate, &s.e_up, &s.e_act, n_used * n_ffe)?;
-
-                // The down projection consumes each expert's own activation, so
-                // its input is n_used blocks of n_ffe, quantized together.
-                // n_used * n_ffe / 256 blocks, laid out as n_used runs of
-                // n_ffe/256 — exactly what matvec_grouped_per_act indexes.
+                // Each expert's down input is its OWN activation, hence the
+                // per-activation grouped kernel.
                 op::quantize(&s.e_act, &s.aq, &s.ad, (n_used * n_ffe) / 256)?;
                 op::matvec_grouped_per_act(
                     &l.ffn_down_exps,
@@ -526,9 +554,9 @@ impl DeviceModel {
                     n_used,
                 )?;
             });
+
             phase!(moe_tail, {
-                op::moe_combine(&s.e_down, &s.expert_w, &s.moe_out, n_used, n_embd)?;
-                op::add(&s.x, &s.moe_out, &s.x, n_embd)?;
+                op::moe_combine_add(&s.e_down, &s.expert_w, &s.x, &s.x, n_used, n_embd)?;
             });
         }
 
@@ -547,13 +575,71 @@ impl DeviceModel {
         if let Some(p) = self.profile.as_mut() {
             p.tokens += 1;
         }
+        Ok(())
+    }
 
-        // THE ONE SYNCHRONISE. Everything above was queued.
+    /// Record the token as a HIP graph, so later tokens submit as one operation.
+    ///
+    /// CAPTURE DOES NOT EXECUTE. Nothing runs between begin and end; the graph
+    /// is a recording of the launches. So this is called with `meta` already set
+    /// to a real (token, pos), and the first replay produces the first result.
+    ///
+    /// Profiling and capture are mutually exclusive: profiling synchronises
+    /// inside the token, which is illegal during capture and would be the wrong
+    /// measurement anyway.
+    fn capture(&mut self) -> Result<()> {
+        if self.profile.is_some() {
+            return Err(Error::malformed(
+                "graph capture",
+                "cannot capture while profiling: profiling synchronises mid-token",
+            ));
+        }
+        llamd_rocm::graph::begin()?;
+        // If queueing fails mid-capture the stream is left capturing, which
+        // poisons every later launch. End it before propagating.
+        if let Err(e) = self.queue_token() {
+            let _ = llamd_rocm::graph::end();
+            llamd_rocm::graph::destroy();
+            return Err(e);
+        }
+        llamd_rocm::graph::end()
+    }
+
+    /// One token: set the metadata, run it, return the argmax.
+    ///
+    /// Uses the captured graph when there is one — which submits ~900 kernels
+    /// as a single operation instead of ~900 driver calls — and falls back to
+    /// queueing them individually when profiling or before capture.
+    pub fn forward(&mut self, token: u32, pos: usize) -> Result<u32> {
+        if pos >= self.max_kv {
+            return Err(Error::malformed(
+                "device forward",
+                format!("position {pos} beyond the {} allocated", self.max_kv),
+            ));
+        }
+        // The only per-token host work: eight bytes.
+        self.s.meta.upload_i32(&[token as i32, pos as i32])?;
+
+        if self.use_graph && self.profile.is_none() {
+            use std::sync::atomic::Ordering::SeqCst;
+            // A graph belonging to a different model points at buffers this one
+            // does not own — possibly freed. Discard rather than replay.
+            if !llamd_rocm::graph::exists() || GRAPH_OWNER.load(SeqCst) != self.id {
+                llamd_rocm::graph::destroy();
+                self.capture()?;
+                GRAPH_OWNER.store(self.id, SeqCst);
+            }
+            llamd_rocm::graph::replay()?;
+        } else {
+            self.queue_token()?;
+        }
+
+        // THE ONE SYNCHRONISE.
         llamd_rocm::sync()?;
 
         let mut got = [0i32; 1];
-        s.out_token.download_i32(&mut got)?;
-        if got[0] < 0 || got[0] as usize >= hp.n_vocab {
+        self.s.out_token.download_i32(&mut got)?;
+        if got[0] < 0 || got[0] as usize >= self.hp.n_vocab {
             return Err(Error::other(format!("argmax returned {}", got[0])));
         }
         Ok(got[0] as u32)
@@ -565,5 +651,18 @@ impl DeviceModel {
         let mut out = vec![0.0f32; self.hp.n_vocab];
         self.s.logits.download_f32(&mut out)?;
         Ok(out)
+    }
+}
+
+impl Drop for DeviceModel {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        // The graph references this model's buffers, which are about to be
+        // freed by the DevBuf drops below. Leaving it instantiated would let a
+        // later model replay it against freed memory.
+        if GRAPH_OWNER.load(SeqCst) == self.id {
+            llamd_rocm::graph::destroy();
+            GRAPH_OWNER.store(0, SeqCst);
+        }
     }
 }

@@ -388,6 +388,266 @@ __global__ void fk_argmax_final(
     *out = bi;
 }
 
+// ---------------------------------------------------------------------------
+// FUSED KERNELS.
+//
+// WHY. The phase breakdown put ~1200 launches in a token at roughly 4.5 us
+// each — about 5.4 of 14.87 ms, more than any single phase. The rope path was
+// five launches per layer (two QK-norms, two RoPEs, a KV store) for work that
+// touches 4096 and 512 floats. Fusing is not micro-optimisation here; launch
+// overhead was the largest single cost in the engine.
+//
+// Each fused kernel performs EXACTLY the operations it replaces, in the same
+// order, so the arithmetic is unchanged and the token-agreement test still
+// holds. Nothing is approximated to make a fusion possible.
+// ---------------------------------------------------------------------------
+
+// Per-head RMS norm followed by NeoX RoPE, one workgroup per head.
+//
+// Both stages are confined to a single head — the norm reduces over head_dim,
+// the rotation pairs i with i + head_dim/2 inside the same head — so one
+// workgroup can do both with a barrier between. Replaces
+// fk_head_rms_norm_mul + fk_rope_neox.
+//
+// `w` may be null: a model without QK-norm skips the norm and still ropes.
+__global__ void fk_norm_rope(
+    float * __restrict__ x, const float * __restrict__ w,
+    int hd, const int32_t * __restrict__ meta, float freq_base, float eps)
+{
+    extern __shared__ float sh[];
+    const int head = blockIdx.x;
+    const int pos  = meta[1];
+    float *xi = x + (size_t)head * hd;
+
+    if (w) {
+        float acc = 0.0f;
+        for (int i = threadIdx.x; i < hd; i += blockDim.x) acc += xi[i] * xi[i];
+        sh[threadIdx.x] = acc;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) sh[threadIdx.x] += sh[threadIdx.x + stride];
+            __syncthreads();
+        }
+        const float inv = rsqrtf(sh[0] / (float)hd + eps);
+        for (int i = threadIdx.x; i < hd; i += blockDim.x) xi[i] = xi[i] * inv * w[i];
+        __syncthreads();
+    }
+
+    const int half = hd / 2;
+    for (int i = threadIdx.x; i < half; i += blockDim.x) {
+        const float exponent = 2.0f * (float)i / (float)hd;
+        const float theta = (float)pos / powf(freq_base, exponent);
+        float sn, cs;
+        __sincosf(theta, &sn, &cs);
+        const float a = xi[i];
+        const float b = xi[i + half];
+        xi[i]        = a * cs - b * sn;
+        xi[i + half] = a * sn + b * cs;
+    }
+}
+
+// The K side: norm, rope, and store both K and V into the cache. Replaces
+// fk_head_rms_norm_mul + fk_rope_neox + fk_kv_store.
+//
+// The store must come after the rotation — the cache holds ROPED keys, which is
+// what attention reads — so it cannot be hoisted out or run concurrently.
+__global__ void fk_k_norm_rope_store(
+    float * __restrict__ k, const float * __restrict__ w,
+    const float * __restrict__ v, float * __restrict__ kc, float * __restrict__ vc,
+    int hd, int kv_dim, const int32_t * __restrict__ meta, float freq_base,
+    float eps)
+{
+    extern __shared__ float sh[];
+    const int head = blockIdx.x;
+    const int pos  = meta[1];
+    float *ki = k + (size_t)head * hd;
+
+    if (w) {
+        float acc = 0.0f;
+        for (int i = threadIdx.x; i < hd; i += blockDim.x) acc += ki[i] * ki[i];
+        sh[threadIdx.x] = acc;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (threadIdx.x < stride) sh[threadIdx.x] += sh[threadIdx.x + stride];
+            __syncthreads();
+        }
+        const float inv = rsqrtf(sh[0] / (float)hd + eps);
+        for (int i = threadIdx.x; i < hd; i += blockDim.x) ki[i] = ki[i] * inv * w[i];
+        __syncthreads();
+    }
+
+    const int half = hd / 2;
+    for (int i = threadIdx.x; i < half; i += blockDim.x) {
+        const float exponent = 2.0f * (float)i / (float)hd;
+        const float theta = (float)pos / powf(freq_base, exponent);
+        float sn, cs;
+        __sincosf(theta, &sn, &cs);
+        const float a = ki[i];
+        const float b = ki[i + half];
+        ki[i]        = a * cs - b * sn;
+        ki[i + half] = a * sn + b * cs;
+    }
+    __syncthreads();
+
+    // Store this head's slice of K (now roped) and V.
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+        const int off = head * hd + i;
+        kc[(size_t)pos * kv_dim + off] = ki[i];
+        vc[(size_t)pos * kv_dim + off] = v[off];
+    }
+}
+
+// rms_norm(x) * w, written as f32 AND quantized to Q8_K in one pass.
+//
+// Replaces fk_rms_norm_mul + q8k_quantize. The f32 output is still needed by
+// the F32 router matvec; the quantized form feeds every Q6_K matvec. Computing
+// the norm twice, or writing f32 and reading it back in a second kernel, was
+// two launches and a round trip through L2 for no reason.
+//
+// The quantization must match llamd_quant::quantize_q8_k exactly: iscale is
+// -127/max where max is the SIGNED value of largest magnitude, the clamp is
+// upper-only, and rounding is half-to-even.
+__global__ void fk_rms_scale(
+    const float * __restrict__ x, float * __restrict__ inv_out, int n, float eps)
+{
+    __shared__ float s[FWD_BLOCK];
+    float acc = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) acc += x[i] * x[i];
+    const float total = block_reduce_sum(acc, s);
+    if (threadIdx.x == 0) *inv_out = rsqrtf(total / (float)n + eps);
+}
+
+// Scale by the precomputed 1/rms, multiply by w, and quantize — ONE WORKGROUP
+// PER QUANTIZATION BLOCK, so the blocks run concurrently.
+//
+// WHY THIS IS TWO KERNELS AND NOT ONE. The fused single-workgroup version
+// computed the norm and then quantized all eight blocks SEQUENTIALLY, because a
+// 256-element block max needs a reduction across the whole workgroup. That cost
+// ~22 us and it runs 96 times per token — about 2.1 of 12.5 ms, on one of the
+// card's 32 WGPs. Splitting the reduction out costs an extra launch and lets
+// eight workgroups quantize at once. Measured, the launch is much the cheaper
+// half: see benchmarks.md §8.
+//
+// Must match llamd_quant::quantize_q8_k exactly: iscale = -127/max with max the
+// SIGNED value of largest magnitude, upper-only clamp, round-half-to-even.
+__global__ void fk_norm_quant(
+    const float * __restrict__ x, const float * __restrict__ w,
+    const float * __restrict__ inv_in, float * __restrict__ out,
+    int8_t * __restrict__ qs, float * __restrict__ d)
+{
+    __shared__ float sa[QK_K];
+    __shared__ float sm[QK_K];
+    const int b = blockIdx.x;
+    const int i = b * QK_K + threadIdx.x;
+    const float inv = *inv_in;
+
+    const float v = x[i] * inv * w[i];
+    out[i] = v;
+
+    sa[threadIdx.x] = fabsf(v);
+    sm[threadIdx.x] = v;
+    __syncthreads();
+    for (int stride = QK_K / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            // Strictly greater, so a tie keeps the earlier element — the one a
+            // sequential host scan keeps.
+            if (sa[threadIdx.x + stride] > sa[threadIdx.x]) {
+                sa[threadIdx.x] = sa[threadIdx.x + stride];
+                sm[threadIdx.x] = sm[threadIdx.x + stride];
+            }
+        }
+        __syncthreads();
+    }
+    const float amax = sa[0], mx = sm[0];
+    if (amax == 0.0f) {
+        qs[i] = 0;
+        if (threadIdx.x == 0) d[b] = 0.0f;
+        return;
+    }
+    const float iscale = -127.0f / mx;
+    int q = (int)rintf(iscale * v);
+    if (q > 127) q = 127;
+    qs[i] = (int8_t)q;
+    if (threadIdx.x == 0) d[b] = 1.0f / iscale;
+}
+
+// out = residual + sum_e weights[e] * down[e]. Replaces fk_moe_combine + fk_add.
+__global__ void fk_moe_combine_add(
+    const float * __restrict__ down, const float * __restrict__ weights,
+    const float * __restrict__ residual, float * __restrict__ out,
+    int n_used, int n_embd)
+{
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= n_embd) return;
+    float acc = 0.0f;
+    for (int e = 0; e < n_used; ++e) acc += weights[e] * down[(size_t)e * n_embd + d];
+    out[d] = residual[d] + acc;
+}
+
+// The embedding lookup, reading the token id from the device-resident meta
+// buffer rather than taking it as an argument. See the graph-capture note in
+// llamd_fwd_begin_capture: a captured graph's kernel arguments are fixed, so
+// anything that changes per token must be read from memory.
+__global__ void fk_embed_q6k_meta(
+    const uint8_t * __restrict__ table, const int32_t * __restrict__ meta,
+    float * __restrict__ out, int blocks)
+{
+    const uint8_t *row = table + (size_t)meta[0] * blocks * Q6K_BLOCK_BYTES;
+    for (int b = blockIdx.x; b < blocks; b += gridDim.x) {
+        q6k_decode_block(row + (size_t)b * Q6K_BLOCK_BYTES, out + b * QK_K,
+                         threadIdx.x, blockDim.x);
+    }
+}
+
+// Attention reading n_kv from the meta buffer, for the same reason.
+__global__ void fk_attention_meta(
+    const float * __restrict__ q, const float * __restrict__ kc,
+    const float * __restrict__ vc, float * __restrict__ out,
+    float * __restrict__ scores, int n_head_kv, int hd,
+    const int32_t * __restrict__ meta, int ratio, int max_kv)
+{
+    __shared__ float s[FWD_BLOCK];
+    const int n_kv = meta[1] + 1;
+    const int h   = blockIdx.x;
+    const int kvh = h / ratio;
+    const int kv_dim = n_head_kv * hd;
+    const float scale = rsqrtf((float)hd);
+
+    const float *qh = q + (size_t)h * hd;
+    // The scores buffer is [n_head][max_kv]; n_kv varies per token but the
+    // stride does not, which is what lets a captured graph reuse it.
+    float *sc = scores + (size_t)h * max_kv;
+
+    float local_max = -INFINITY;
+    for (int t = threadIdx.x; t < n_kv; t += blockDim.x) {
+        const float *kt = kc + (size_t)t * kv_dim + (size_t)kvh * hd;
+        float dot = 0.0f;
+        for (int d = 0; d < hd; ++d) dot += qh[d] * kt[d];
+        const float sv = dot * scale;
+        sc[t] = sv;
+        local_max = fmaxf(local_max, sv);
+    }
+    const float mx = block_reduce_max(local_max, s);
+
+    float local_sum = 0.0f;
+    for (int t = threadIdx.x; t < n_kv; t += blockDim.x) {
+        const float e = __expf(sc[t] - mx);
+        sc[t] = e;
+        local_sum += e;
+    }
+    const float sum = block_reduce_sum(local_sum, s);
+    const float inv = 1.0f / sum;
+    __syncthreads();
+
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int t = 0; t < n_kv; ++t) {
+            acc += sc[t] * vc[(size_t)t * kv_dim + (size_t)kvh * hd + d];
+        }
+        out[(size_t)h * hd + d] = acc * inv;
+    }
+}
+
 // F32 matvec, for the router.
 //
 // The MoE gate (ffn_gate_inp) is stored F32, not Q6_K — 241 of this model's
@@ -396,28 +656,65 @@ __global__ void fk_argmax_final(
 // One wave per output row, matching the quantized kernel's shape.
 __global__ void fk_matvec_f32(
     const float * __restrict__ w, const float * __restrict__ x,
-    float * __restrict__ out, int k, int rows)
+    float * __restrict__ out, int k)
 {
-    const int wave = threadIdx.x / WAVE;
-    const int lane = threadIdx.x % WAVE;
-    const int row  = blockIdx.x * (FWD_BLOCK / WAVE) + wave;
-    if (row >= rows) return;
+    // ONE WORKGROUP PER ROW, not one wave.
+    //
+    // The first version gave each row a single 32-lane wave and packed eight
+    // rows into a workgroup. For the MoE router — [2048, 128], the only F32
+    // matvec in the model — that is 16 workgroups on a 32-WGP card, so half the
+    // GPU idles and the rest is latency-bound on 8 KiB per row. The router phase
+    // was 13.9% of a token for 1 MiB of reads.
+    //
+    // One workgroup of FWD_BLOCK threads per row gives 128 workgroups and eight
+    // elements per thread, then one block reduction.
+    __shared__ float s[FWD_BLOCK];
+    const int row = blockIdx.x;
     const float *wr = w + (size_t)row * k;
     float acc = 0.0f;
-    for (int i = lane; i < k; i += WAVE) acc += wr[i] * x[i];
-    #pragma unroll
-    for (int off = WAVE / 2; off > 0; off >>= 1) acc += __shfl_down(acc, off, WAVE);
-    if (lane == 0) out[row] = acc;
+    for (int i = threadIdx.x; i < k; i += blockDim.x) acc += wr[i] * x[i];
+    const float total = block_reduce_sum(acc, s);
+    if (threadIdx.x == 0) out[row] = total;
 }
 
 // ---------------------------------------------------------------------------
-// Device buffers and the launch surface.
+// STREAM AND GRAPH CAPTURE.
 //
-// Every function below takes device pointers and returns immediately. None
-// synchronises. That is the whole point: a token is ~1400 launches queued back
-// to back, and the one hipDeviceSynchronize belongs after all of them.
-// ---------------------------------------------------------------------------
+// WHY A GRAPH. About 1200 kernels go into a token. Each hipLaunchKernelGGL
+// costs a few microseconds of driver work — command packet assembly, argument
+// marshalling, doorbell — and measured against the phase breakdown that came to
+// roughly 5.4 of 14.87 ms, more than any single phase of actual computation.
+// A graph pays that cost ONCE, at instantiation, and each replay submits the
+// whole token as one operation. llama.cpp builds with GGML_HIP_GRAPHS=ON for
+// exactly this reason.
+//
+// WHAT MADE IT POSSIBLE. A captured graph's kernel arguments are frozen. The
+// token id, the position and n_kv change every token, so as long as they were
+// kernel arguments the graph had to be rebuilt each time — which costs more
+// than it saves. They now live in a two-int device buffer that the kernels
+// READ, so the graph is structurally invariant and the only per-token host work
+// is a 8-byte upload. Expert routing was never a problem: the ids are chosen on
+// the device and consumed there, so the graph does not branch on them.
+//
+// Everything launches on g_stream so capture can intercept it. The default
+// stream cannot be captured.
+static hipStream_t  g_stream = nullptr;
+static hipGraphExec_t g_exec = nullptr;
+static hipGraph_t     g_graph = nullptr;
+
 extern "C" {
+
+// The stream, for the entry points in llamd.hip. They are a separate
+// translation unit and cannot see the static, but their launches MUST go to the
+// same stream: a launch on the default stream during capture is not captured,
+// and mixing a captured stream with an uncaptured one is an error.
+void *llamd_fwd_get_stream() { return (void *)g_stream; }
+
+// Create the stream all launches use. Idempotent.
+int llamd_fwd_stream_init() {
+    if (g_stream) return 0;
+    return hipStreamCreate(&g_stream) == hipSuccess ? 0 : -1;
+}
 
 void *llamd_fwd_alloc(size_t bytes) {
     void *p = nullptr;
@@ -436,10 +733,14 @@ int llamd_fwd_download(void *dst, const void *src, size_t bytes) {
 }
 
 int llamd_fwd_memset(void *p, int value, size_t bytes) {
-    return hipMemsetAsync(p, value, bytes, 0) == hipSuccess ? 0 : -1;
+    return hipMemsetAsync(p, value, bytes, g_stream) == hipSuccess ? 0 : -1;
 }
 
 int llamd_fwd_sync() {
+    // The stream, not the device: everything this module queues goes to
+    // g_stream, and a device-wide synchronise would also wait on unrelated
+    // work (the matvec entry points in llamd.hip still use the default stream).
+    if (g_stream) return hipStreamSynchronize(g_stream) == hipSuccess ? 0 : -1;
     return hipDeviceSynchronize() == hipSuccess ? 0 : -1;
 }
 
@@ -451,13 +752,13 @@ size_t llamd_fwd_free_mem() {
 
 void llamd_fwd_embed(const void *table, int token, float *out, int blocks) {
     hipLaunchKernelGGL(fk_embed_q6k, dim3(blocks < 256 ? blocks : 256),
-                       dim3(FWD_BLOCK), 0, 0,
+                       dim3(FWD_BLOCK), 0, g_stream,
                        (const uint8_t *)table, token, out, blocks);
 }
 
 void llamd_fwd_rms_norm_mul(const float *x, const float *w, float *out,
                             int n, float eps) {
-    hipLaunchKernelGGL(fk_rms_norm_mul, dim3(1), dim3(FWD_BLOCK), 0, 0,
+    hipLaunchKernelGGL(fk_rms_norm_mul, dim3(1), dim3(FWD_BLOCK), 0, g_stream,
                        x, w, out, n, eps);
 }
 
@@ -465,63 +766,147 @@ void llamd_fwd_head_rms_norm_mul(const float *x, const float *w, float *out,
                                  int n_head, int hd, float eps) {
     const int threads = hd < FWD_BLOCK ? hd : FWD_BLOCK;
     hipLaunchKernelGGL(fk_head_rms_norm_mul, dim3(n_head), dim3(threads),
-                       threads * sizeof(float), 0, x, w, out, hd, eps);
+                       threads * sizeof(float), g_stream, x, w, out, hd, eps);
 }
 
 void llamd_fwd_rope(float *x, int pos, int n_head, int hd, float freq_base) {
     const int threads = (hd / 2) < FWD_BLOCK ? (hd / 2) : FWD_BLOCK;
-    hipLaunchKernelGGL(fk_rope_neox, dim3(n_head), dim3(threads), 0, 0,
+    hipLaunchKernelGGL(fk_rope_neox, dim3(n_head), dim3(threads), 0, g_stream,
                        x, pos, hd, freq_base);
 }
 
 void llamd_fwd_kv_store(float *kc, float *vc, const float *k, const float *v,
                         int pos, int kv_dim) {
-    hipLaunchKernelGGL(fk_kv_store, dim3((kv_dim + 255) / 256), dim3(256), 0, 0,
+    hipLaunchKernelGGL(fk_kv_store, dim3((kv_dim + 255) / 256), dim3(256), 0, g_stream,
                        kc, vc, k, v, pos, kv_dim);
 }
 
 void llamd_fwd_attention(const float *q, const float *kc, const float *vc,
                          float *out, float *scores, int n_head, int n_head_kv,
                          int hd, int n_kv) {
-    hipLaunchKernelGGL(fk_attention, dim3(n_head), dim3(FWD_BLOCK), 0, 0,
+    hipLaunchKernelGGL(fk_attention, dim3(n_head), dim3(FWD_BLOCK), 0, g_stream,
                        q, kc, vc, out, scores, n_head_kv, hd, n_kv,
                        n_head / n_head_kv);
 }
 
 void llamd_fwd_matvec_f32(const float *w, const float *x, float *out,
                           int k, int rows) {
-    const int per = FWD_BLOCK / WAVE;
-    hipLaunchKernelGGL(fk_matvec_f32, dim3((rows + per - 1) / per), dim3(FWD_BLOCK),
-                       0, 0, w, x, out, k, rows);
+    hipLaunchKernelGGL(fk_matvec_f32, dim3(rows), dim3(FWD_BLOCK),
+                       0, g_stream, w, x, out, k);
 }
 
 void llamd_fwd_add(const float *a, const float *b, float *out, int n) {
-    hipLaunchKernelGGL(fk_add, dim3((n + 255) / 256), dim3(256), 0, 0, a, b, out, n);
+    hipLaunchKernelGGL(fk_add, dim3((n + 255) / 256), dim3(256), 0, g_stream, a, b, out, n);
 }
 
 void llamd_fwd_silu_mul(const float *gate, const float *up, float *out, int n) {
-    hipLaunchKernelGGL(fk_silu_mul, dim3((n + 255) / 256), dim3(256), 0, 0,
+    hipLaunchKernelGGL(fk_silu_mul, dim3((n + 255) / 256), dim3(256), 0, g_stream,
                        gate, up, out, n);
 }
 
 void llamd_fwd_router(const float *logits, int n_expert, int n_used,
                       int32_t *ids, float *weights, float *probs) {
-    hipLaunchKernelGGL(fk_router_topk, dim3(1), dim3(FWD_BLOCK), 0, 0,
+    hipLaunchKernelGGL(fk_router_topk, dim3(1), dim3(FWD_BLOCK), 0, g_stream,
                        logits, n_expert, n_used, ids, weights, probs);
 }
 
 void llamd_fwd_moe_combine(const float *down, const float *weights, float *out,
                            int n_used, int n_embd) {
-    hipLaunchKernelGGL(fk_moe_combine, dim3((n_embd + 255) / 256), dim3(256), 0, 0,
+    hipLaunchKernelGGL(fk_moe_combine, dim3((n_embd + 255) / 256), dim3(256), 0, g_stream,
                        down, weights, out, n_used, n_embd);
 }
 
 void llamd_fwd_argmax(const float *x, int n, float *scratch_v, int32_t *scratch_i,
                       int32_t *out, int nblocks) {
-    hipLaunchKernelGGL(fk_argmax_partial, dim3(nblocks), dim3(FWD_BLOCK), 0, 0,
+    hipLaunchKernelGGL(fk_argmax_partial, dim3(nblocks), dim3(FWD_BLOCK), 0, g_stream,
                        x, n, scratch_v, scratch_i);
-    hipLaunchKernelGGL(fk_argmax_final, dim3(1), dim3(1), 0, 0,
+    hipLaunchKernelGGL(fk_argmax_final, dim3(1), dim3(1), 0, g_stream,
                        scratch_v, scratch_i, nblocks, out);
+}
+
+void llamd_fwd_norm_rope(float *x, const float *w, int n_head, int hd,
+                         const int32_t *meta, float freq_base, float eps) {
+    const int threads = hd < FWD_BLOCK ? hd : FWD_BLOCK;
+    hipLaunchKernelGGL(fk_norm_rope, dim3(n_head), dim3(threads),
+                       threads * sizeof(float), g_stream, x, w, hd, meta,
+                       freq_base, eps);
+}
+
+void llamd_fwd_k_norm_rope_store(float *k, const float *w, const float *v,
+                                 float *kc, float *vc, int n_head_kv, int hd,
+                                 int kv_dim, const int32_t *meta,
+                                 float freq_base, float eps) {
+    const int threads = hd < FWD_BLOCK ? hd : FWD_BLOCK;
+    hipLaunchKernelGGL(fk_k_norm_rope_store, dim3(n_head_kv), dim3(threads),
+                       threads * sizeof(float), g_stream,
+                       k, w, v, kc, vc, hd, kv_dim, meta, freq_base, eps);
+}
+
+void llamd_fwd_rms_norm_quant(const float *x, const float *w, float *out,
+                              int8_t *qs, float *d, float *inv_scratch,
+                              int n, float eps) {
+    hipLaunchKernelGGL(fk_rms_scale, dim3(1), dim3(FWD_BLOCK), 0, g_stream,
+                       x, inv_scratch, n, eps);
+    // One workgroup per 256-element quantization block, QK_K threads each, so
+    // every block's max reduction happens at the same time as the others'.
+    hipLaunchKernelGGL(fk_norm_quant, dim3(n / QK_K), dim3(QK_K), 0, g_stream,
+                       x, w, inv_scratch, out, qs, d);
+}
+
+void llamd_fwd_moe_combine_add(const float *down, const float *weights,
+                               const float *residual, float *out,
+                               int n_used, int n_embd) {
+    hipLaunchKernelGGL(fk_moe_combine_add, dim3((n_embd + 255) / 256), dim3(256),
+                       0, g_stream, down, weights, residual, out, n_used, n_embd);
+}
+
+void llamd_fwd_embed_meta(const void *table, const int32_t *meta, float *out,
+                          int blocks) {
+    hipLaunchKernelGGL(fk_embed_q6k_meta, dim3(blocks < 256 ? blocks : 256),
+                       dim3(FWD_BLOCK), 0, g_stream,
+                       (const uint8_t *)table, meta, out, blocks);
+}
+
+void llamd_fwd_attention_meta(const float *q, const float *kc, const float *vc,
+                              float *out, float *scores, int n_head,
+                              int n_head_kv, int hd, const int32_t *meta,
+                              int max_kv) {
+    hipLaunchKernelGGL(fk_attention_meta, dim3(n_head), dim3(FWD_BLOCK), 0, g_stream,
+                       q, kc, vc, out, scores, n_head_kv, hd, meta,
+                       n_head / n_head_kv, max_kv);
+}
+
+// ---- graph capture ---------------------------------------------------------
+//
+// Capture is NOT a dry run: nothing executes between begin and end. So the
+// buffers a captured token reads must already hold sane values, and the first
+// real result comes from the first replay, not from the capture.
+int llamd_fwd_begin_capture() {
+    if (!g_stream) return -1;
+    if (g_exec) { (void)hipGraphExecDestroy(g_exec); g_exec = nullptr; }
+    if (g_graph) { (void)hipGraphDestroy(g_graph); g_graph = nullptr; }
+    return hipStreamBeginCapture(g_stream, hipStreamCaptureModeGlobal) == hipSuccess
+        ? 0 : -1;
+}
+
+int llamd_fwd_end_capture() {
+    if (!g_stream) return -1;
+    if (hipStreamEndCapture(g_stream, &g_graph) != hipSuccess) return -1;
+    if (hipGraphInstantiate(&g_exec, g_graph, nullptr, nullptr, 0) != hipSuccess)
+        return -1;
+    return 0;
+}
+
+int llamd_fwd_graph_launch() {
+    if (!g_exec) return -1;
+    return hipGraphLaunch(g_exec, g_stream) == hipSuccess ? 0 : -1;
+}
+
+int llamd_fwd_has_graph() { return g_exec ? 1 : 0; }
+
+void llamd_fwd_graph_destroy() {
+    if (g_exec) { (void)hipGraphExecDestroy(g_exec); g_exec = nullptr; }
+    if (g_graph) { (void)hipGraphDestroy(g_graph); g_graph = nullptr; }
 }
 
 // Did anything in the queued work fail? Checked once per token, after the

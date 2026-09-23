@@ -175,6 +175,124 @@ void llamd_rocm_release(void *dev) {
 // scheduling and 512.
 #define ROWS_PER_BLOCK 8
 
+// The Q6_K x Q8_K row dot product, as ONE definition.
+//
+// This arithmetic was copied into four kernels as they were written, which is
+// four places for a divergence that would flip a near-tied expert and change
+// the emitted token. Factored here; `grouped_matches_the_ungrouped_kernel_exactly`
+// asserts bit-identity across kernels, so a mistake in this refactor fails a
+// test rather than producing subtly different text.
+//
+// Returns this LANE's partial sum. The caller does the shuffle reduction,
+// because the reduction is where the kernels legitimately differ in shape.
+__device__ __forceinline__ float q6k_lane_partial(
+    const uint8_t * __restrict__ wrow,
+    const int8_t  * __restrict__ aq,
+    const float   * __restrict__ ad,
+    int blocks, int lane)
+{
+    float acc = 0.0f;
+    for (int b = 0; b < blocks; ++b) {
+        const uint8_t *blk = wrow + (size_t)b * Q6K_BLOCK_BYTES;
+        const uint8_t *ql  = blk;
+        const uint8_t *qh  = blk + QK_K / 2;
+        const int8_t  *sc  = (const int8_t *)(blk + QK_K / 2 + QK_K / 4);
+        const uint16_t dbits = (uint16_t)blk[QK_K / 2 + QK_K / 4 + QK_K / 16]
+                             | ((uint16_t)blk[QK_K / 2 + QK_K / 4 + QK_K / 16 + 1] << 8);
+        const float    d   = __half2float(__ushort_as_half(dbits)) * ad[b];
+        const int8_t  *q8  = aq + (size_t)b * QK_K;
+
+        int32_t iacc = 0;
+        for (int half = 0; half < 2; ++half) {
+            const int o = half * 128;
+            for (int l = lane; l < 32; l += WAVE) {
+                const uint8_t h   = qh[half * 32 + l];
+                const uint8_t lo0 = ql[half * 64 + l];
+                const uint8_t lo1 = ql[half * 64 + l + 32];
+                const int v0 = (int)(int8_t)((lo0 & 0x0F) | (((h >> 0) & 3) << 4)) - 32;
+                const int v1 = (int)(int8_t)((lo1 & 0x0F) | (((h >> 2) & 3) << 4)) - 32;
+                const int v2 = (int)(int8_t)((lo0 >>   4) | (((h >> 4) & 3) << 4)) - 32;
+                const int v3 = (int)(int8_t)((lo1 >>   4) | (((h >> 6) & 3) << 4)) - 32;
+                iacc += sc[(o + l)      / 16] * v0 * (int)q8[o + l];
+                iacc += sc[(o + l + 32) / 16] * v1 * (int)q8[o + l + 32];
+                iacc += sc[(o + l + 64) / 16] * v2 * (int)q8[o + l + 64];
+                iacc += sc[(o + l + 96) / 16] * v3 * (int)q8[o + l + 96];
+            }
+        }
+        acc += d * (float)iacc;
+    }
+    return acc;
+}
+
+__device__ __forceinline__ float wave_reduce(float acc) {
+    #pragma unroll
+    for (int off = WAVE / 2; off > 0; off >>= 1) acc += __shfl_down(acc, off, WAVE);
+    return acc;
+}
+
+// THREE MATRICES, ONE LAUNCH — the Q, K and V projections.
+//
+// They all consume the same activation, and separately they are 512 + 64 + 64
+// workgroups issued as three launches. Together they are 640 workgroups in one,
+// which both removes two launches per layer and lets the small K and V
+// projections fill the card alongside Q instead of running alone at 64
+// workgroups on 32 WGPs.
+__global__ void q6k_q8k_matvec_x3(
+    const uint8_t * __restrict__ w0, const uint8_t * __restrict__ w1,
+    const uint8_t * __restrict__ w2,
+    const int8_t  * __restrict__ aq, const float * __restrict__ ad,
+    float * __restrict__ o0, float * __restrict__ o1, float * __restrict__ o2,
+    int blocks, int rows0, int rows1, int rows2)
+{
+    const int wave = threadIdx.x / WAVE;
+    const int lane = threadIdx.x % WAVE;
+    const int grow = blockIdx.x * ROWS_PER_BLOCK + wave;
+    if (grow >= rows0 + rows1 + rows2) return;
+
+    const uint8_t *w;
+    float *out;
+    int row;
+    if (grow < rows0)                { w = w0; out = o0; row = grow; }
+    else if (grow < rows0 + rows1)   { w = w1; out = o1; row = grow - rows0; }
+    else                             { w = w2; out = o2; row = grow - rows0 - rows1; }
+
+    const float acc = wave_reduce(
+        q6k_lane_partial(w + (size_t)row * blocks * Q6K_BLOCK_BYTES, aq, ad, blocks, lane));
+    if (lane == 0) out[row] = acc;
+}
+
+// TWO GROUPED MATRICES, ONE LAUNCH — the expert gate and up projections.
+//
+// Same reasoning: both read the same activation, and 768 workgroups each
+// becomes 1536 in one launch.
+__global__ void q6k_q8k_matvec_grouped_x2(
+    const uint8_t * __restrict__ wa, const uint8_t * __restrict__ wb,
+    const int32_t * __restrict__ expert_ids,
+    const int8_t  * __restrict__ aq, const float * __restrict__ ad,
+    float * __restrict__ oa, float * __restrict__ ob,
+    int blocks, int rows, int n_used)
+{
+    const int wave = threadIdx.x / WAVE;
+    const int lane = threadIdx.x % WAVE;
+    const int grow = blockIdx.x * ROWS_PER_BLOCK + wave;
+    const int total = rows * n_used;
+    if (grow >= 2 * total) return;
+
+    const bool second = grow >= total;
+    const int idx = second ? grow - total : grow;
+    const uint8_t *w = second ? wb : wa;
+    float *out = second ? ob : oa;
+
+    const int e   = idx / rows;
+    const int row = idx - e * rows;
+    const size_t mat = (size_t)expert_ids[e] * rows * blocks * Q6K_BLOCK_BYTES;
+
+    const float acc = wave_reduce(q6k_lane_partial(
+        w + mat + (size_t)row * blocks * Q6K_BLOCK_BYTES, aq, ad, blocks, lane));
+    if (lane == 0) out[idx] = acc;
+}
+
+
 __global__ void q6k_q8k_matvec_resident(
     const uint8_t * __restrict__ w,
     const int8_t  * __restrict__ aq,
@@ -738,12 +856,19 @@ out:
 // kernels do, and a __global__ cannot be launched from another translation
 // unit.
 // ---------------------------------------------------------------------------
+// The stream these launch on, owned by llamd_forward.hip. Fetched per call
+// rather than cached: it is created after this translation unit is loaded, and
+// a stale null would silently put these kernels on the default stream — outside
+// any graph capture, which is an error rather than a slowdown.
+void *llamd_fwd_get_stream();
+static inline hipStream_t fwd_stream() { return (hipStream_t)llamd_fwd_get_stream(); }
+
 void llamd_fwd_matvec(const void *d_w, const int8_t *d_aq, const float *d_ad,
                       float *d_out, int blocks, int rows)
 {
     const int grid = (rows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
     hipLaunchKernelGGL(q6k_q8k_matvec_resident,
-                       dim3(grid), dim3(WAVE * ROWS_PER_BLOCK), 0, 0,
+                       dim3(grid), dim3(WAVE * ROWS_PER_BLOCK), 0, fwd_stream(),
                        (const uint8_t *)d_w, d_aq, d_ad, d_out, blocks, rows);
 }
 
@@ -754,7 +879,7 @@ void llamd_fwd_matvec_grouped(const void *d_w, const int32_t *d_ids,
     const int total = rows * n_used;
     const int grid  = (total + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
     hipLaunchKernelGGL(q6k_q8k_matvec_grouped,
-                       dim3(grid), dim3(WAVE * ROWS_PER_BLOCK), 0, 0,
+                       dim3(grid), dim3(WAVE * ROWS_PER_BLOCK), 0, fwd_stream(),
                        (const uint8_t *)d_w, d_ids, d_aq, d_ad, d_out,
                        blocks, rows, n_used);
 }
@@ -766,14 +891,40 @@ void llamd_fwd_matvec_grouped_pa(const void *d_w, const int32_t *d_ids,
     const int total = rows * n_used;
     const int grid  = (total + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
     hipLaunchKernelGGL(q6k_q8k_matvec_grouped_pa,
-                       dim3(grid), dim3(WAVE * ROWS_PER_BLOCK), 0, 0,
+                       dim3(grid), dim3(WAVE * ROWS_PER_BLOCK), 0, fwd_stream(),
                        (const uint8_t *)d_w, d_ids, d_aq, d_ad, d_out,
                        blocks, rows, n_used);
 }
 
+void llamd_fwd_matvec_x3(const void *w0, const void *w1, const void *w2,
+                         const int8_t *d_aq, const float *d_ad,
+                         float *o0, float *o1, float *o2,
+                         int blocks, int rows0, int rows1, int rows2)
+{
+    const int total = rows0 + rows1 + rows2;
+    const int grid = (total + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
+    hipLaunchKernelGGL(q6k_q8k_matvec_x3,
+                       dim3(grid), dim3(WAVE * ROWS_PER_BLOCK), 0, fwd_stream(),
+                       (const uint8_t *)w0, (const uint8_t *)w1, (const uint8_t *)w2,
+                       d_aq, d_ad, o0, o1, o2, blocks, rows0, rows1, rows2);
+}
+
+void llamd_fwd_matvec_grouped_x2(const void *wa, const void *wb,
+                                 const int32_t *d_ids, const int8_t *d_aq,
+                                 const float *d_ad, float *oa, float *ob,
+                                 int blocks, int rows, int n_used)
+{
+    const int total = 2 * rows * n_used;
+    const int grid = (total + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
+    hipLaunchKernelGGL(q6k_q8k_matvec_grouped_x2,
+                       dim3(grid), dim3(WAVE * ROWS_PER_BLOCK), 0, fwd_stream(),
+                       (const uint8_t *)wa, (const uint8_t *)wb, d_ids,
+                       d_aq, d_ad, oa, ob, blocks, rows, n_used);
+}
+
 void llamd_fwd_quantize(const float *d_x, int8_t *d_qs, float *d_d, int nblocks)
 {
-    hipLaunchKernelGGL(q8k_quantize, dim3(nblocks), dim3(QK_K), 0, 0,
+    hipLaunchKernelGGL(q8k_quantize, dim3(nblocks), dim3(QK_K), 0, fwd_stream(),
                        d_x, d_qs, d_d, (int16_t *)nullptr, nblocks);
 }
 

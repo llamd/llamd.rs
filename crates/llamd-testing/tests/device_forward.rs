@@ -157,7 +157,20 @@ fn device_generation_throughput() {
         }
     };
 
+    // WARM FIRST, THEN MEASURE. A cold run pays first-launch costs — module
+    // load, code-object paging, the first touch of each weight page — that a
+    // steady state does not. Measuring 64 tokens cold gave 14.20 ms/token while
+    // the same path warm gave 11.93, and quoting the cold figure would
+    // understate the engine by 19%.
+    //
+    // 64 GENERATED TOKENS, matching llama-bench's tg64, so the comparison is
+    // like for like: attention cost grows with n_kv in both.
     let mut token = 13048u32; // "Hi", the prompt llama.cpp was benchmarked on
+    for pos in 0..N_GEN {
+        token = dev.forward(token, pos).expect("warm");
+    }
+
+    token = 13048;
     let mut text = String::new();
     let mut per = Vec::with_capacity(N_GEN);
     for pos in 0..N_GEN {
@@ -168,23 +181,52 @@ fn device_generation_throughput() {
     }
 
     let first = per[0];
-    let rest: f64 = per[1..].iter().sum();
-    let tg = (per.len() - 1) as f64 / rest;
-    eprintln!("\n  first token     {:.1} ms", first * 1e3);
+    let total: f64 = per.iter().sum();
+    let tg = per.len() as f64 / total;
+    eprintln!("\n  first token     {:.2} ms", first * 1e3);
     eprintln!(
-        "  steady state    {:.2} ms/token  ->  {tg:.2} tok/s",
-        rest / (per.len() - 1) as f64 * 1e3
+        "  {N_GEN} tokens      {:.2} ms/token  ->  {tg:.2} tok/s",
+        total / per.len() as f64 * 1e3
     );
     eprintln!(
         "  spread          min {:.2} ms  max {:.2} ms",
-        per[1..].iter().cloned().fold(f64::MAX, f64::min) * 1e3,
-        per[1..].iter().cloned().fold(0.0, f64::max) * 1e3
+        per.iter().cloned().fold(f64::MAX, f64::min) * 1e3,
+        per.iter().cloned().fold(0.0, f64::max) * 1e3
     );
     eprintln!("  generated       {text:?}");
-    eprintln!("  llama.cpp bar   94.39 tok/s (llama-bench, idle card)");
+    // Two llama-bench runs on this idle card gave 94.39 +/- 7.73 and
+    // 95.55 +/- 5.59, so the bar is a range. The conservative end is used for
+    // the ratio: a claim of beating llama.cpp should be measured against its
+    // better run, not its worse one.
+    const BAR: f64 = 95.55;
+    eprintln!("  llama.cpp bar   {BAR:.2} tok/s (llama-bench tg64, idle card)");
+    eprintln!("  ratio           {:.2}x llama.cpp", tg / BAR);
 
     assert!(tg > 0.0 && tg < 10000.0, "implausible throughput {tg}");
     assert!(!text.is_empty());
+
+    // Graph against no graph, same model, same prompt. The launch-overhead
+    // estimate that motivated graph capture was inferred, not measured; this
+    // measures it.
+    for (label, use_graph) in [("graph", true), ("per-launch", false)] {
+        dev.use_graph = use_graph;
+        let mut tk = 13048u32;
+        // Warm: the first graph token pays capture.
+        for pos in 0..4 {
+            tk = dev.forward(tk, pos).expect("warm");
+        }
+        let t = std::time::Instant::now();
+        const N: usize = 64;
+        for pos in 0..N {
+            tk = dev.forward(tk, pos).expect("timed");
+        }
+        let ms = t.elapsed().as_secs_f64() * 1e3 / N as f64;
+        eprintln!(
+            "  {label:<12} {ms:>7.3} ms/token  ->  {:>6.2} tok/s",
+            1000.0 / ms
+        );
+    }
+    dev.use_graph = true;
 
     // Where the time goes. Profiled tokens are SLOWER than real ones — each
     // phase ends with a synchronise so it can be attributed — so the total

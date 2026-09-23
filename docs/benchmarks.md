@@ -491,3 +491,106 @@ in order of expected return:
 reachable by removing overhead alone — it needs item 3 as well. **90–100 tok/s,
 i.e. parity with llama.cpp, is reachable from items 1 and 2**, and that is the
 next honest milestone.
+
+---
+
+## 8. Parity, and past it — 101.9 tok/s against llama.cpp's 95.6
+
+§7 left LLAMD at 67.27 tok/s against llama.cpp's 94.39, with a plan: fuse
+launches, capture a HIP graph, and expect ~90–100. Both were built. One worked.
+
+**Final, warmed, 64 generated tokens, matching `llama-bench tg64`:**
+
+| | tok/s | ms/token |
+|---|---|---|
+| **LLAMD** | **101.9 – 103.9** | 9.62 – 9.84 |
+| llama.cpp (two runs) | 94.39 ± 7.73, 95.55 ± 5.59 | |
+| **ratio** | **1.07 – 1.10×** | |
+
+Three consecutive runs gave 103.94, 103.39, 102.13 — spread 8.99 to 10.89 ms per
+token. **GPU == CPU == llama.cpp on all five agreement prompts throughout.**
+
+### What actually produced the gain
+
+| step | tok/s | |
+|---|---|---|
+| resident forward, §7 | 67.27 | |
+| fuse rope path, norm+quant, moe tail | 79.71 | +18% |
+| parallelise rms_norm_quant | 83.84 | +5% |
+| one workgroup per row in the F32 matvec | 82.84 → 101.60 with the next step | |
+| **fuse Q/K/V into one launch, gate/up into one** | **101.6 – 103.9** | **+23%** |
+
+The last step was by far the largest, and not for the reason the fusions were
+begun. Q, K and V are 512, 64 and 64 workgroups. Issued separately, the K and V
+projections each occupy 64 workgroups on a 32-WGP card — the GPU is nearly idle
+while they run. Fused, all three are 640 workgroups in one launch and K and V
+fill the card alongside Q. The same applies to the expert gate and up: 768
+workgroups each becomes 1536 together.
+
+**So the win was occupancy, not launch overhead.** That distinction is the
+useful result here, because it is the opposite of what §7 predicted.
+
+### The HIP graph was a dead end, and the measurement says so
+
+§7 argued from a ~4.5 µs/launch estimate that ~1200 launches cost roughly 5.4 of
+14.87 ms, and that graph capture should recover most of it. Capture was
+implemented — device-resident `[token, pos]` so the graph is structurally
+invariant, a dedicated stream, ownership tracking — and measured:
+
+| | before fusion | after fusion |
+|---|---|---|
+| graph replay | 13.851 ms | 9.538 – 9.662 ms |
+| individual launches | **12.545 ms** | 9.581 – 9.676 ms |
+
+**Slower before fusion, indistinguishable after.** The launch-overhead estimate
+was inferred, not measured, and it was wrong. `use_graph` is off by default and
+the machinery is kept so the comparison stays reproducible and a future ROCm can
+be retested by flipping one flag.
+
+Recording this because a plan that half-failed is more informative than one that
+worked: the reasoning behind the graph was plausible and the number refuted it.
+
+### Two bugs found, both by symptom rather than by review
+
+**A graph replayed against freed memory.** The HIP graph is a process-global
+object holding raw pointers into whichever model recorded it. Load a model,
+capture, drop it, load another: the new model saw `graph::exists()` and replayed
+a graph pointing at freed buffers. It surfaced as
+`HSA_STATUS_ERROR_MEMORY_FAULT ... kernel: fk_embed_q6k_meta` — reading an
+embedding table that no longer existed. Fixed with instance ownership: each
+model takes an id, and a graph recorded under a different id is discarded rather
+than replayed. A comment would not have prevented it.
+
+**A hardcoded epsilon that happened to be right.** The fused QK-norm kernels were
+written with `1e-6f` inline. This model's `rms_eps` *is* 1e-6, so every test
+passed; another model would have been silently wrong. Now passed as an argument.
+
+### Where the remaining time goes
+
+| phase | ms (profiled) | share |
+|---|---|---|
+| experts | 4.966 | 24.9% |
+| router | 2.667 | 13.4% |
+| attn_out + residual | 2.648 | 13.3% |
+| q/k/v proj | 2.353 | 11.8% |
+| profiled total | 19.970 | |
+
+Profiling synchronises after each phase, so its total overstates the 9.8 ms real
+token; the proportions are what to read.
+
+### Toward 140
+
+140 tok/s needs 7.14 ms against today's 9.62–9.84. The remaining levers are no
+longer integration:
+
+1. **The matvec kernel itself.** `attn_q` measures 230 GB/s where the output
+   projection reaches 480, and the experts 322–367. Closing that on the
+   attention shapes is worth roughly 1 ms.
+2. **Fuse the residual add into the projection** that produces it, as
+   `moe_combine_add` already does — the attention output path still runs a
+   separate `add`.
+3. **The remaining small kernels.** `qk-norm+rope` and `moe tail` are ~1.5 ms
+   combined for work that touches a few thousand floats.
+
+Those three plausibly reach ~8 ms, i.e. ~125 tok/s. 140 would need the expert
+path near 480 GB/s, which nothing has yet demonstrated at a 10 MB shape.

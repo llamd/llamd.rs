@@ -140,6 +140,14 @@ A live `llama-server` on the same card, configured as a user would run one
 (98304-token context, `-ctk q8_0 -ctv q8_0 -fa on`), measures **57.7 t/s**
 instead. The bar depends on configuration, so both are recorded.
 
+**LLAMD is faster than llama.cpp on this card: 101.9-103.9 tok/s against
+94.4-95.6**, measured warmed over 64 generated tokens, emitting the same tokens
+as the CPU reference and llama.cpp on all five agreement prompts. That is
+1.07-1.10x. See [benchmarks.md](benchmarks.md) §8, including the HIP graph that
+measured slower and was abandoned.
+
+The earlier milestone, kept for the reasoning that produced it:
+
 **LLAMD now has an end-to-end GPU number: 67.27 tok/s**, from a resident
 forward pass with every operation on the device and one synchronise per token
 (`llamd-runtime/src/device.rs`). It emits the same tokens as the CPU reference

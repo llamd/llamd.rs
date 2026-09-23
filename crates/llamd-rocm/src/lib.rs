@@ -22,7 +22,7 @@
 #![deny(unsafe_code)]
 
 pub mod forward;
-pub use forward::{DevBuf, free_memory, op, sync};
+pub use forward::{DevBuf, free_memory, graph, op, stream_init, sync};
 
 use llamd_core::{Error, Result};
 
