@@ -21,6 +21,9 @@
 
 #![deny(unsafe_code)]
 
+pub mod ops;
+pub use ops::{Pipeline, Push, begin, end_and_wait, subgroup_size};
+
 use llamd_core::{Error, Result};
 use std::ffi::c_void;
 
@@ -299,6 +302,12 @@ impl VkBuf {
     pub fn download_f32(&self, out: &mut [f32]) -> Result<()> {
         self.download(as_bytes_mut(out))
     }
+    pub fn upload_i32(&self, host: &[i32]) -> Result<()> {
+        self.upload(as_bytes(host))
+    }
+    pub fn download_i32(&self, out: &mut [i32]) -> Result<()> {
+        self.download(as_bytes_mut(out))
+    }
 }
 
 /// Planar Q6_K weights on the Vulkan device, with their plane offsets.
@@ -330,6 +339,12 @@ impl PlanarWeights {
     }
     pub fn blocks(&self) -> usize {
         self.blocks
+    }
+    pub fn buf(&self) -> &VkBuf {
+        &self.buf
+    }
+    pub fn offsets(&self) -> &[u64; 4] {
+        &self.off
     }
 
     /// Q6_K × Q8_K matvec for `nseq` activations.
@@ -389,7 +404,7 @@ impl PlanarWeights {
 
 #[cfg(vulkan)]
 #[allow(unsafe_code)]
-mod ffi {
+pub(crate) mod ffi {
     use std::ffi::c_void;
     use std::os::raw::{c_char, c_int};
 
@@ -405,6 +420,19 @@ mod ffi {
             subgroup: *mut u32,
         ) -> c_int;
         pub fn llamd_vk_alloc(bytes: u64) -> *mut c_void;
+        pub fn llamd_vk_pipeline_count() -> c_int;
+        pub fn llamd_vk_pipeline_name(i: c_int) -> *const c_char;
+        pub fn llamd_vk_begin() -> c_int;
+        pub fn llamd_vk_dispatch(
+            pipe: c_int,
+            bufs: *const *mut c_void,
+            nbuf: c_int,
+            push: *const u32,
+            gx: u32,
+            gy: u32,
+        ) -> c_int;
+        pub fn llamd_vk_end_and_wait() -> c_int;
+        pub fn llamd_vk_subgroup_size() -> u32;
         pub fn llamd_vk_free(h: *mut c_void);
         pub fn llamd_vk_upload(h: *mut c_void, src: *const c_void, bytes: u64) -> c_int;
         pub fn llamd_vk_download(h: *mut c_void, dst: *mut c_void, bytes: u64) -> c_int;

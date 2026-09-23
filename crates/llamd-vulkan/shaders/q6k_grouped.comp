@@ -1,0 +1,42 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly  buffer W   { uint  w[];  };
+layout(std430, binding = 1) readonly  buffer QB  { uint  qb[]; };
+layout(std430, binding = 2) readonly  buffer SB  { int   sb[]; };
+layout(std430, binding = 3) readonly  buffer AD  { float ad[]; };
+layout(std430, binding = 4) writeonly buffer O   { float outv[]; };
+layout(std430, binding = 5) readonly  buffer IDS { int   ids[]; };
+layout(push_constant) uniform Push {
+    uint ql_u; uint qh_u; uint sc_u; uint d_u;
+    uint blocks; uint rows; uint nseq; uint n_used;
+} pc;
+#include "common.glsl"
+#include "q6k.glsl"
+
+// One row per subgroup. A row belongs to exactly one (sequence, expert): the
+// sequences route independently, so unlike the attention projections there is
+// nothing to share between them here — but the packed dot product still cuts
+// the instruction count fourfold.
+void main() {
+    uint grow = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
+    uint per_seq = pc.rows * pc.n_used;
+    if (grow >= per_seq * pc.nseq) return;
+
+    uint s = grow / per_seq;
+    uint r0 = grow - s * per_seq;
+    uint e = r0 / pc.rows;
+    uint row = r0 - e * pc.rows;
+    uint ri = (uint(ids[s * pc.n_used + e]) * pc.rows + row) * pc.blocks;
+
+    float acc[MAX_SEQ];
+    for (int i = 0; i < MAX_SEQ; ++i) acc[i] = 0.0;
+    // NS = 1: this row belongs to one sequence, whose activation the bases
+    // below select. pc.nseq still bounds the row space above.
+    Q6K_ACC(w, ri, s * pc.blocks * 64u, s * pc.blocks * 16u, s * pc.blocks, 1u, acc)
+    float t = subgroupAdd(acc[0]);
+    if (subgroupElect()) outv[grow] = t;
+}

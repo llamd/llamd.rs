@@ -1,0 +1,28 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#include "common.glsl"
+#include "quant.glsl"
+layout(local_size_x = QK_K) in;
+layout(std430, binding = 0) readonly  buffer X  { float x[];   };
+layout(std430, binding = 1) writeonly buffer QB { uint8_t qb[]; };
+layout(std430, binding = 2) writeonly buffer SB { int   sb[];  };
+layout(std430, binding = 3) writeonly buffer D  { float d[];   };
+layout(push_constant) uniform P { uint nblocks_total; } pc;
+
+void main() {
+    uint b = gl_WorkGroupID.x;
+    if (b >= pc.nblocks_total) return;
+    uint t = gl_LocalInvocationID.x;
+    uint i = b * QK_K + t;
+    float dscale;
+    uint bq = quant_bias_group(x[i], t, 0u, dscale);
+    qb[i] = uint8_t(bq);
+    if (t == 0u) d[b] = dscale;
+    if (t < QK_K / 16u) {
+        int acc = 0;
+        for (uint j = 0u; j < 16u; ++j) acc += s_q[t * 16u + j];
+        sb[b * 16u + t] = acc;
+    }
+}

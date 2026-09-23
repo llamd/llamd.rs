@@ -42,10 +42,15 @@ struct Ctx {
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
-    VkDescriptorPool dpool = VK_NULL_HANDLE;
+    PFN_vkCmdPushDescriptorSetKHR push_desc = nullptr;
+    // There is ONE command buffer. An upload or download between begin() and
+    // end_and_wait() would reset it and silently discard a half-recorded token,
+    // producing plausible wrong output rather than an error — so it is refused.
+    bool recording = false;
     VkDescriptorSetLayout dlayout = VK_NULL_HANDLE;
     VkPipelineLayout playout = VK_NULL_HANDLE;
-    VkPipeline matvec = VK_NULL_HANDLE;
+    // One pipeline per shader, indexed by the build order in build.rs.
+    std::vector<VkPipeline> pipes;
     VkPhysicalDeviceMemoryProperties memprops{};
     char name[256] = {0};
     char driver[256] = {0};
@@ -260,13 +265,16 @@ int llamd_vk_init() {
     f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     f2.pNext = &v12;
 
-    const char *exts[] = { VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME };
+    const char *exts[] = {
+        VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME,
+        VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
+    };
     VkDeviceCreateInfo dci{};
     dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     dci.pNext = &f2;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = 1;
+    dci.enabledExtensionCount = 2;
     dci.ppEnabledExtensionNames = exts;
     if (vkCreateDevice(g.phys, &dci, nullptr, &g.dev) != VK_SUCCESS) return -1;
     vkGetDeviceQueue(g.dev, g.qfam, 0, &g.queue);
@@ -288,8 +296,8 @@ int llamd_vk_init() {
     fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     if (vkCreateFence(g.dev, &fi, nullptr, &g.fence) != VK_SUCCESS) return -1;
 
-    VkDescriptorSetLayoutBinding binds[5]{};
-    for (int i = 0; i < 5; ++i) {
+    VkDescriptorSetLayoutBinding binds[8]{};
+    for (int i = 0; i < 8; ++i) {
         binds[i].binding = (uint32_t)i;
         binds[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         binds[i].descriptorCount = 1;
@@ -297,16 +305,19 @@ int llamd_vk_init() {
     }
     VkDescriptorSetLayoutCreateInfo dli{};
     dli.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dli.bindingCount = 5;
+    dli.bindingCount = 8;
     dli.pBindings = binds;
-    // PUSH descriptors would avoid a pool entirely, but the extension is not
-    // guaranteed; a pool with a generous set count is portable.
+    // PUSH DESCRIPTORS: the buffer handles travel inside the command buffer, so
+    // there is no pool, no set allocation and nothing to recycle between
+    // dispatches. A token is ~15 dispatches per layer and allocating a
+    // descriptor set for each would dominate.
+    dli.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
     if (vkCreateDescriptorSetLayout(g.dev, &dli, nullptr, &g.dlayout) != VK_SUCCESS) return -1;
 
     VkPushConstantRange pcr{};
     pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     pcr.offset = 0;
-    pcr.size = 8 * sizeof(uint32_t);
+    pcr.size = 16 * sizeof(uint32_t);   // 64 bytes; the device guarantees 128
     VkPipelineLayoutCreateInfo pli{};
     pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     pli.setLayoutCount = 1;
@@ -315,19 +326,19 @@ int llamd_vk_init() {
     pli.pPushConstantRanges = &pcr;
     if (vkCreatePipelineLayout(g.dev, &pli, nullptr, &g.playout) != VK_SUCCESS) return -1;
 
-    VkDescriptorPoolSize ps{};
-    ps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    ps.descriptorCount = 5 * 256;
-    VkDescriptorPoolCreateInfo dpi{};
-    dpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dpi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    dpi.maxSets = 256;
-    dpi.poolSizeCount = 1;
-    dpi.pPoolSizes = &ps;
-    if (vkCreateDescriptorPool(g.dev, &dpi, nullptr, &g.dpool) != VK_SUCCESS) return -1;
+    g.push_desc = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(
+        g.dev, "vkCmdPushDescriptorSetKHR");
+    if (!g.push_desc) return -1;
 
-    g.matvec = make_pipeline(SPV_Q6K_MATVEC, sizeof(SPV_Q6K_MATVEC) / sizeof(uint32_t));
-    if (g.matvec == VK_NULL_HANDLE) return -1;
+    const size_t n_pipes = sizeof(SPV_TABLE) / sizeof(SPV_TABLE[0]);
+    g.pipes.resize(n_pipes, VK_NULL_HANDLE);
+    for (size_t i = 0; i < n_pipes; ++i) {
+        g.pipes[i] = make_pipeline(SPV_TABLE[i].code, SPV_TABLE[i].words);
+        if (g.pipes[i] == VK_NULL_HANDLE) {
+            fprintf(stderr, "llamd-vulkan: pipeline %s failed to create\n", SPV_TABLE[i].name);
+            return -1;
+        }
+    }
 
     g.ok = true;
     return 0;
@@ -366,7 +377,7 @@ void llamd_vk_free(void *h) {
 }
 
 int llamd_vk_upload(void *h, const void *src, uint64_t bytes) {
-    if (!g.ok || !h) return -1;
+    if (!g.ok || !h || g.recording) return -1;
     Buf *b = (Buf *)h;
     if (bytes > b->size) return -1;
     if (!ensure_staging(bytes)) return -1;
@@ -382,7 +393,7 @@ int llamd_vk_upload(void *h, const void *src, uint64_t bytes) {
 }
 
 int llamd_vk_download(void *h, void *dst, uint64_t bytes) {
-    if (!g.ok || !h) return -1;
+    if (!g.ok || !h || g.recording) return -1;
     Buf *b = (Buf *)h;
     if (bytes > b->size) return -1;
     if (!ensure_staging(bytes)) return -1;
@@ -398,40 +409,93 @@ int llamd_vk_download(void *h, void *dst, uint64_t bytes) {
     return 0;
 }
 
-// Q6_K matvec. `off` is the four plane offsets in BYTES; the shader wants them
-// in uints, converted here so the caller uses the same PlanarQ6K layout the
-// ROCm backend does.
-int llamd_vk_matvec(void *w, const uint64_t *off, void *qb, void *sb, void *ad,
-                    void *out, int blocks, int rows, int nseq, int iters)
+// ---------------------------------------------------------------------------
+// RECORD, DISPATCH, SUBMIT ONCE.
+//
+// A token is roughly fifteen dispatches per layer. Recording them all into one
+// command buffer and waiting once is the Vulkan equivalent of the ROCm path's
+// single hipDeviceSynchronize, and for the same reason: the alternative is a
+// stall per operation, which on the ROCm side cost 0.12 ms per matmul and put a
+// hard ~6 tok/s ceiling on the engine regardless of kernel speed.
+//
+// Buffer handles travel inside the command buffer via push descriptors, so there
+// is no descriptor pool and nothing to recycle between dispatches.
+//
+// A COMPUTE-TO-COMPUTE BARRIER FOLLOWS EVERY DISPATCH. Almost every operation
+// in a token reads what the previous one wrote; Vulkan does not order dispatches
+// implicitly the way a HIP stream does, and omitting the barrier produces
+// plausible, wrong output rather than an error.
+int llamd_vk_pipeline_count() {
+    return (int)(sizeof(SPV_TABLE) / sizeof(SPV_TABLE[0]));
+}
+
+const char *llamd_vk_pipeline_name(int i) {
+    if (i < 0 || i >= llamd_vk_pipeline_count()) return "";
+    return SPV_TABLE[i].name;
+}
+
+int llamd_vk_begin() {
+    if (!g.ok || g.recording) return -1;
+    if (!begin_cmd()) return -1;
+    g.recording = true;
+    return 0;
+}
+
+int llamd_vk_dispatch(int pipe, void *const *bufs, int nbuf,
+                      const uint32_t *push, uint32_t gx, uint32_t gy)
 {
-    if (!g.ok) return -1;
-    Buf *bw = (Buf *)w, *bq = (Buf *)qb, *bs = (Buf *)sb, *ba = (Buf *)ad, *bo = (Buf *)out;
+    if (!g.ok || !g.recording) return -1;
+    if (pipe < 0 || pipe >= llamd_vk_pipeline_count()) return -1;
+    if (nbuf < 0 || nbuf > 8) return -1;
+    if (gx == 0 || gy == 0) return 0;          // nothing to do, not an error
 
-    VkDescriptorSetAllocateInfo ai{};
-    ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    ai.descriptorPool = g.dpool;
-    ai.descriptorSetCount = 1;
-    ai.pSetLayouts = &g.dlayout;
-    VkDescriptorSet set = VK_NULL_HANDLE;
-    if (vkAllocateDescriptorSets(g.dev, &ai, &set) != VK_SUCCESS) return -1;
-
-    VkBuffer bufs[5] = {bw->buf, bq->buf, bs->buf, ba->buf, bo->buf};
-    VkDescriptorBufferInfo bi[5]{};
-    VkWriteDescriptorSet wr[5]{};
-    for (int i = 0; i < 5; ++i) {
-        bi[i].buffer = bufs[i];
+    VkDescriptorBufferInfo bi[8]{};
+    VkWriteDescriptorSet wr[8]{};
+    for (int i = 0; i < nbuf; ++i) {
+        Buf *b = (Buf *)bufs[i];
+        if (!b || b->buf == VK_NULL_HANDLE) return -1;
+        bi[i].buffer = b->buf;
         bi[i].offset = 0;
         bi[i].range = VK_WHOLE_SIZE;
         wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        wr[i].dstSet = set;
         wr[i].dstBinding = (uint32_t)i;
         wr[i].descriptorCount = 1;
         wr[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         wr[i].pBufferInfo = &bi[i];
     }
-    vkUpdateDescriptorSets(g.dev, 5, wr, 0, nullptr);
 
-    uint32_t pc[8];
+    vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pipes[(size_t)pipe]);
+    g.push_desc(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.playout, 0, (uint32_t)nbuf, wr);
+    vkCmdPushConstants(g.cmd, g.playout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       16 * sizeof(uint32_t), push);
+    vkCmdDispatch(g.cmd, gx, gy, 1);
+
+    VkMemoryBarrier mb{};
+    mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(g.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr,
+                         0, nullptr);
+    return 0;
+}
+
+int llamd_vk_end_and_wait() {
+    if (!g.ok || !g.recording) return -1;
+    g.recording = false;
+    if (vkEndCommandBuffer(g.cmd) != VK_SUCCESS) return -1;
+    return submit_and_wait() ? 0 : -1;
+}
+
+uint32_t llamd_vk_subgroup_size() { return g.subgroup_size; }
+
+// Convenience wrapper for the standalone matvec validation and benchmark: one
+// begin / N dispatches / one wait.
+int llamd_vk_matvec(void *w, const uint64_t *off, void *qb, void *sb, void *ad,
+                    void *out, int blocks, int rows, int nseq, int iters)
+{
+    if (!g.ok) return -1;
+    uint32_t pc[16] = {0};
     pc[0] = (uint32_t)(off[0] / 4);
     pc[1] = (uint32_t)(off[1] / 4);
     pc[2] = (uint32_t)(off[2] / 4);
@@ -439,33 +503,17 @@ int llamd_vk_matvec(void *w, const uint64_t *off, void *qb, void *sb, void *ad,
     pc[4] = (uint32_t)blocks;
     pc[5] = (uint32_t)rows;
     pc[6] = (uint32_t)nseq;
-    pc[7] = 0;
 
-    // One subgroup per row; 256 invocations per workgroup.
-    const uint32_t subgroups_per_wg = 256u / (g.subgroup_size ? g.subgroup_size : 64u);
-    const uint32_t groups = ((uint32_t)rows + subgroups_per_wg - 1) / subgroups_per_wg;
+    void *bufs[5] = {w, qb, sb, ad, out};
+    const uint32_t sg = g.subgroup_size ? g.subgroup_size : 64u;
+    const uint32_t per_wg = 256u / sg;                 // subgroups, one row each
+    const uint32_t groups = ((uint32_t)rows + per_wg - 1) / per_wg;
 
-    if (!begin_cmd()) return -1;
-    vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.matvec);
-    vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.playout, 0, 1, &set, 0, nullptr);
-    vkCmdPushConstants(g.cmd, g.playout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+    if (llamd_vk_begin() != 0) return -1;
     for (int i = 0; i < (iters > 0 ? iters : 1); ++i) {
-        vkCmdDispatch(g.cmd, groups, 1, 1);
-        if (i + 1 < iters) {
-            // Back-to-back timing runs must not overlap, or the measurement is
-            // of the queue rather than the kernel.
-            VkMemoryBarrier mb{};
-            mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-            mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            vkCmdPipelineBarrier(g.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
-        }
+        if (llamd_vk_dispatch(0, bufs, 5, pc, groups, 1) != 0) return -1;
     }
-    if (vkEndCommandBuffer(g.cmd) != VK_SUCCESS) return -1;
-    const bool okk = submit_and_wait();
-    vkFreeDescriptorSets(g.dev, g.dpool, 1, &set);
-    return okk ? 0 : -1;
+    return llamd_vk_end_and_wait();
 }
 
 } // extern "C"

@@ -1,0 +1,47 @@
+#version 450
+layout(local_size_x = 128) in;
+layout(std430, binding = 0) buffer X          { float x[];    };
+layout(std430, binding = 1) readonly buffer W { float w[];    };
+layout(std430, binding = 2) readonly buffer M { int   meta[]; };
+layout(push_constant) uniform P {
+    uint n_head; uint hd; uint nseq; uint has_norm;
+    float freq_base; float eps;
+} pc;
+shared float sh[128];
+
+// Per-head RMS norm then NeoX RoPE, one workgroup per (sequence, head).
+//
+// BOTH STAGES ARE CONFINED TO ONE HEAD — the norm reduces over head_dim, the
+// rotation pairs i with i + head_dim/2 inside the same head — so one workgroup
+// does both with a barrier between. QK-norm comes BEFORE the rotation, which is
+// the order the CPU reference and llama.cpp use.
+void main() {
+    uint s = gl_WorkGroupID.x / pc.n_head;
+    uint head = gl_WorkGroupID.x - s * pc.n_head;
+    if (s >= pc.nseq) return;
+    int pos = meta[2 * int(s) + 1];
+    uint base = (s * pc.n_head + head) * pc.hd;
+    uint t = gl_LocalInvocationID.x;
+
+    if (pc.has_norm != 0u) {
+        float a = 0.0;
+        for (uint i = t; i < pc.hd; i += 128u) { float v = x[base + i]; a += v * v; }
+        sh[t] = a;
+        barrier();
+        for (uint st = 64u; st > 0u; st >>= 1u) { if (t < st) sh[t] += sh[t + st]; barrier(); }
+        float inv = inversesqrt(sh[0] / float(pc.hd) + pc.eps);
+        for (uint i = t; i < pc.hd; i += 128u) x[base + i] = x[base + i] * inv * w[i];
+        barrier();
+    }
+
+    uint half_ = pc.hd / 2u;
+    for (uint i = t; i < half_; i += 128u) {
+        // theta = pos / freq_base^(2i/hd) — NeoX pairing, i with i + hd/2, not
+        // adjacent elements.
+        float theta = float(pos) / pow(pc.freq_base, 2.0 * float(i) / float(pc.hd));
+        float sn = sin(theta), cs = cos(theta);
+        float a = x[base + i], b = x[base + i + half_];
+        x[base + i]          = a * cs - b * sn;
+        x[base + i + half_]  = a * sn + b * cs;
+    }
+}

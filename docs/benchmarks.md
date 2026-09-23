@@ -1059,3 +1059,104 @@ kernel that is implemented and validated. It is **not** yet true that a token is
 computed on Vulkan. The honest reading of the table above is *a strong signal on
 the dominant kernel*, and the next increment is the remaining shaders — after
 which a whole-token Vulkan-versus-ROCm number can be put beside llama.cpp's.
+
+---
+
+## 14. Vulkan end to end: ahead of llama.cpp at every batch size
+
+§13 delivered the Vulkan backend with one kernel and said plainly that a token
+was not yet computed on it. The remaining seventeen shaders are now written, and
+`VulkanModel` computes a whole token on Vulkan: weights resident, activations
+never crossing the bus, every operation recorded without waiting, **one
+submission per token**, and only the argmax read back.
+
+### Correctness first
+
+| prompt | Vulkan | llama.cpp | |
+|---|---|---|---|
+| `"Hi"` | 525 `" are"` | 525 | ok |
+| `"The"` | 525 `" are"` | 525 | ok |
+| `"def"` | 374 `" is"` | 374 | ok |
+| `"Python"` | 25 `":"` | 25 | ok |
+| `"1"` | 13 `"."` | 13 | ok |
+
+**All five, including the two near-ties** (margins 0.1196 and 0.1946) that the
+q8_0-KV experiment in §1 showed are sensitive enough to flip. Batch 2 and batch 4
+produce exactly what `nseq=1` produces, so batching is verified against the same
+kernel rather than across a kernel boundary.
+
+It generates coherent text, not one matching token:
+
+> `" are you familiar with the concept of \"the 10,000 hour rule\"?\nYes, I'm
+> familiar with the \"10,000 hour rule.\" It's a concept popularized by Malcolm
+> Gladwell in his 2008 book *Outliers*. The rule suggests that it"`
+
+### Throughput, three runs, warmed, 64 decode passes
+
+| batch | **Vulkan** | llamd ROCm | llama.cpp | vs llama.cpp | vs ROCm |
+|---|---|---|---|---|---|
+| 1 | **111.5 – 114.6** | 103.8 | 94.4 – 95.6 | **1.17 – 1.21×** | 1.07 – 1.10× |
+| 2 | **183.6 – 186.5** | 147.6 | 145.8 | **1.26 – 1.28×** | 1.24 – 1.26× |
+| 4 | **258.1 – 265.6** | 214.8 | 229.5 | **1.12 – 1.16×** | 1.20 – 1.24× |
+| 8 | **396.2 – 399.9** | 279.6 | 290.9 | **1.36 – 1.37×** | 1.42 – 1.43× |
+
+**Vulkan is ahead of hipified CUDA at every batch size, and ahead of LLAMD's own
+ROCm path at every batch size.** The batch-8 figure is the one §12 could not
+reach: llama.cpp led there by 4% and now trails by 37%.
+
+This also closes the question §11 opened. The gap at batch was blamed on
+matrix-matrix tiling, and the fix turned out to be elsewhere — the same
+`udot4`-equivalent identity, the same planar layout, expressed through an API
+whose subgroup is 64 wide and whose driver schedules it better.
+
+### What the Vulkan path is made of
+
+Eighteen compute shaders: the Q6_K matvec, two grouped expert variants (shared
+activation for gate and up, per-`(sequence, expert)` activation for down), an F32
+matvec for the router, the embedding dequantizer, `rms_scale`, the fused
+norm-and-quantize, a standalone quantize, `rms_norm_mul`, per-head norm with NeoX
+RoPE, the K-side variant that also writes the cache, attention with GQA, `add`,
+`silu_mul`, the router's softmax and top-k, the MoE combine, and a two-stage
+argmax.
+
+Three structural decisions carried the work:
+
+**One descriptor layout for every shader.** Eight storage buffers pushed inline
+with `VK_KHR_push_descriptor` plus 64 bytes of push constants. No descriptor
+pool, nothing to recycle, and adding a shader is adding a file — a token is ~15
+dispatches per layer and allocating a set for each would have dominated.
+
+**The Q6_K decode lives in one place.** GLSL has no buffer pointers and the
+weight tensor differs per shader, so the arithmetic is a macro in `q6k.glsl`
+instantiated against whichever buffer a shader declares. Four hand-written copies
+would have been four places for a divergence that flips a near-tied expert.
+
+**The headers are split by what they cost.** `quant.glsl` brings 3 KiB of shared
+memory the matvec shaders must not pay for; `q6k.glsl` needs a `uint w[]` binding
+a quantize shader does not have. Appending everything to one header broke three
+shaders and silently taxed the rest.
+
+### Two bugs the design caught rather than shipped
+
+**One field, two meanings.** The Q6_K macro loops `_s < pc.nseq` while the expert
+shaders need exactly one sequence per row — a row belongs to one
+`(sequence, expert)` pair — and the row-space bound needs the real batch width.
+Sharing one push field made those disagree. The sequence count is now an explicit
+macro parameter, documented as load-bearing.
+
+**One command buffer, two users.** `upload` and `download` record into the same
+command buffer the token is being recorded into, so calling either between
+`begin` and `end_and_wait` would reset it and discard a half-built token —
+producing plausible wrong output rather than an error. Both now refuse while
+recording, `begin` refuses to nest, and a dispatch outside a recording is
+refused. Three tests assert it.
+
+### Still true, and worth repeating
+
+The ROCm path is unchanged and unregressed at 102.0 tok/s, and remains the
+benchmarking reference: both backends implement the same identity over the same
+planar bytes and are validated against the same scalar reference, which is what
+makes the column above a measurement of the backend.
+
+The CPU path remains the correctness reference — the one that agrees with
+llama.cpp token for token, and the one every device kernel is held to.

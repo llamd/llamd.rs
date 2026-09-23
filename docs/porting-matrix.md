@@ -143,7 +143,14 @@ instead. The bar depends on configuration, so both are recorded.
 **LLAMD is faster than llama.cpp on this card: 101.1-102.1 tok/s against
 94.4-95.6**, measured warmed over 64 generated tokens, emitting the same tokens
 as the CPU reference and llama.cpp on all five agreement prompts. That is
-1.07-1.10x. Batched decode reaches **279.7 tok/s at batch 8** and **148.4 at batch 2**,
+1.07-1.10x. **VULKAN IS NOW THE FASTEST PATH AT EVERY BATCH SIZE**, and ahead of llama.cpp
+everywhere: 111.5-114.6 tok/s single stream against llama.cpp's 94.4-95.6, and
+396-400 at batch 8 against its 290.9. A whole token is computed on Vulkan and
+emits the same tokens as llama.cpp on all five agreement prompts. See
+[benchmarks.md](benchmarks.md) §14.
+
+The ROCm path, kept as the benchmarking reference, reaches **279.7 tok/s at batch
+8** and **148.4 at batch 2**,
 using RDNA4's `udot4` — an unsigned 4-way int8 dot product made to carry a
 signed Q6_K product by an exact identity. LLAMD is **ahead of llama.cpp at batch
 1 (1.09x) and batch 2 (1.02x)** and within 4-6% at batch 4 and 8.

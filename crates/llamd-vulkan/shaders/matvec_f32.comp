@@ -1,0 +1,21 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly  buffer W { float w[]; };
+layout(std430, binding = 1) readonly  buffer X { float x[]; };
+layout(std430, binding = 2) writeonly buffer O { float o[]; };
+layout(push_constant) uniform P { uint k; uint rows; uint nseq; } pc;
+shared float sh[256];
+// One workgroup per (sequence, row). The MoE gate is [2048, 128] and stored
+// F32 — 241 of this model's tensors are: the norms and the 48 routers. Small,
+// but it decides which experts run.
+void main() {
+    uint s = gl_WorkGroupID.x / pc.rows;
+    uint row = gl_WorkGroupID.x - s * pc.rows;
+    uint t = gl_LocalInvocationID.x;
+    float a = 0.0;
+    for (uint i = t; i < pc.k; i += 256u) a += w[row * pc.k + i] * x[s * pc.k + i];
+    sh[t] = a;
+    barrier();
+    for (uint st = 128u; st > 0u; st >>= 1u) { if (t < st) sh[t] += sh[t + st]; barrier(); }
+    if (t == 0u) o[s * pc.rows + row] = sh[0];
+}

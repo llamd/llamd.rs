@@ -1,0 +1,19 @@
+#version 450
+layout(local_size_x = 1) in;
+layout(std430, binding = 0) readonly  buffer BV { float bv[]; };
+layout(std430, binding = 1) readonly  buffer BI { int   bi[]; };
+layout(std430, binding = 2) writeonly buffer O  { int   o[];  };
+layout(push_constant) uniform P { uint nchunk; uint nseq; } pc;
+// Stage two: one thread per sequence combines the chunk winners.
+void main() {
+    uint s = gl_WorkGroupID.x;
+    if (s >= pc.nseq) return;
+    float v = -1.0 / 0.0;
+    int idx = -1;
+    for (uint i = 0u; i < pc.nchunk; ++i) {
+        float c = bv[s * pc.nchunk + i];
+        int j = bi[s * pc.nchunk + i];
+        if (c > v || (c == v && j < idx)) { v = c; idx = j; }
+    }
+    o[s] = idx;
+}

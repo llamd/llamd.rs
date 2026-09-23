@@ -1,0 +1,33 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly  buffer X  { float x[];  };
+layout(std430, binding = 1) buffer BV           { float bv[]; };
+layout(std430, binding = 2) buffer BI           { int   bi[]; };
+layout(push_constant) uniform P { uint n; uint nchunk; uint nseq; } pc;
+shared float sv[256];
+shared int   si[256];
+// Stage one: each workgroup reduces a slice of one sequence's logits.
+// Ties go to the LOWER index, the same rule the CPU's max_by follows, so the
+// emitted token is reproducible.
+void main() {
+    uint s = gl_WorkGroupID.y;
+    uint c = gl_WorkGroupID.x;
+    if (s >= pc.nseq) return;
+    uint t = gl_LocalInvocationID.x;
+    float v = -1.0 / 0.0;
+    int idx = -1;
+    for (uint i = c * 256u + t; i < pc.n; i += pc.nchunk * 256u) {
+        float q = x[s * pc.n + i];
+        if (q > v) { v = q; idx = int(i); }
+    }
+    sv[t] = v; si[t] = idx;
+    barrier();
+    for (uint st = 128u; st > 0u; st >>= 1u) {
+        if (t < st) {
+            uint j = t + st;
+            if (sv[j] > sv[t] || (sv[j] == sv[t] && si[j] < si[t])) { sv[t] = sv[j]; si[t] = si[j]; }
+        }
+        barrier();
+    }
+    if (t == 0u) { bv[s * pc.nchunk + c] = sv[0]; bi[s * pc.nchunk + c] = si[0]; }
+}

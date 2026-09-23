@@ -1,0 +1,81 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly  buffer L  { float logits[]; };
+layout(std430, binding = 1) writeonly buffer I  { int   ids[];    };
+layout(std430, binding = 2) buffer WT { float wt[]; };   // read back to renormalise
+layout(std430, binding = 3) buffer PR           { float probs[];  };
+layout(push_constant) uniform P { uint n_expert; uint n_used; uint nseq; } pc;
+shared float sh[256];
+shared float sp[1024];
+shared float sval[256];
+shared int   sidx[256];
+
+#define WEIGHT_SUM_FLOOR 6.103515625e-5
+
+// One workgroup per sequence. Mirrors llamd_models::route exactly, including the
+// two details that decide reproducibility: ties break toward the LOWER expert
+// index, matching ggml's argsort, and the renormalising divisor is clamped at
+// 2^-14.
+//
+// Selection is a parallel max-reduction per round, not a serial scan. The serial
+// form cost 37.9% of a token in the ROCm engine — one thread issuing ~1024
+// dependent global loads per layer hides no latency.
+void main() {
+    uint s = gl_WorkGroupID.x;
+    if (s >= pc.nseq || pc.n_expert > 1024u) return;
+    uint t = gl_LocalInvocationID.x;
+    uint lb = s * pc.n_expert;
+
+    float lmax = -1.0 / 0.0;
+    for (uint i = t; i < pc.n_expert; i += 256u) lmax = max(lmax, logits[lb + i]);
+    sh[t] = lmax;
+    barrier();
+    for (uint st = 128u; st > 0u; st >>= 1u) { if (t < st) sh[t] = max(sh[t], sh[t + st]); barrier(); }
+    float mx = sh[0];
+    barrier();
+
+    float lsum = 0.0;
+    for (uint i = t; i < pc.n_expert; i += 256u) {
+        float e = exp(logits[lb + i] - mx);
+        probs[lb + i] = e;
+        lsum += e;
+    }
+    sh[t] = lsum;
+    barrier();
+    for (uint st = 128u; st > 0u; st >>= 1u) { if (t < st) sh[t] += sh[t + st]; barrier(); }
+    float tot = sh[0];
+    barrier();
+    for (uint i = t; i < pc.n_expert; i += 256u) { probs[lb + i] /= tot; sp[i] = probs[lb + i]; }
+    barrier();
+
+    for (uint kk = 0u; kk < pc.n_used; ++kk) {
+        float bv = -1.0 / 0.0;
+        int bi = -1;
+        for (uint i = t; i < pc.n_expert; i += 256u) {
+            if (sp[i] > bv || (sp[i] == bv && int(i) < bi)) { bv = sp[i]; bi = int(i); }
+        }
+        sval[t] = bv; sidx[t] = bi;
+        barrier();
+        for (uint st = 128u; st > 0u; st >>= 1u) {
+            if (t < st) {
+                uint j = t + st;
+                if (sval[j] > sval[t] || (sval[j] == sval[t] && sidx[j] < sidx[t])) {
+                    sval[t] = sval[j]; sidx[t] = sidx[j];
+                }
+            }
+            barrier();
+        }
+        if (t == 0u) {
+            ids[s * pc.n_used + kk] = sidx[0];
+            wt[s * pc.n_used + kk] = sval[0];
+            sp[uint(sidx[0])] = -1.0 / 0.0;   // so the next round cannot pick it
+        }
+        barrier();
+    }
+    if (t == 0u) {
+        float ws = 0.0;
+        for (uint kk = 0u; kk < pc.n_used; ++kk) ws += wt[s * pc.n_used + kk];
+        ws = max(ws, WEIGHT_SUM_FLOOR);
+        for (uint kk = 0u; kk < pc.n_used; ++kk) wt[s * pc.n_used + kk] /= ws;
+    }
+}

@@ -1,0 +1,53 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly  buffer W    { uint  w[];    };
+layout(std430, binding = 1) readonly  buffer META { int   meta[]; };
+layout(std430, binding = 2) writeonly buffer O    { float outv[]; };
+layout(push_constant) uniform Push {
+    uint ql_u; uint qh_u; uint sc_u; uint d_u;
+    uint blocks; uint rows; uint nseq; uint pad;
+} pc;
+#include "common.glsl"
+#include "q6k.glsl"
+
+// Embedding lookup: dequantize one planar Q6_K row per sequence.
+//
+// THE INDEX MAPPING, derived rather than copied, because the dot product walks
+// this layout from the other direction. For value v in a 256-block:
+//   h = v >> 7                 which half
+//   q = v & 63                 position inside the half's 64-byte ql group
+//   hi = (v & 127) >= 64       high nibble rather than low
+//   ql byte  = h*64 + q
+//   qh byte  = h*32 + (q & 31)
+//   shift    = (q >= 32 ? 2 : 0) + (hi ? 4 : 0)
+// Checked at the four boundaries v = 0, 32, 64, 96 against the decode order in
+// llamd_quant::dot_q6k_q8k.
+void main() {
+    uint s = gl_WorkGroupID.y;
+    if (s >= pc.nseq) return;
+    uint b = gl_WorkGroupID.x;
+    if (b >= pc.blocks) return;
+    uint t = gl_LocalInvocationID.x;          // the value index within the block
+
+    uint row = uint(meta[2 * int(s)]);         // the token id
+    uint ri  = row * pc.blocks + b;
+
+    uint r  = t & 127u;
+    uint h  = t >> 7u;
+    uint q  = r & 63u;
+    bool hi = r >= 64u;
+
+    uint qlw = w[pc.ql_u + ri * 32u + ((h * 64u + q) >> 2u)];
+    uint qlb = (qlw >> (8u * ((h * 64u + q) & 3u))) & 0xFFu;
+    uint qhw = w[pc.qh_u + ri * 16u + ((h * 32u + (q & 31u)) >> 2u)];
+    uint qhb = (qhw >> (8u * ((h * 32u + (q & 31u)) & 3u))) & 0xFFu;
+
+    uint sh = ((q >= 32u) ? 2u : 0u) + (hi ? 4u : 0u);
+    uint nib = hi ? (qlb >> 4u) : (qlb & 0x0Fu);
+    int val = int(nib | (((qhb >> sh) & 3u) << 4u)) - 32;
+
+    int   sc = sc_at(pc.sc_u + ri * 4u, t >> 4u);
+    float dw = d_at(pc.d_u, ri);
+    outv[s * pc.blocks * QK_K + b * QK_K + t] = dw * float(sc) * float(val);
+}

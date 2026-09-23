@@ -8,7 +8,9 @@
 pub mod backend;
 pub use backend::Backend;
 pub mod device;
+pub mod vulkan_model;
 pub use device::DeviceModel;
+pub use vulkan_model::VulkanModel;
 pub mod attention;
 pub mod kv;
 pub mod layer;

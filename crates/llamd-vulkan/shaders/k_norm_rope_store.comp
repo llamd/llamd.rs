@@ -1,0 +1,55 @@
+#version 450
+layout(local_size_x = 128) in;
+layout(std430, binding = 0) buffer K           { float k[];    };
+layout(std430, binding = 1) readonly buffer W  { float w[];    };
+layout(std430, binding = 2) readonly buffer V  { float v[];    };
+layout(std430, binding = 3) buffer KC          { float kc[];   };
+layout(std430, binding = 4) buffer VC          { float vc[];   };
+layout(std430, binding = 5) readonly buffer M  { int   meta[]; };
+layout(push_constant) uniform P {
+    uint n_head_kv; uint hd; uint kv_dim; uint max_kv;
+    uint nseq; uint has_norm; float freq_base; float eps;
+} pc;
+shared float sh[128];
+
+// The K side: norm, rotate, then store K and V into this sequence's cache slice.
+// The store must follow the rotation — the cache holds ROPED keys, which is what
+// attention reads — so it cannot be hoisted out.
+void main() {
+    uint s = gl_WorkGroupID.x / pc.n_head_kv;
+    uint head = gl_WorkGroupID.x - s * pc.n_head_kv;
+    if (s >= pc.nseq) return;
+    int pos = meta[2 * int(s) + 1];
+    uint base = (s * pc.n_head_kv + head) * pc.hd;
+    uint t = gl_LocalInvocationID.x;
+
+    if (pc.has_norm != 0u) {
+        float a = 0.0;
+        for (uint i = t; i < pc.hd; i += 128u) { float q = k[base + i]; a += q * q; }
+        sh[t] = a;
+        barrier();
+        for (uint st = 64u; st > 0u; st >>= 1u) { if (t < st) sh[t] += sh[t + st]; barrier(); }
+        float inv = inversesqrt(sh[0] / float(pc.hd) + pc.eps);
+        for (uint i = t; i < pc.hd; i += 128u) k[base + i] = k[base + i] * inv * w[i];
+        barrier();
+    }
+
+    uint half_ = pc.hd / 2u;
+    for (uint i = t; i < half_; i += 128u) {
+        float theta = float(pos) / pow(pc.freq_base, 2.0 * float(i) / float(pc.hd));
+        float sn = sin(theta), cs = cos(theta);
+        float a = k[base + i], b = k[base + i + half_];
+        k[base + i]         = a * cs - b * sn;
+        k[base + i + half_] = a * sn + b * cs;
+    }
+    barrier();
+
+    // Each sequence owns a max_kv * kv_dim slice.
+    uint ks = s * pc.max_kv * pc.kv_dim;
+    uint vs = s * pc.kv_dim;
+    for (uint i = t; i < pc.hd; i += 128u) {
+        uint off = head * pc.hd + i;
+        kc[ks + uint(pos) * pc.kv_dim + off] = k[base + i];
+        vc[ks + uint(pos) * pc.kv_dim + off] = v[vs + off];
+    }
+}

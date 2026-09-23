@@ -1,0 +1,70 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly  buffer Q  { float q[];     };
+layout(std430, binding = 1) readonly  buffer KC { float kc[];    };
+layout(std430, binding = 2) readonly  buffer VC { float vc[];    };
+layout(std430, binding = 3) writeonly buffer O  { float outv[];  };
+layout(std430, binding = 4) buffer SC           { float scores[]; };
+layout(std430, binding = 5) readonly  buffer M  { int   meta[];  };
+layout(push_constant) uniform P {
+    uint n_head; uint n_head_kv; uint hd; uint max_kv;
+    uint nseq; uint ratio;
+} pc;
+shared float sh[256];
+
+// One workgroup per (sequence, query head). Mirrors llamd_runtime::attend:
+// scale 1/sqrt(head_dim), GQA by integer division, softmax shifted by the max,
+// then the weighted sum of V. Each sequence attends only to its own cache slice.
+//
+// Each thread computes whole dot products for a subset of positions, so the
+// scores need no cross-thread reduction — only the max and the sum do. Scores
+// live in a global scratch because n_kv grows with the sequence and would
+// overflow shared memory.
+void main() {
+    uint s = gl_WorkGroupID.x / pc.n_head;
+    uint h = gl_WorkGroupID.x - s * pc.n_head;
+    if (s >= pc.nseq) return;
+    uint n_kv = uint(meta[2 * int(s) + 1]) + 1u;
+    uint kvh = h / pc.ratio;
+    uint kv_dim = pc.n_head_kv * pc.hd;
+    float scale = inversesqrt(float(pc.hd));
+    uint t = gl_LocalInvocationID.x;
+
+    uint qb = (s * pc.n_head + h) * pc.hd;
+    uint kbase = s * pc.max_kv * kv_dim;
+    uint sbase = (s * pc.n_head + h) * pc.max_kv;
+
+    float lmax = -1.0 / 0.0;
+    for (uint j = t; j < n_kv; j += 256u) {
+        uint ko = kbase + j * kv_dim + kvh * pc.hd;
+        float dot = 0.0;
+        for (uint d = 0u; d < pc.hd; ++d) dot += q[qb + d] * kc[ko + d];
+        float sv = dot * scale;
+        scores[sbase + j] = sv;
+        lmax = max(lmax, sv);
+    }
+    sh[t] = lmax;
+    barrier();
+    for (uint st = 128u; st > 0u; st >>= 1u) { if (t < st) sh[t] = max(sh[t], sh[t + st]); barrier(); }
+    float mx = sh[0];
+    barrier();
+
+    float lsum = 0.0;
+    for (uint j = t; j < n_kv; j += 256u) {
+        float e = exp(scores[sbase + j] - mx);
+        scores[sbase + j] = e;
+        lsum += e;
+    }
+    sh[t] = lsum;
+    barrier();
+    for (uint st = 128u; st > 0u; st >>= 1u) { if (t < st) sh[t] += sh[t + st]; barrier(); }
+    float inv = 1.0 / sh[0];
+    barrier();
+
+    for (uint d = t; d < pc.hd; d += 256u) {
+        float a = 0.0;
+        for (uint j = 0u; j < n_kv; ++j)
+            a += scores[sbase + j] * vc[kbase + j * kv_dim + kvh * pc.hd + d];
+        outv[(s * pc.n_head + h) * pc.hd + d] = a * inv;
+    }
+}
