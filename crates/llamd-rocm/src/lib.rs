@@ -77,8 +77,13 @@ mod ffi {
             warp_size: *mut c_int,
         ) -> c_int;
         pub fn llamd_rocm_free_mem() -> usize;
-        pub fn llamd_rocm_matvec_q6k(
-            w: *const u8,
+        pub fn llamd_rocm_upload(
+            host: *const std::ffi::c_void,
+            bytes: usize,
+        ) -> *mut std::ffi::c_void;
+        pub fn llamd_rocm_release(dev: *mut std::ffi::c_void);
+        pub fn llamd_rocm_matvec_q6k_resident(
+            d_w: *const std::ffi::c_void,
             aq: *const i8,
             ad: *const f32,
             out: *mut f32,
@@ -183,75 +188,148 @@ pub fn device_info(index: i32) -> Result<DeviceInfo> {
     }
 }
 
-/// Q6_K × Q8_K matrix-vector product on the GPU.
+/// Weights resident on the device.
 ///
-/// `w` holds `rows × blocks` packed Q6_K blocks; the activation is supplied
-/// already quantized, because quantizing it once and reusing it across rows is
-/// the whole point — re-quantizing per row would cost more than the matmul.
-///
-/// Returns one f32 per row, and must agree with
-/// [`llamd_quant::dot_q6k_q8k`]: a difference here flips a near-tied MoE
-/// expert and changes the emitted token.
-pub fn matvec_q6k(w: &[u8], act: &[llamd_quant::BlockQ8K], rows: usize) -> Result<Vec<f32>> {
-    let blocks = act.len();
-    if blocks == 0 || rows == 0 {
-        return Err(Error::malformed(
-            "rocm matvec",
-            format!("{rows} rows, {blocks} blocks"),
-        ));
-    }
-    let need = rows * blocks * llamd_quant::Q6K_BLOCK_BYTES;
-    if w.len() < need {
-        return Err(Error::malformed(
-            "rocm matvec",
-            format!(
-                "need {need} weight bytes for {rows}x{blocks}, have {}",
-                w.len()
-            ),
-        ));
-    }
-
-    // The kernel wants quants and scales separately: one contiguous i8 array
-    // it can read coalesced, and one small f32 array. Splitting here keeps the
-    // device side free of struct-of-array gymnastics.
-    let mut aq = Vec::with_capacity(blocks * llamd_quant::QK_K);
-    let mut ad = Vec::with_capacity(blocks);
-    for b in act {
-        aq.extend_from_slice(&b.qs);
-        ad.push(b.d);
-    }
-
-    #[cfg(not(rocm))]
-    {
-        let _ = (aq, ad);
-        Err(Error::unsupported("rocm", "not built with ROCm support"))
-    }
+/// MEASURED, NOT ASSUMED. The first version uploaded the weights on every
+/// call: 13.25 ms for a 6.6 MiB projection against 5.02 ms for the scalar CPU
+/// — the GPU was 2.6× SLOWER, and only 0.34 ms of that was the transfer. The
+/// cost was allocation churn. Weights live for the life of the model, so they
+/// are uploaded once and this handle owns that allocation.
+pub struct DeviceWeights {
     #[cfg(rocm)]
-    {
-        if !available() {
-            return Err(Error::unsupported("rocm", "no device present"));
+    ptr: *mut std::ffi::c_void,
+    rows: usize,
+    blocks: usize,
+}
+
+// SAFETY: the handle is an opaque device pointer that is only dereferenced
+// inside HIP calls, and it is never aliased — `Drop` frees it exactly once.
+// Sending it between threads is sound; sharing it is too, because every use
+// is a read.
+#[allow(unsafe_code)]
+unsafe impl Send for DeviceWeights {}
+#[allow(unsafe_code)]
+unsafe impl Sync for DeviceWeights {}
+
+impl DeviceWeights {
+    /// Upload packed Q6_K weights for `rows` rows of `blocks` blocks each.
+    pub fn upload(w: &[u8], rows: usize, blocks: usize) -> Result<Self> {
+        let need = rows * blocks * llamd_quant::Q6K_BLOCK_BYTES;
+        if w.len() < need {
+            return Err(Error::malformed(
+                "device weights",
+                format!("need {need} bytes for {rows}x{blocks}, have {}", w.len()),
+            ));
         }
-        let mut out = vec![0.0f32; rows];
-        // SAFETY: every buffer length was checked above — `w` holds at least
-        // `rows*blocks*210` bytes, `aq` exactly `blocks*256`, `ad` exactly
-        // `blocks`, and `out` exactly `rows`. The callee reads and writes no
-        // more than it is told, and does not retain the pointers.
-        #[allow(unsafe_code)]
-        let rc = unsafe {
-            ffi::llamd_rocm_matvec_q6k(
-                w.as_ptr(),
-                aq.as_ptr(),
-                ad.as_ptr(),
-                out.as_mut_ptr(),
-                blocks as i32,
-                rows as i32,
-            )
-        };
-        if rc != 0 {
-            return Err(Error::other("HIP matvec failed — see the ROCm log"));
+        #[cfg(not(rocm))]
+        {
+            let _ = (rows, blocks);
+            Err(Error::unsupported("rocm", "not built with ROCm support"))
         }
-        Ok(out)
+        #[cfg(rocm)]
+        {
+            if !available() {
+                return Err(Error::unsupported("rocm", "no device present"));
+            }
+            // SAFETY: `w` is at least `need` bytes and `need` is what is
+            // copied; the callee returns null on failure rather than a
+            // partially-initialised pointer.
+            #[allow(unsafe_code)]
+            let ptr = unsafe { ffi::llamd_rocm_upload(w.as_ptr() as *const _, need) };
+            if ptr.is_null() {
+                return Err(Error::other(format!(
+                    "hipMalloc/hipMemcpy failed for {:.1} MiB of weights",
+                    need as f64 / (1 << 20) as f64
+                )));
+            }
+            Ok(DeviceWeights { ptr, rows, blocks })
+        }
     }
+
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+    pub fn blocks(&self) -> usize {
+        self.blocks
+    }
+
+    /// Matvec against the resident weights. Only the activation and the
+    /// result cross the bus.
+    pub fn matvec(&self, act: &[llamd_quant::BlockQ8K]) -> Result<Vec<f32>> {
+        if act.len() != self.blocks {
+            return Err(Error::Shape {
+                expected: vec![self.blocks],
+                got: vec![act.len()],
+            });
+        }
+        let mut aq = Vec::with_capacity(self.blocks * llamd_quant::QK_K);
+        let mut ad = Vec::with_capacity(self.blocks);
+        for b in act {
+            aq.extend_from_slice(&b.qs);
+            ad.push(b.d);
+        }
+        #[cfg(not(rocm))]
+        {
+            let _ = (aq, ad);
+            Err(Error::unsupported("rocm", "not built with ROCm support"))
+        }
+        #[cfg(rocm)]
+        {
+            let mut out = vec![0.0f32; self.rows];
+            // SAFETY: `self.ptr` was returned by a successful upload of
+            // exactly `rows*blocks*210` bytes and has not been freed — `Drop`
+            // is the only release and consumes the handle. `aq`, `ad` and
+            // `out` are sized from the same `blocks`/`rows`.
+            #[allow(unsafe_code)]
+            let rc = unsafe {
+                ffi::llamd_rocm_matvec_q6k_resident(
+                    self.ptr,
+                    aq.as_ptr(),
+                    ad.as_ptr(),
+                    out.as_mut_ptr(),
+                    self.blocks as i32,
+                    self.rows as i32,
+                )
+            };
+            if rc != 0 {
+                return Err(Error::other("HIP resident matvec failed"));
+            }
+            Ok(out)
+        }
+    }
+}
+
+impl Drop for DeviceWeights {
+    fn drop(&mut self) {
+        #[cfg(rocm)]
+        {
+            // SAFETY: freeing a pointer this handle owns, exactly once.
+            #[allow(unsafe_code)]
+            unsafe {
+                ffi::llamd_rocm_release(self.ptr)
+            };
+        }
+    }
+}
+
+/// Q6_K × Q8_K matrix-vector product, uploading the weights each call.
+///
+/// Kept for the validation tests, which check correctness rather than speed.
+/// Anything that runs repeatedly should use [`DeviceWeights`]: this form was
+/// measured at 2.6× slower than the CPU, almost entirely in allocation.
+pub fn matvec_q6k(w: &[u8], act: &[llamd_quant::BlockQ8K], rows: usize) -> Result<Vec<f32>> {
+    // Expressed on top of DeviceWeights rather than as a second kernel: two
+    // implementations of the same arithmetic is two things to keep in
+    // agreement, and the validation tests exist to check the kernel, not the
+    // convenience wrapper around it.
+    if act.is_empty() || rows == 0 {
+        return Err(Error::malformed(
+            "rocm matvec",
+            format!("{rows} rows, {} blocks", act.len()),
+        ));
+    }
+    let dw = DeviceWeights::upload(w, rows, act.len())?;
+    dw.matvec(act)
 }
 
 #[cfg(test)]

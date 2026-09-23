@@ -89,8 +89,39 @@ hardware: `multiProcessorCount` counts **workgroup processors**, each holding
 two CUs, so the R9700's 64 CUs appear as 32; and `major`/`minor` give `12.0`
 where `gcnArchName` gives the real `gfx1201`, which is what hipcc compiled for.
 
-Benchmarking against hipified llama.cpp is the next step and the one that
-decides whether the project's premise holds.
+### What the first benchmark measured, including the part that was wrong
+
+The kernel was 2.6× SLOWER than the scalar CPU when first timed — 13.25 ms
+against 5.02 ms for a 6.6 MiB projection, of which only 0.34 ms was the
+transfer. The design reasoning was sound; the *configuration* was not. Two
+fixes, each measured separately:
+
+| | attn_q 6.6 MiB | all six shapes |
+|---|---|---|
+| upload per call, 1 wave/workgroup | 13.25 ms | — |
+| weights resident, 8 waves/workgroup | 0.349 ms | 3.611 ms |
+| + persistent activation scratch | **0.232 ms** | **2.335 ms** |
+
+Against the scalar CPU reference, on the real projection shapes:
+
+```text
+  attn_q      [2048→4096]      0.232 ms    46.6x     29.6 GB/s
+  attn_k      [2048→512]       0.158 ms     5.2x      5.4 GB/s
+  attn_out    [4096→2048]      0.175 ms    38.8x     39.3 GB/s
+  expert_gate [2048→768]       0.173 ms     6.8x      7.5 GB/s
+  expert_down [768→2048]       0.166 ms     7.1x      7.8 GB/s
+  output      [2048→151936]    1.430 ms   180.1x    178.5 GB/s
+```
+
+**A floor of ~0.16 ms remains** on every small shape — launch plus
+synchronise, not arithmetic. The MoE experts sit squarely inside it, and eight
+of them run per layer, so that floor is the next thing worth attacking:
+batching the experts into one launch, or an asynchronous stream that does not
+synchronise per call.
+
+Note the CPU reference is deliberately unoptimised, so these ratios say
+nothing about llama.cpp. **The comparison against hipified llama.cpp is still
+outstanding and is the only one that tests the premise.**
 
 ## Gaps worth knowing about
 

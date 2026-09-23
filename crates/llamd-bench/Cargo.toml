@@ -9,4 +9,11 @@ repository.workspace   = true
 authors.workspace      = true
 
 [dependencies]
-llamd-core.workspace = true
+llamd-core.workspace  = true
+llamd-quant.workspace = true
+llamd-rocm.workspace  = true
+half.workspace        = true
+
+[[bin]]
+name = "llamd-bench"
+path = "src/main.rs"
