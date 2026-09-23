@@ -229,6 +229,171 @@ __global__ void q6k_q8k_matvec_resident(
     if (lane == 0) out[row] = acc;
 }
 
+// ---------------------------------------------------------------------------
+// DEVICE-SIDE Q8_K QUANTIZATION
+//
+// WHY THIS IS THE KEYSTONE. Every matvec needs its activation as Q8_K. While
+// that conversion lives on the host, each of the ~1400 matmuls in a token must
+// hand a buffer across the bus, so the forward pass cannot stay on the device
+// no matter how fast the kernels are. Measured: 127.5 us per call through the
+// host path against 8.3 us of actual kernel. The host was 15/16ths of the cost.
+//
+// MUST MATCH llamd_quant::quantize_q8_k BIT FOR BIT. iscale is -127/max where
+// max is the SIGNED value of largest magnitude, so the peak lands on -127; the
+// clamp is upper-only; rounding is round-half-to-even. A difference here shifts
+// a routing decision and changes the emitted token, which is the failure this
+// project exists to avoid.
+//
+// One workgroup per 256-element block. 256 threads, so one element each.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ int q8k_nearest_int(float v) {
+    // rintf() is round-half-to-even under the default rounding mode, which is
+    // what f32::round_ties_even() gives on the host. roundf() is NOT: it
+    // rounds halves away from zero and would disagree on exact .5 values.
+    return (int)rintf(v);
+}
+
+__global__ void q8k_quantize(
+    const float * __restrict__ x,
+    int8_t      * __restrict__ qs,     // [nblocks][256]
+    float       * __restrict__ d,      // [nblocks]
+    int16_t     * __restrict__ bsums,  // [nblocks][16], may be null
+    int nblocks)
+{
+    const int blk = blockIdx.x;
+    if (blk >= nblocks) return;
+    const int tid = threadIdx.x;              // 0..255
+    const float *src = x + (size_t)blk * QK_K;
+
+    // Reduce for the signed value of largest magnitude. Reducing |v| alone
+    // loses the sign, and the sign is what decides iscale's direction.
+    __shared__ float s_amax[QK_K];
+    __shared__ float s_max[QK_K];
+    const float v = src[tid];
+    s_amax[tid] = fabsf(v);
+    s_max[tid]  = v;
+    __syncthreads();
+    for (int stride = QK_K / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            // Strictly greater, so ties keep the earlier element — the same
+            // element the host's sequential scan keeps.
+            if (s_amax[tid + stride] > s_amax[tid]) {
+                s_amax[tid] = s_amax[tid + stride];
+                s_max[tid]  = s_max[tid + stride];
+            }
+        }
+        __syncthreads();
+    }
+    const float amax = s_amax[0];
+    const float mx   = s_max[0];
+
+    int8_t *bq = qs + (size_t)blk * QK_K;
+    if (amax == 0.0f) {
+        bq[tid] = 0;
+        if (tid == 0) d[blk] = 0.0f;
+        if (bsums && tid < QK_K / 16) bsums[(size_t)blk * (QK_K / 16) + tid] = 0;
+        return;
+    }
+
+    const float iscale = -127.0f / mx;
+    int q = q8k_nearest_int(iscale * v);
+    if (q > 127) q = 127;                  // upper clamp only, as on the host
+    bq[tid] = (int8_t)q;
+    if (tid == 0) d[blk] = 1.0f / iscale;
+
+    if (bsums) {
+        __syncthreads();
+        if (tid < QK_K / 16) {
+            int sum = 0;
+            for (int i = 0; i < 16; ++i) sum += (int)bq[tid * 16 + i];
+            bsums[(size_t)blk * (QK_K / 16) + tid] = (int16_t)sum;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GROUPED EXPERT MATVEC
+//
+// THE MEASUREMENT THAT DEMANDED THIS. Per-shape kernel-only bandwidth on this
+// card: 480 GB/s on the 243 MiB output projection (75% of peak), but 154.8 on
+// expert_gate [2048->768] and 57.8 on expert_down [768->2048] — 24% and 9%.
+// The expert matrices are 90% of a token's weight traffic (31.0 of 46.4 MB per
+// layer), so the whole model inherits the 9-24% figure, ceilinging at ~75 t/s.
+//
+// WHY THEY ARE SLOW, and it is not the inner loop. expert_down has k=768, i.e.
+// blocks=3, so a lane runs the block loop three times and the inner loop ONCE:
+// twelve multiply-accumulates, then a five-step shuffle reduction. With 2048
+// rows at 8 rows per workgroup there are only 256 workgroups — too little in
+// flight to cover memory latency, and most of what does run is reduction.
+//
+// WHAT THIS CHANGES. One launch covers all `n_used` routed experts, so the row
+// space is n_used*rows instead of rows: 8x the workgroups, 8x the bytes in
+// flight, from the same 210-byte-per-block reads. The arithmetic per row is
+// untouched and must stay untouched — it is the arithmetic the token agreement
+// tests validate.
+//
+// `expert_ids` holds the routed expert indices, so a workgroup finds its
+// weights at expert_ids[e] * (rows*blocks*210) within the layer's 3D tensor.
+// Output is [n_used][rows], the caller scales by the routing weights.
+__global__ void q6k_q8k_matvec_grouped(
+    const uint8_t * __restrict__ w,        // the whole [.., .., n_expert] tensor
+    const int32_t * __restrict__ expert_ids,
+    const int8_t  * __restrict__ aq,
+    const float   * __restrict__ ad,
+    float         * __restrict__ out,      // [n_used][rows]
+    int blocks, int rows, int n_used)
+{
+    const int wave = threadIdx.x / WAVE;
+    const int lane = threadIdx.x % WAVE;
+    const int grow = blockIdx.x * ROWS_PER_BLOCK + wave;   // global row
+    const int total = rows * n_used;
+    if (grow >= total) return;
+
+    const int e   = grow / rows;            // which routed expert
+    const int row = grow - e * rows;         // row within that expert
+    const size_t mat = (size_t)expert_ids[e] * rows * blocks * Q6K_BLOCK_BYTES;
+    const uint8_t *wrow = w + mat + (size_t)row * blocks * Q6K_BLOCK_BYTES;
+
+    float acc = 0.0f;
+    for (int b = 0; b < blocks; ++b) {
+        const uint8_t *blk = wrow + (size_t)b * Q6K_BLOCK_BYTES;
+        const uint8_t *ql  = blk;
+        const uint8_t *qh  = blk + QK_K / 2;
+        const int8_t  *sc  = (const int8_t *)(blk + QK_K / 2 + QK_K / 4);
+        const uint16_t dbits = (uint16_t)blk[QK_K / 2 + QK_K / 4 + QK_K / 16]
+                             | ((uint16_t)blk[QK_K / 2 + QK_K / 4 + QK_K / 16 + 1] << 8);
+        const float    d   = __half2float(__ushort_as_half(dbits)) * ad[b];
+        const int8_t  *q8  = aq + (size_t)b * QK_K;
+
+        int32_t iacc = 0;
+        for (int half = 0; half < 2; ++half) {
+            const int o = half * 128;
+            for (int l = lane; l < 32; l += WAVE) {
+                const uint8_t h   = qh[half * 32 + l];
+                const uint8_t lo0 = ql[half * 64 + l];
+                const uint8_t lo1 = ql[half * 64 + l + 32];
+
+                const int v0 = (int)(int8_t)((lo0 & 0x0F) | (((h >> 0) & 3) << 4)) - 32;
+                const int v1 = (int)(int8_t)((lo1 & 0x0F) | (((h >> 2) & 3) << 4)) - 32;
+                const int v2 = (int)(int8_t)((lo0 >>   4) | (((h >> 4) & 3) << 4)) - 32;
+                const int v3 = (int)(int8_t)((lo1 >>   4) | (((h >> 6) & 3) << 4)) - 32;
+
+                iacc += sc[(o + l)      / 16] * v0 * (int)q8[o + l];
+                iacc += sc[(o + l + 32) / 16] * v1 * (int)q8[o + l + 32];
+                iacc += sc[(o + l + 64) / 16] * v2 * (int)q8[o + l + 64];
+                iacc += sc[(o + l + 96) / 16] * v3 * (int)q8[o + l + 96];
+            }
+        }
+        acc += d * (float)iacc;
+    }
+
+    #pragma unroll
+    for (int off = WAVE / 2; off > 0; off >>= 1) {
+        acc += __shfl_down(acc, off, WAVE);
+    }
+    if (lane == 0) out[grow] = acc;
+}
+
 // Per-device scratch for the activation and the result. Grown on demand and
 // never freed until the process ends.
 //
@@ -287,6 +452,213 @@ int llamd_rocm_matvec_q6k_resident(
 
 done:
     return rc;   // the scratch is kept; llamd_rocm_free_scratch releases it
+}
+
+// Kernel-only timing. WHY THIS EXISTS: llamd_rocm_matvec_q6k_resident above
+// copies activations in, synchronises, and copies the result out on EVERY
+// call. For a 243 MiB weight matrix that overhead is noise, but for a 1.2 MiB
+// expert matrix it is everything -- the benchmark reported 10.5 GB/s on a
+// shape whose weights would stream in 4 us at full rate. Attributing that to
+// the kernel, and then projecting end-to-end throughput from it, would draw
+// exactly the wrong conclusion about what needs fixing.
+//
+// So: upload once, launch `iters` times back to back with no intervening
+// synchronise, then synchronise once and report the elapsed device time. That
+// is the cost the kernel would have inside a resident forward pass, which is
+// the number the design decision actually depends on.
+//
+// `ms_out` receives the total for all iterations; the caller divides.
+int llamd_rocm_matvec_bench(
+    const void *d_w, const int8_t *h_aq, const float *h_ad,
+    int blocks, int rows, int iters, float *ms_out)
+{
+    const size_t aqbytes = (size_t)blocks * QK_K;
+    const size_t adbytes = (size_t)blocks * sizeof(float);
+    const size_t obytes  = (size_t)rows * sizeof(float);
+
+    int rc = -1;
+    hipEvent_t t0, t1;
+    if (!ensure((void **)&g_aq,  &g_aq_cap,  aqbytes)) return -1;
+    if (!ensure((void **)&g_ad,  &g_ad_cap,  adbytes)) return -1;
+    if (!ensure((void **)&g_out, &g_out_cap, obytes))  return -1;
+    if (hipMemcpy(g_aq, h_aq, aqbytes, hipMemcpyHostToDevice) != hipSuccess) return -1;
+    if (hipMemcpy(g_ad, h_ad, adbytes, hipMemcpyHostToDevice) != hipSuccess) return -1;
+
+    if (hipEventCreate(&t0) != hipSuccess) return -1;
+    if (hipEventCreate(&t1) != hipSuccess) { (void)hipEventDestroy(t0); return -1; }
+
+    {
+        const int grid = (rows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
+
+        // One warm launch, so the measurement excludes first-launch costs
+        // (module load, code object paging) that a steady forward pass does
+        // not pay per token.
+        hipLaunchKernelGGL(q6k_q8k_matvec_resident,
+                           dim3(grid), dim3(WAVE * ROWS_PER_BLOCK), 0, 0,
+                           (const uint8_t *)d_w, g_aq, g_ad, g_out, blocks, rows);
+        if (hipDeviceSynchronize() != hipSuccess) goto cleanup;
+
+        if (hipEventRecord(t0, 0) != hipSuccess) goto cleanup;
+        for (int i = 0; i < iters; ++i) {
+            hipLaunchKernelGGL(q6k_q8k_matvec_resident,
+                               dim3(grid), dim3(WAVE * ROWS_PER_BLOCK), 0, 0,
+                               (const uint8_t *)d_w, g_aq, g_ad, g_out, blocks, rows);
+        }
+        if (hipEventRecord(t1, 0) != hipSuccess) goto cleanup;
+        if (hipEventSynchronize(t1) != hipSuccess) goto cleanup;
+        if (hipGetLastError() != hipSuccess) goto cleanup;
+        if (hipEventElapsedTime(ms_out, t0, t1) != hipSuccess) goto cleanup;
+        rc = 0;
+    }
+
+cleanup:
+    (void)hipEventDestroy(t0);
+    (void)hipEventDestroy(t1);
+    return rc;
+}
+
+// ---------------------------------------------------------------------------
+// Grouped expert matvec: correctness path and timing path.
+//
+// The correctness path exists because the grouped kernel is only worth having
+// if it computes exactly what the per-expert kernel computes. It takes host
+// activations, returns host results for all n_used experts, and the Rust test
+// compares those against n_used separate calls to the scalar CPU dot product.
+// ---------------------------------------------------------------------------
+static int32_t *g_eid  = nullptr;  static size_t g_eid_cap  = 0;
+
+void llamd_rocm_free_grouped_scratch() {
+    if (g_eid) { (void)hipFree(g_eid); g_eid = nullptr; g_eid_cap = 0; }
+}
+
+int llamd_rocm_matvec_grouped(
+    const void *d_w, const int32_t *h_eid, const int8_t *h_aq,
+    const float *h_ad, float *h_out, int blocks, int rows, int n_used)
+{
+    const size_t aqbytes = (size_t)blocks * QK_K;
+    const size_t adbytes = (size_t)blocks * sizeof(float);
+    const size_t obytes  = (size_t)rows * n_used * sizeof(float);
+    const size_t ebytes  = (size_t)n_used * sizeof(int32_t);
+
+    int rc = -1;
+    if (!ensure((void **)&g_aq,  &g_aq_cap,  aqbytes)) return -1;
+    if (!ensure((void **)&g_ad,  &g_ad_cap,  adbytes)) return -1;
+    if (!ensure((void **)&g_out, &g_out_cap, obytes))  return -1;
+    if (!ensure((void **)&g_eid, &g_eid_cap, ebytes))  return -1;
+
+    if (hipMemcpy(g_aq,  h_aq,  aqbytes, hipMemcpyHostToDevice) != hipSuccess) return -1;
+    if (hipMemcpy(g_ad,  h_ad,  adbytes, hipMemcpyHostToDevice) != hipSuccess) return -1;
+    if (hipMemcpy(g_eid, h_eid, ebytes,  hipMemcpyHostToDevice) != hipSuccess) return -1;
+
+    {
+        const int total = rows * n_used;
+        const int grid  = (total + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
+        hipLaunchKernelGGL(q6k_q8k_matvec_grouped,
+                           dim3(grid), dim3(WAVE * ROWS_PER_BLOCK), 0, 0,
+                           (const uint8_t *)d_w, g_eid, g_aq, g_ad, g_out,
+                           blocks, rows, n_used);
+    }
+    if (hipGetLastError() != hipSuccess) return -1;
+    if (hipDeviceSynchronize() != hipSuccess) return -1;
+    if (hipMemcpy(h_out, g_out, obytes, hipMemcpyDeviceToHost) != hipSuccess) return -1;
+    rc = 0;
+    return rc;
+}
+
+// Kernel-only timing for the grouped kernel, same discipline as
+// llamd_rocm_matvec_bench: upload once, launch `iters` times with no
+// intervening synchronise, one warm launch first, HIP events on the device.
+int llamd_rocm_matvec_grouped_bench(
+    const void *d_w, const int32_t *h_eid, const int8_t *h_aq,
+    const float *h_ad, int blocks, int rows, int n_used,
+    int iters, float *ms_out)
+{
+    const size_t aqbytes = (size_t)blocks * QK_K;
+    const size_t adbytes = (size_t)blocks * sizeof(float);
+    const size_t obytes  = (size_t)rows * n_used * sizeof(float);
+    const size_t ebytes  = (size_t)n_used * sizeof(int32_t);
+
+    int rc = -1;
+    hipEvent_t t0, t1;
+    if (!ensure((void **)&g_aq,  &g_aq_cap,  aqbytes)) return -1;
+    if (!ensure((void **)&g_ad,  &g_ad_cap,  adbytes)) return -1;
+    if (!ensure((void **)&g_out, &g_out_cap, obytes))  return -1;
+    if (!ensure((void **)&g_eid, &g_eid_cap, ebytes))  return -1;
+    if (hipMemcpy(g_aq,  h_aq,  aqbytes, hipMemcpyHostToDevice) != hipSuccess) return -1;
+    if (hipMemcpy(g_ad,  h_ad,  adbytes, hipMemcpyHostToDevice) != hipSuccess) return -1;
+    if (hipMemcpy(g_eid, h_eid, ebytes,  hipMemcpyHostToDevice) != hipSuccess) return -1;
+
+    if (hipEventCreate(&t0) != hipSuccess) return -1;
+    if (hipEventCreate(&t1) != hipSuccess) { (void)hipEventDestroy(t0); return -1; }
+
+    {
+        const int total = rows * n_used;
+        const int grid  = (total + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
+
+        hipLaunchKernelGGL(q6k_q8k_matvec_grouped,
+                           dim3(grid), dim3(WAVE * ROWS_PER_BLOCK), 0, 0,
+                           (const uint8_t *)d_w, g_eid, g_aq, g_ad, g_out,
+                           blocks, rows, n_used);
+        if (hipDeviceSynchronize() != hipSuccess) goto cleanup;
+
+        if (hipEventRecord(t0, 0) != hipSuccess) goto cleanup;
+        for (int i = 0; i < iters; ++i) {
+            hipLaunchKernelGGL(q6k_q8k_matvec_grouped,
+                               dim3(grid), dim3(WAVE * ROWS_PER_BLOCK), 0, 0,
+                               (const uint8_t *)d_w, g_eid, g_aq, g_ad, g_out,
+                               blocks, rows, n_used);
+        }
+        if (hipEventRecord(t1, 0) != hipSuccess) goto cleanup;
+        if (hipEventSynchronize(t1) != hipSuccess) goto cleanup;
+        if (hipGetLastError() != hipSuccess) goto cleanup;
+        if (hipEventElapsedTime(ms_out, t0, t1) != hipSuccess) goto cleanup;
+        rc = 0;
+    }
+
+cleanup:
+    (void)hipEventDestroy(t0);
+    (void)hipEventDestroy(t1);
+    return rc;
+}
+
+// Device-side Q8_K quantization, validated against the host implementation.
+// Takes f32 on the host only so the test can drive it; inside a resident
+// forward pass the input is already a device buffer and this kernel is
+// launched directly.
+int llamd_rocm_quantize_q8k(
+    const float *h_x, int nblocks,
+    int8_t *h_qs, float *h_d, int16_t *h_bsums)
+{
+    const size_t xbytes  = (size_t)nblocks * QK_K * sizeof(float);
+    const size_t qbytes  = (size_t)nblocks * QK_K;
+    const size_t dbytes  = (size_t)nblocks * sizeof(float);
+    const size_t sbytes  = (size_t)nblocks * (QK_K / 16) * sizeof(int16_t);
+
+    float   *d_x = nullptr; int8_t *d_qs = nullptr;
+    float   *d_d = nullptr; int16_t *d_bs = nullptr;
+    int rc = -1;
+    if (hipMalloc((void **)&d_x,  xbytes) != hipSuccess) goto out;
+    if (hipMalloc((void **)&d_qs, qbytes) != hipSuccess) goto out;
+    if (hipMalloc((void **)&d_d,  dbytes) != hipSuccess) goto out;
+    if (hipMalloc((void **)&d_bs, sbytes) != hipSuccess) goto out;
+    if (hipMemcpy(d_x, h_x, xbytes, hipMemcpyHostToDevice) != hipSuccess) goto out;
+
+    hipLaunchKernelGGL(q8k_quantize, dim3(nblocks), dim3(QK_K), 0, 0,
+                       d_x, d_qs, d_d, d_bs, nblocks);
+    if (hipGetLastError() != hipSuccess) goto out;
+    if (hipDeviceSynchronize() != hipSuccess) goto out;
+
+    if (hipMemcpy(h_qs, d_qs, qbytes, hipMemcpyDeviceToHost) != hipSuccess) goto out;
+    if (hipMemcpy(h_d,  d_d,  dbytes, hipMemcpyDeviceToHost) != hipSuccess) goto out;
+    if (h_bsums && hipMemcpy(h_bsums, d_bs, sbytes, hipMemcpyDeviceToHost) != hipSuccess) goto out;
+    rc = 0;
+
+out:
+    if (d_x)  (void)hipFree(d_x);
+    if (d_qs) (void)hipFree(d_qs);
+    if (d_d)  (void)hipFree(d_d);
+    if (d_bs) (void)hipFree(d_bs);
+    return rc;
 }
 
 } // extern "C"

@@ -128,9 +128,13 @@ llama.cpp built with `GGML_HIP=ON` for gfx1201, on this card:
 
 ```text
   qwen3moe 30B.A3B Q6_K · ROCm · ngl 99
-    pp64   640.25 ± 267.19 t/s
-    tg32    73.04 ±  11.23 t/s
+    pp512  1636.66 ± 460.41 t/s
+    tg64     94.39 ±   7.73 t/s
 ```
+
+Measured on an IDLE card. An earlier 73.04 t/s recorded here was taken
+while a llama-server held 32 GB of VRAM — benchmarking against a busy card
+understates the bar by 23%.
 
 A live `llama-server` on the same card, configured as a user would run one
 (98304-token context, `-ctk q8_0 -ctv q8_0 -fa on`), measures **57.7 t/s**
@@ -148,8 +152,12 @@ deliberately unoptimised path.
 
 What the kernel bandwidth does say is more useful. A MoE token touches roughly
 2.5 GiB of active weights, so at the **310–319 GB/s** measured on the output
-projection the arithmetic alone would permit **~118 t/s — 1.6× the reference's
-73**. (An earlier figure of 178 GB/s here was a hardcoded constant that had
+projection the arithmetic alone would permit ~118 t/s. **That estimate is
+wrong, and the per-shape sweep in [benchmarks.md](benchmarks.md) shows why:**
+it applies the largest shape's bandwidth to all traffic, but the expert
+matrices are 90% of the bytes and sustain only 9–24% of peak. Weighted by what
+the model actually reads, today's kernel ceiling is **~75 t/s** — parity with
+llama.cpp, not 1.6× it. (An earlier figure of 178 GB/s here was a hardcoded constant that had
 drifted from what the benchmark measured; it now prints the measurement.)
 **The kernel is not the bottleneck; the missing integration is.** That makes
 the next step concrete rather than speculative: hold weights resident across the

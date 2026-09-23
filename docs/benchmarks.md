@@ -104,13 +104,20 @@ pass when given it:
 Measured the way llama.cpp reports it — first token separated from steady
 state, KV cache growing one position per token:
 
-| path | configuration | tok/s |
-|---|---|---|
-| llama.cpp, HIP | `-ngl 99`, q8_0 KV, 98304 ctx | **57.7** |
-| llama.cpp, HIP | `llama-bench`, f16 KV, short ctx | **73.0** |
-| llama.cpp, CPU | 12 threads, f16 KV, warm | **0.75** |
-| **LLAMD, CPU** | 1 thread, scalar reference | **0.363** |
-| LLAMD, GPU | kernel validated, *not wired in* | — |
+| path | configuration | tok/s | % of 640 GB/s |
+|---|---|---|---|
+| llama.cpp, HIP | `llama-bench`, **idle card** | **94.39** ± 7.73 | 36.6% |
+| llama.cpp, HIP | `-ngl 99`, q8_0 KV, 98304 ctx | 57.74 | 22.4% |
+| llama.cpp, CPU | 12 threads, f16 KV, warm | 0.75 | — |
+| **LLAMD, CPU** | 1 thread, scalar reference | **0.363** | 0.1% |
+| LLAMD, GPU | kernel validated, *not wired in* | — | — |
+
+Prompt processing, same run: **1636.66 ± 460.41 t/s** (pp512).
+
+**The bar was understated in this repo by 23%.** The previously recorded 73.04
+t/s was measured while a `llama-server` held 32 GB of VRAM. On an idle card
+llama.cpp reaches 94.39. A benchmark taken against a contended GPU flatters
+whatever it is compared to.
 
 LLAMD generates coherent text, not just one matching token:
 
@@ -207,3 +214,175 @@ would turn it into speed is not done.
 
 The next number that would actually test the premise is LLAMD's tok/s with the
 ROCm backend in the forward pass. Everything before that is groundwork.
+
+---
+
+## 5. Kernel-only bandwidth, and the correction it forced
+
+Everything above measures `DeviceWeights::matvec`, which copies activations to
+the device, synchronises, and copies the result back **on every call**. That is
+the honest cost for a host-side caller. It is the wrong number for deciding
+what to build next, because on a small matrix it is almost entirely PCIe.
+
+`DeviceWeights::bench_kernel_only` launches back to back with one device
+synchronise at the end, timed with HIP events after a warm launch — what the
+kernel costs inside a resident forward pass:
+
+| shape | size | api µs | kernel µs | GB/s | of peak |
+|---|---|---|---|---|---|
+| `output` [2048→151936] | 243.4 MiB | 912.0 | **531.6** | **480.1** | **75%** |
+| `attn_out` [4096→2048] | 6.6 MiB | 133.6 | 22.3 | 309.0 | 48% |
+| `attn_q` [2048→4096] | 6.6 MiB | 142.7 | 29.8 | 230.6 | 36% |
+| `expert_gate` [2048→768] | 1.2 MiB | 127.5 | 8.3 | 154.8 | 24% |
+| `attn_k` [2048→512] | 0.8 MiB | 117.5 | 7.6 | 113.9 | 18% |
+| `expert_down` [768→2048] | 1.2 MiB | 157.0 | 22.3 | **57.8** | **9%** |
+
+Two findings, and the second overturns an earlier claim in this document.
+
+**The round-trip was costing 15×.** `expert_gate` went from 127.5 µs to 8.3 µs.
+Per-call `hipMemcpy` and `hipDeviceSynchronize` were the measurement, not the
+kernel. A resident forward pass recovers all of it.
+
+**But the projection built on the best shape was wrong.** This document
+previously argued ~115 t/s by applying the output projection's bandwidth to all
+weight traffic. Measured per shape, that is not available:
+
+```
+  weight traffic per token
+    48 x (attn 15.5 MB + 8 experts 31.0 MB) + output 255.3 MB = 2.485 GB
+    at the bandwidths measured above:  13.35 ms/token  ->  75 tok/s
+```
+
+**~75 tok/s, not ~115** — parity with llama.cpp's 94.39, slightly behind it.
+The error was applying a 243 MiB shape's rate to 1.2 MiB shapes that measure
+5–8× slower.
+
+### Where the ceiling actually goes
+
+The expert matrices are **90% of the traffic** — 31.0 of 46.4 MB per layer —
+and they sustain 9–24% of peak. The reason is parallelism, not the inner loop:
+a 1.2 MiB matrix at 8 rows per workgroup gives the card too little in flight to
+cover memory latency. `expert_down` [768→2048] is worst at 9%, because k=768 is
+only three Q6_K blocks per row — the inner loop ends before it gets going.
+
+The 243 MiB output projection reaching 75% of peak proves the memory system and
+the kernel's inner loop are not the limit. Size is.
+
+### What 140 tok/s requires, from these measurements
+
+| | |
+|---|---|
+| budget at 140 t/s | 7.14 ms/token |
+| output projection, measured | 0.53 ms |
+| attention, 48 layers at ~270 GB/s | 2.76 ms |
+| **left for experts** | **3.85 ms** |
+| expert traffic, 48 × 31.0 MB | 1.49 GB |
+| **required expert bandwidth** | **388 GB/s** (61% of peak) |
+| measured today on that shape | 57.8 – 154.8 GB/s |
+
+So 140 t/s needs the expert path 2.5–6.7× faster. The lever is **grouped expert
+GEMM**: one kernel over all 8 routed experts turns 24 launches of 1.2 MiB into
+3 of 10.3 MB, with 8× the rows. That moves the experts into the size class where
+this kernel already measures 230–309 GB/s, and 388 sits between that and the
+480 measured at 243 MiB.
+
+It is not a certainty — 388 GB/s on a 10.3 MB shape is above anything measured
+here at that size. It is a target with a measured basis, which is the most that
+can be said before it is built.
+
+---
+
+## 6. Grouped expert GEMM — GPU against GPU
+
+Section 5 located the problem: the routed-expert matrices are 90% of a token's
+weight traffic and ran at 9–24% of peak, ceilinging the model near 75 t/s. The
+cause was shape, not arithmetic. `expert_down` has k=768, so `blocks=3`: a lane
+performs twelve multiply-accumulates and then a five-step shuffle reduction, and
+2048 rows at 8 per workgroup is only 256 workgroups — too little in flight to
+cover memory latency.
+
+`q6k_q8k_matvec_grouped` puts all 8 routed experts in one launch. The row space
+becomes `n_used * rows`, so 8× the workgroups and 8× the bytes in flight, from
+the same 210-byte block reads. The arithmetic is untouched.
+
+**No CPU appears in this comparison.** Both columns are this card, kernel-only,
+timed with HIP events after a warm launch.
+
+| expert shape | MiB (8 experts) | 8 separate | grouped | speedup | GB/s | of peak |
+|---|---|---|---|---|---|---|
+| `expert_gate` [2048→768] | 9.8 | 70.1 µs | **28.4 µs** | 2.5× | **363.3** | 57% |
+| `expert_up` [2048→768] | 9.8 | 80.8 µs | **28.1 µs** | 2.9× | **367.3** | 57% |
+| `expert_down` [768→2048] | 9.8 | 183.2 µs | **32.0 µs** | **5.7×** | **322.8** | 50% |
+
+`expert_down` — the worst shape in the model — went from **57.8 GB/s to 322.8**,
+a 5.6× bandwidth improvement on the path that carries most of the traffic.
+
+### The per-token estimate, rebuilt
+
+```
+  per-expert launches     19.53 ms/token  ->    51 tok/s
+  grouped                  7.73 ms/token  ->   129 tok/s
+  llama.cpp measured                            94.4 tok/s
+```
+
+**129 against llama.cpp's 94.39 — 1.37×.** The target of 140 t/s needed 388 GB/s
+on the expert path; it delivers 322–367.
+
+### What this figure is, stated precisely
+
+It is the **weight-traffic time of the matmuls**, summed over the real model
+composition, with every matmul at the bandwidth measured for its own shape. It
+excludes attention, normalisation, RoPE, routing, the residual adds, KV cache
+traffic, and every gap between launches. Those are real costs and they will pull
+the number down.
+
+It is **not** an engine. LLAMD still generates at 0.363 tok/s, on the CPU,
+because none of this is wired into `forward`. The honest claim is narrow and
+worth stating exactly: *the kernel path required to beat llama.cpp on this card
+now exists and measures faster than llama.cpp; the engine around it does not.*
+
+### Correctness was not traded for it
+
+`llamd-testing/tests/grouped_expert.rs` holds the grouped kernel to two bars:
+
+- **Bit-identical to the ungrouped kernel** across 16,384 rows over 8 routed
+  experts. Grouping changes which matrix a workgroup indexes, not how it sums,
+  so any difference is a bug and a tolerance would hide it.
+- **Within reduction error of the scalar CPU path**, scaled by accumulation
+  magnitude rather than by each result — worst 7.3e-4 against a 1.7e-2 bound.
+
+A repeated expert id must produce a repeated output block, and out-of-range ids,
+a zero row count and a row count that does not divide the upload are all errors
+rather than clamps, because each would read past the allocation.
+
+### A concurrency bug this work exposed
+
+The HIP layer keeps `g_aq`, `g_ad`, `g_out` and `g_eid` as process-global
+statics — the design that removed per-call allocation and took a small
+projection under the 0.23 ms floor. But `DeviceWeights` is `Send + Sync` and
+`cargo test` runs tests concurrently, so two threads entered the same scratch.
+
+The symptom was a result with the **right magnitude and the wrong sign**:
+`-1752.9983` where `+1753.0044` was correct. In a forward pass that would have
+surfaced as an occasional wrong token and been blamed on the arithmetic. The
+scratch is now behind a mutex — uncontended on the inference path, where work is
+one stream, and cheaper than per-thread device buffers that would multiply VRAM
+by the thread count.
+
+### Device-side Q8_K quantization
+
+Also landed, and a precondition for everything above becoming an engine: while
+activation quantization runs on the host, every one of the ~1400 matmuls in a
+token must hand a buffer across the bus, so no forward pass can stay resident.
+`q8k_quantize` is validated **exactly** — scales, quants and bsums — against
+`llamd_quant::quantize_q8_k` on the cases most likely to expose a difference: a
+negative peak (which is what `iscale = -127/max` exists for), an all-zero block,
+exact `.5` values for round-half-to-even, and values needing the upper clamp.
+
+### What remains between 129 and a real number
+
+1. The resident forward pass — weights uploaded once, activations never leaving
+   VRAM, one synchronise per token instead of ~1400.
+2. Attention, norms, RoPE, routing and residuals as device kernels. Anything
+   left on the host reintroduces the round-trip the grouped kernel just escaped.
+3. Then measure. That number, not 129, is the one that tests the premise.

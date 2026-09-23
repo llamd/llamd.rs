@@ -90,8 +90,63 @@ mod ffi {
             blocks: c_int,
             rows: c_int,
         ) -> c_int;
+        pub fn llamd_rocm_matvec_grouped(
+            d_w: *const std::ffi::c_void,
+            eid: *const i32,
+            aq: *const i8,
+            ad: *const f32,
+            out: *mut f32,
+            blocks: c_int,
+            rows: c_int,
+            n_used: c_int,
+        ) -> c_int;
+        pub fn llamd_rocm_matvec_grouped_bench(
+            d_w: *const std::ffi::c_void,
+            eid: *const i32,
+            aq: *const i8,
+            ad: *const f32,
+            blocks: c_int,
+            rows: c_int,
+            n_used: c_int,
+            iters: c_int,
+            ms_out: *mut f32,
+        ) -> c_int;
+        pub fn llamd_rocm_quantize_q8k(
+            x: *const f32,
+            nblocks: c_int,
+            qs: *mut i8,
+            d: *mut f32,
+            bsums: *mut i16,
+        ) -> c_int;
+        pub fn llamd_rocm_matvec_bench(
+            d_w: *const std::ffi::c_void,
+            aq: *const i8,
+            ad: *const f32,
+            blocks: c_int,
+            rows: c_int,
+            iters: c_int,
+            ms_out: *mut f32,
+        ) -> c_int;
     }
 }
+
+/// Serialises access to the HIP layer's shared scratch buffers.
+///
+/// WHY THIS IS NECESSARY, and it was found the hard way. `g_aq`, `g_ad`,
+/// `g_out` and `g_eid` in llamd.hip are process-global statics, grown on
+/// demand and reused across calls — the design that took a small projection
+/// from 0.23 ms to well under it, by not allocating per call. But
+/// `DeviceWeights` is `Send + Sync`, and `cargo test` runs tests concurrently,
+/// so two threads entered the same scratch and overwrote each other's
+/// activations. The symptom was a result with the RIGHT MAGNITUDE AND THE
+/// WRONG SIGN — `-1752.9983` where `+1753.0044` was correct — which is exactly
+/// the kind of corruption that would surface later as an occasional wrong
+/// token and be blamed on the arithmetic.
+///
+/// A mutex rather than per-thread scratch: inference is one stream of work,
+/// the lock is uncontended on that path, and thread-local device buffers would
+/// multiply VRAM use by the thread count for no benefit.
+static SCRATCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Was this crate built against a real ROCm installation?
 pub const fn built_with_rocm() -> bool {
@@ -280,6 +335,7 @@ impl DeviceWeights {
             // exactly `rows*blocks*210` bytes and has not been freed — `Drop`
             // is the only release and consumes the handle. `aq`, `ad` and
             // `out` are sized from the same `blocks`/`rows`.
+            let _guard = SCRATCH.lock().expect("scratch mutex");
             #[allow(unsafe_code)]
             let rc = unsafe {
                 ffi::llamd_rocm_matvec_q6k_resident(
@@ -296,6 +352,261 @@ impl DeviceWeights {
             }
             Ok(out)
         }
+    }
+}
+
+/// Kernel-only time for `iters` launches, in milliseconds for the whole run.
+///
+/// WHY THIS IS SEPARATE FROM [`DeviceWeights::matvec`]. `matvec` is the honest
+/// API: it takes host activations and returns host results, so it pays two
+/// `hipMemcpy`s and a full device synchronise every call. That is the right
+/// shape for a caller that has data on the host, and the wrong shape for
+/// answering "how fast is the kernel". On a 1.2 MiB expert matrix the
+/// round-trip is 30x the kernel, so a benchmark built on `matvec` measures
+/// PCIe and concludes the kernel is slow.
+///
+/// This launches back to back with no synchronise between, timed with HIP
+/// events on the device, after one warm launch. It is what the kernel costs
+/// inside a resident forward pass — the number the design depends on.
+impl DeviceWeights {
+    pub fn bench_kernel_only(&self, act: &[llamd_quant::BlockQ8K], iters: u32) -> Result<f32> {
+        if act.len() != self.blocks {
+            return Err(Error::Shape {
+                expected: vec![self.blocks],
+                got: vec![act.len()],
+            });
+        }
+        if iters == 0 {
+            return Err(Error::malformed("bench iters", "0"));
+        }
+        let mut aq = Vec::with_capacity(self.blocks * llamd_quant::QK_K);
+        let mut ad = Vec::with_capacity(self.blocks);
+        for b in act {
+            aq.extend_from_slice(&b.qs);
+            ad.push(b.d);
+        }
+        #[cfg(not(rocm))]
+        {
+            let _ = (aq, ad);
+            Err(Error::unsupported("rocm", "not built with ROCm support"))
+        }
+        #[cfg(rocm)]
+        {
+            let mut ms = 0.0f32;
+            // SAFETY: as `matvec` — `self.ptr` is a live upload of exactly
+            // `rows*blocks*210` bytes, and `aq`/`ad` are sized from the same
+            // `blocks`. `ms` is a single initialised f32.
+            let _guard = SCRATCH.lock().expect("scratch mutex");
+            #[allow(unsafe_code)]
+            let rc = unsafe {
+                ffi::llamd_rocm_matvec_bench(
+                    self.ptr,
+                    aq.as_ptr(),
+                    ad.as_ptr(),
+                    self.blocks as i32,
+                    self.rows as i32,
+                    iters as i32,
+                    &mut ms,
+                )
+            };
+            if rc != 0 {
+                return Err(Error::other("HIP kernel-only bench failed"));
+            }
+            Ok(ms)
+        }
+    }
+}
+
+/// The routed-expert path: all `expert_ids` experts in one launch.
+///
+/// The weights are the layer's whole 3-D expert tensor, uploaded once; each
+/// workgroup indexes into it by `expert_ids[e]`. Returns `[n_used][rows]` —
+/// one row block per routed expert, in the order given, unscaled. Applying the
+/// router weights is the caller's job, because the caller is what knows
+/// whether softmax came before or after top-k.
+impl DeviceWeights {
+    pub fn matvec_grouped(
+        &self,
+        act: &[llamd_quant::BlockQ8K],
+        expert_ids: &[i32],
+        rows_per_expert: usize,
+    ) -> Result<Vec<f32>> {
+        if act.len() != self.blocks {
+            return Err(Error::Shape {
+                expected: vec![self.blocks],
+                got: vec![act.len()],
+            });
+        }
+        if expert_ids.is_empty() {
+            return Err(Error::malformed("expert_ids", "empty"));
+        }
+        // The upload holds n_expert matrices of rows_per_expert rows; a stated
+        // row count that does not divide it means the caller has the layout
+        // wrong, and reading past the allocation is the alternative.
+        if rows_per_expert == 0 || self.rows % rows_per_expert != 0 {
+            return Err(Error::malformed(
+                "rows_per_expert",
+                format!(
+                    "{rows_per_expert} does not divide {} uploaded rows",
+                    self.rows
+                ),
+            ));
+        }
+        let n_expert = self.rows / rows_per_expert;
+        if let Some(bad) = expert_ids
+            .iter()
+            .find(|&&e| e < 0 || e as usize >= n_expert)
+        {
+            return Err(Error::malformed(
+                "expert id",
+                format!("{bad} outside 0..{n_expert}"),
+            ));
+        }
+        let mut aq = Vec::with_capacity(self.blocks * llamd_quant::QK_K);
+        let mut ad = Vec::with_capacity(self.blocks);
+        for b in act {
+            aq.extend_from_slice(&b.qs);
+            ad.push(b.d);
+        }
+        #[cfg(not(rocm))]
+        {
+            let _ = (aq, ad);
+            Err(Error::unsupported("rocm", "not built with ROCm support"))
+        }
+        #[cfg(rocm)]
+        {
+            let mut out = vec![0.0f32; rows_per_expert * expert_ids.len()];
+            // SAFETY: `self.ptr` is a live upload of rows*blocks*210 bytes;
+            // every id was just bounds-checked against the matrix count, so
+            // the largest offset the kernel forms stays inside it. `aq`/`ad`
+            // are sized from `blocks`, `out` from rows_per_expert*n_used.
+            let _guard = SCRATCH.lock().expect("scratch mutex");
+            #[allow(unsafe_code)]
+            let rc = unsafe {
+                ffi::llamd_rocm_matvec_grouped(
+                    self.ptr,
+                    expert_ids.as_ptr(),
+                    aq.as_ptr(),
+                    ad.as_ptr(),
+                    out.as_mut_ptr(),
+                    self.blocks as i32,
+                    rows_per_expert as i32,
+                    expert_ids.len() as i32,
+                )
+            };
+            if rc != 0 {
+                return Err(Error::other("HIP grouped matvec failed"));
+            }
+            Ok(out)
+        }
+    }
+
+    /// Kernel-only milliseconds for `iters` grouped launches. See
+    /// [`DeviceWeights::bench_kernel_only`] for why this is not `matvec_grouped`
+    /// in a loop.
+    pub fn bench_grouped_kernel_only(
+        &self,
+        act: &[llamd_quant::BlockQ8K],
+        expert_ids: &[i32],
+        rows_per_expert: usize,
+        iters: u32,
+    ) -> Result<f32> {
+        if act.len() != self.blocks || expert_ids.is_empty() || iters == 0 {
+            return Err(Error::malformed("grouped bench args", "invalid"));
+        }
+        let mut aq = Vec::with_capacity(self.blocks * llamd_quant::QK_K);
+        let mut ad = Vec::with_capacity(self.blocks);
+        for b in act {
+            aq.extend_from_slice(&b.qs);
+            ad.push(b.d);
+        }
+        #[cfg(not(rocm))]
+        {
+            let _ = (aq, ad);
+            Err(Error::unsupported("rocm", "not built with ROCm support"))
+        }
+        #[cfg(rocm)]
+        {
+            let mut ms = 0.0f32;
+            // SAFETY: as `matvec_grouped`, with no output buffer — the kernel
+            // writes only to device scratch sized by the same arguments.
+            let _guard = SCRATCH.lock().expect("scratch mutex");
+            #[allow(unsafe_code)]
+            let rc = unsafe {
+                ffi::llamd_rocm_matvec_grouped_bench(
+                    self.ptr,
+                    expert_ids.as_ptr(),
+                    aq.as_ptr(),
+                    ad.as_ptr(),
+                    self.blocks as i32,
+                    rows_per_expert as i32,
+                    expert_ids.len() as i32,
+                    iters as i32,
+                    &mut ms,
+                )
+            };
+            if rc != 0 {
+                return Err(Error::other("HIP grouped bench failed"));
+            }
+            Ok(ms)
+        }
+    }
+}
+
+/// Quantize to Q8_K on the device.
+///
+/// The point is not speed on its own — it is that while this conversion lives
+/// on the host, no forward pass can stay resident: every matvec would hand a
+/// buffer back across the bus. Validated against
+/// `llamd_quant::quantize_q8_k` for exact equality, because a differing quant
+/// shifts a routing decision and changes the token.
+pub fn quantize_q8k_on_device(x: &[f32]) -> Result<Vec<llamd_quant::BlockQ8K>> {
+    if x.is_empty() || x.len() % llamd_quant::QK_K != 0 {
+        return Err(Error::malformed(
+            "q8k input",
+            format!("{} is not a multiple of {}", x.len(), llamd_quant::QK_K),
+        ));
+    }
+    let nblocks = x.len() / llamd_quant::QK_K;
+    #[cfg(not(rocm))]
+    {
+        Err(Error::unsupported("rocm", "not built with ROCm support"))
+    }
+    #[cfg(rocm)]
+    {
+        let mut qs = vec![0i8; nblocks * llamd_quant::QK_K];
+        let mut d = vec![0.0f32; nblocks];
+        let mut bsums = vec![0i16; nblocks * (llamd_quant::QK_K / 16)];
+        // SAFETY: all four buffers are sized from the same `nblocks` the
+        // kernel is told about, and `x` is non-empty and block-aligned.
+        #[allow(unsafe_code)]
+        let rc = unsafe {
+            ffi::llamd_rocm_quantize_q8k(
+                x.as_ptr(),
+                nblocks as i32,
+                qs.as_mut_ptr(),
+                d.as_mut_ptr(),
+                bsums.as_mut_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(Error::other("HIP q8_k quantize failed"));
+        }
+        let mut out = Vec::with_capacity(nblocks);
+        for b in 0..nblocks {
+            let mut blk = llamd_quant::BlockQ8K {
+                d: d[b],
+                qs: [0; llamd_quant::QK_K],
+                bsums: [0; llamd_quant::QK_K / 16],
+            };
+            blk.qs
+                .copy_from_slice(&qs[b * llamd_quant::QK_K..(b + 1) * llamd_quant::QK_K]);
+            blk.bsums.copy_from_slice(
+                &bsums[b * (llamd_quant::QK_K / 16)..(b + 1) * (llamd_quant::QK_K / 16)],
+            );
+            out.push(blk);
+        }
+        Ok(out)
     }
 }
 
