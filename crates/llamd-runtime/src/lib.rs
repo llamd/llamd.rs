@@ -5,6 +5,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod device;
+pub use device::DeviceModel;
 pub mod attention;
 pub mod kv;
 pub mod layer;

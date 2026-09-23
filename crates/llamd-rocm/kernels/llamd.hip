@@ -394,6 +394,71 @@ __global__ void q6k_q8k_matvec_grouped(
     if (lane == 0) out[grow] = acc;
 }
 
+// GROUPED MATVEC WITH PER-EXPERT ACTIVATIONS.
+//
+// WHY A SECOND GROUPED KERNEL. The one above shares a single activation across
+// every routed expert, which is exactly right for the gate and up projections:
+// all 8 experts read the same normalised x. It is WRONG for the down
+// projection. Each expert's down input is its own silu(gate_e) * up_e, so the
+// activation is per-expert and indexing it as shared would feed expert 0's
+// activation to all 8 — producing plausible, fluent, wrong output.
+//
+// `aq` and `ad` are therefore indexed by the routed slot e, not shared.
+__global__ void q6k_q8k_matvec_grouped_pa(
+    const uint8_t * __restrict__ w,
+    const int32_t * __restrict__ expert_ids,
+    const int8_t  * __restrict__ aq,       // [n_used][blocks*256]
+    const float   * __restrict__ ad,       // [n_used][blocks]
+    float         * __restrict__ out,      // [n_used][rows]
+    int blocks, int rows, int n_used)
+{
+    const int wave = threadIdx.x / WAVE;
+    const int lane = threadIdx.x % WAVE;
+    const int grow = blockIdx.x * ROWS_PER_BLOCK + wave;
+    if (grow >= rows * n_used) return;
+
+    const int e   = grow / rows;
+    const int row = grow - e * rows;
+    const size_t mat = (size_t)expert_ids[e] * rows * blocks * Q6K_BLOCK_BYTES;
+    const uint8_t *wrow = w + mat + (size_t)row * blocks * Q6K_BLOCK_BYTES;
+    const int8_t *aq_e = aq + (size_t)e * blocks * QK_K;
+    const float  *ad_e = ad + (size_t)e * blocks;
+
+    float acc = 0.0f;
+    for (int b = 0; b < blocks; ++b) {
+        const uint8_t *blk = wrow + (size_t)b * Q6K_BLOCK_BYTES;
+        const uint8_t *ql  = blk;
+        const uint8_t *qh  = blk + QK_K / 2;
+        const int8_t  *sc  = (const int8_t *)(blk + QK_K / 2 + QK_K / 4);
+        const uint16_t dbits = (uint16_t)blk[QK_K / 2 + QK_K / 4 + QK_K / 16]
+                             | ((uint16_t)blk[QK_K / 2 + QK_K / 4 + QK_K / 16 + 1] << 8);
+        const float    d   = __half2float(__ushort_as_half(dbits)) * ad_e[b];
+        const int8_t  *q8  = aq_e + (size_t)b * QK_K;
+
+        int32_t iacc = 0;
+        for (int half = 0; half < 2; ++half) {
+            const int o = half * 128;
+            for (int l = lane; l < 32; l += WAVE) {
+                const uint8_t h   = qh[half * 32 + l];
+                const uint8_t lo0 = ql[half * 64 + l];
+                const uint8_t lo1 = ql[half * 64 + l + 32];
+                const int v0 = (int)(int8_t)((lo0 & 0x0F) | (((h >> 0) & 3) << 4)) - 32;
+                const int v1 = (int)(int8_t)((lo1 & 0x0F) | (((h >> 2) & 3) << 4)) - 32;
+                const int v2 = (int)(int8_t)((lo0 >>   4) | (((h >> 4) & 3) << 4)) - 32;
+                const int v3 = (int)(int8_t)((lo1 >>   4) | (((h >> 6) & 3) << 4)) - 32;
+                iacc += sc[(o + l)      / 16] * v0 * (int)q8[o + l];
+                iacc += sc[(o + l + 32) / 16] * v1 * (int)q8[o + l + 32];
+                iacc += sc[(o + l + 64) / 16] * v2 * (int)q8[o + l + 64];
+                iacc += sc[(o + l + 96) / 16] * v3 * (int)q8[o + l + 96];
+            }
+        }
+        acc += d * (float)iacc;
+    }
+    #pragma unroll
+    for (int off = WAVE / 2; off > 0; off >>= 1) acc += __shfl_down(acc, off, WAVE);
+    if (lane == 0) out[grow] = acc;
+}
+
 // Per-device scratch for the activation and the result. Grown on demand and
 // never freed until the process ends.
 //
@@ -659,6 +724,57 @@ out:
     if (d_d)  (void)hipFree(d_d);
     if (d_bs) (void)hipFree(d_bs);
     return rc;
+}
+
+// ---------------------------------------------------------------------------
+// DEVICE-POINTER ENTRY POINTS for the resident forward pass.
+//
+// The functions above are the host-facing API: they copy activations in,
+// synchronise, and copy results out. Inside a token that is fatal — ~1400
+// matmuls at the measured 0.12 ms round-trip is 167 ms, about 6 tok/s.
+//
+// These take device pointers and return immediately. The caller queues a whole
+// token's worth and synchronises once. They live in this file because the
+// kernels do, and a __global__ cannot be launched from another translation
+// unit.
+// ---------------------------------------------------------------------------
+void llamd_fwd_matvec(const void *d_w, const int8_t *d_aq, const float *d_ad,
+                      float *d_out, int blocks, int rows)
+{
+    const int grid = (rows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
+    hipLaunchKernelGGL(q6k_q8k_matvec_resident,
+                       dim3(grid), dim3(WAVE * ROWS_PER_BLOCK), 0, 0,
+                       (const uint8_t *)d_w, d_aq, d_ad, d_out, blocks, rows);
+}
+
+void llamd_fwd_matvec_grouped(const void *d_w, const int32_t *d_ids,
+                              const int8_t *d_aq, const float *d_ad,
+                              float *d_out, int blocks, int rows, int n_used)
+{
+    const int total = rows * n_used;
+    const int grid  = (total + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
+    hipLaunchKernelGGL(q6k_q8k_matvec_grouped,
+                       dim3(grid), dim3(WAVE * ROWS_PER_BLOCK), 0, 0,
+                       (const uint8_t *)d_w, d_ids, d_aq, d_ad, d_out,
+                       blocks, rows, n_used);
+}
+
+void llamd_fwd_matvec_grouped_pa(const void *d_w, const int32_t *d_ids,
+                                 const int8_t *d_aq, const float *d_ad,
+                                 float *d_out, int blocks, int rows, int n_used)
+{
+    const int total = rows * n_used;
+    const int grid  = (total + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
+    hipLaunchKernelGGL(q6k_q8k_matvec_grouped_pa,
+                       dim3(grid), dim3(WAVE * ROWS_PER_BLOCK), 0, 0,
+                       (const uint8_t *)d_w, d_ids, d_aq, d_ad, d_out,
+                       blocks, rows, n_used);
+}
+
+void llamd_fwd_quantize(const float *d_x, int8_t *d_qs, float *d_d, int nblocks)
+{
+    hipLaunchKernelGGL(q8k_quantize, dim3(nblocks), dim3(QK_K), 0, 0,
+                       d_x, d_qs, d_d, (int16_t *)nullptr, nblocks);
 }
 
 } // extern "C"

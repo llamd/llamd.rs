@@ -14,3 +14,4 @@ llamd-tensor.workspace = true
 llamd-models.workspace = true
 llamd-gguf.workspace = true
 llamd-cpu.workspace = true
+llamd-rocm.workspace = true

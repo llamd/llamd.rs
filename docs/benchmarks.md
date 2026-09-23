@@ -386,3 +386,108 @@ exact `.5` values for round-half-to-even, and values needing the upper clamp.
 2. Attention, norms, RoPE, routing and residuals as device kernels. Anything
    left on the host reintroduces the round-trip the grouped kernel just escaped.
 3. Then measure. That number, not 129, is the one that tests the premise.
+
+---
+
+## 7. The resident forward pass — LLAMD generating on the GPU
+
+Everything before this section measured kernels. This one measures an engine.
+
+`DeviceModel` uploads the whole model to VRAM once and computes a token with
+every operation on the device: **one `hipDeviceSynchronize` per token**, and the
+only value crossing the bus is the argmax — a single `i32`.
+
+```
+  uploaded 23.32 GiB in 3.8 s     VRAM free 31.8 -> 8.1 GiB
+```
+
+### Correctness first
+
+| prompt | GPU | CPU | llama.cpp | margin |
+|---|---|---|---|---|
+| `"Hi"` | 525 | 525 | 525 | 0.1196 |
+| `"The"` | 525 | 525 | 525 | 2.0050 |
+| `"def"` | 374 | 374 | 374 | 0.1946 |
+| `"Python"` | 25 | 25 | 25 | 0.8520 |
+| `"1"` | 13 | 13 | 13 | 0.8905 |
+
+**GPU == CPU == llama.cpp on all five**, including the two near-ties that the
+q8_0 KV experiment in §1 showed are sensitive enough to flip. Logit deviation
+between GPU and CPU is 8e-2 to 2.8e-1 relative, which is 48 layers of reordered
+reduction; the *decision* is identical, which is what a user sees.
+
+### Throughput
+
+```
+  first token      19.6 ms
+  steady state     14.87 ms/token  ->  67.27 tok/s   (spread 13.26 - 18.07 ms)
+  llama.cpp                            94.39 tok/s
+```
+
+Generating coherent text, not one token:
+
+> `" are you familiar with the book \"The Art of War\" by Sun Tzu?\nYes, I'm
+> familiar with \"The Art of War\" by Sun Tzu. It's an ancient Chinese military
+> treatise dating from the 5th century BCE, traditionally attributed to the
+> military general and strategist Sun Tzu (also"`
+
+**0.363 → 67.27 tok/s, 185×.** LLAMD is now at 0.71× llama.cpp, from 0.004×.
+
+### Where the remaining time goes, measured
+
+Profiling is opt-in because measuring a phase means synchronising after it —
+exactly the stall the module exists to remove. A profiled token is slower than a
+real one and its total must never be quoted as throughput. It is here because
+"14.87 ms against a 7.73 ms matmul budget" is a question guesswork answers badly.
+
+| phase | ms | share |
+|---|---|---|
+| experts | 6.570 | 27.1% |
+| q/k/v proj | 3.815 | 15.7% |
+| router | 3.056 | 12.8% |
+| attn_out + residual | 2.610 | 10.8% |
+| qk-norm + rope + kv | 2.177 | 9.0% |
+| attention | 1.854 | 7.6% |
+| moe tail | 1.717 | 7.1% |
+| norms | 1.671 | 6.9% |
+| output + argmax | 0.502 | 2.1% |
+| embed | 0.035 | 0.1% |
+| profiled total | 24.253 | |
+
+Each row carries ~17.5 µs × 48 of synchronise overhead the real path does not
+pay, which is why the profiled total exceeds the measured 14.87 ms.
+
+### Two bottlenecks this found, and what they cost
+
+**The router was 37.9% of a token — larger than all 1152 expert matmuls.**
+Selection was a serial scan on thread 0: eight rounds over 128 experts, each a
+global read of `probs[]`, so ~1024 dependent loads per layer with no latency
+hiding. Staging the probabilities in LDS and running eight block-wide max
+reductions instead took the phase from **12.326 ms to 3.056 ms** and the engine
+from **41.93 to 64.66 tok/s**. Same selection, same tie rule, same 2^-14 clamp.
+
+**Q, K and V were quantizing the same activation three times.** They all consume
+the same normalised x. Quantizing once took q/k/v from 4.073 to 3.815 ms —
+64.66 to **67.27 tok/s**. A smaller win than expected, and that is the useful
+part of the result: it says the cost is launch *count*, not the work.
+
+### What stands between 67 and 140
+
+About 1200 launches go into a token. At the ~4.5 µs the numbers above imply,
+that is roughly 5.4 of the 14.87 ms — more than any single phase. Three levers,
+in order of expected return:
+
+1. **Fewer launches.** The rope path alone is five launches per layer for
+   trivial work (two QK-norms, two RoPEs, a KV store) and fuses to two. Norms
+   fuse into the quantization that follows them; the MoE tail's combine and
+   residual add fuse into one.
+2. **HIP graph capture.** llama.cpp builds with `GGML_HIP_GRAPHS=ON` for this
+   reason. A token's graph is structurally fixed — expert ids are read on the
+   device, so routing does not change it — and only `pos` and `n_kv` vary.
+3. **Faster matvec on the attention shapes.** `attn_q` measures 230 GB/s against
+   480 on the output projection. The experts already reach 322–367.
+
+140 tok/s needs 7.14 ms. The matmuls alone measure 7.73 ms today, so 140 is not
+reachable by removing overhead alone — it needs item 3 as well. **90–100 tok/s,
+i.e. parity with llama.cpp, is reachable from items 1 and 2**, and that is the
+next honest milestone.

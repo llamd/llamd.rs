@@ -140,7 +140,17 @@ A live `llama-server` on the same card, configured as a user would run one
 (98304-token context, `-ctk q8_0 -ctv q8_0 -fa on`), measures **57.7 t/s**
 instead. The bar depends on configuration, so both are recorded.
 
-**LLAMD has no end-to-end GPU number to set against that yet.** The GPU kernel
+**LLAMD now has an end-to-end GPU number: 67.27 tok/s**, from a resident
+forward pass with every operation on the device and one synchronise per token
+(`llamd-runtime/src/device.rs`). It emits the same tokens as the CPU reference
+and llama.cpp on all five agreement prompts. That is 0.71x llama.cpp's 94.39,
+up from 0.004x. See [benchmarks.md](benchmarks.md) §7 for the phase breakdown
+and the two bottlenecks it exposed.
+
+The paragraph below describes the state before that landed, kept because its
+reasoning is what produced it.
+
+**The CPU reference remains at 0.363 tok/s.** The GPU kernel
 is validated but is not wired into the forward pass, which runs on the CPU
 reference at **2.755 s/token — 0.363 t/s**, now measured end to end by
 `llamd-testing/tests/throughput.rs` rather than inferred from a single forward.

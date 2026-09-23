@@ -21,6 +21,9 @@
 
 #![deny(unsafe_code)]
 
+pub mod forward;
+pub use forward::{DevBuf, free_memory, op, sync};
+
 use llamd_core::{Error, Result};
 
 #[derive(Debug, Clone)]
