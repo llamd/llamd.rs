@@ -351,6 +351,33 @@ impl PlanarWeights {
         &self.off
     }
 
+    /// The same, through the tiled GEMM kernel. Validation and benchmarking
+    /// only; the engine calls `ops::matvec_gemm` inside a recording.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matvec_gemm_host(
+        &self,
+        qb: &VkBuf,
+        sb: &VkBuf,
+        ad: &VkBuf,
+        out: &VkBuf,
+        nseq: usize,
+        iters: usize,
+    ) -> Result<()> {
+        if out.bytes() < self.rows * nseq * 4 {
+            return Err(Error::malformed("matvec_gemm", "output buffer too small"));
+        }
+        crate::ops::begin()?;
+        let queued = (|| -> Result<()> {
+            for _ in 0..iters.max(1) {
+                crate::ops::matvec_gemm(self, qb, sb, ad, out, self.rows, nseq)?;
+            }
+            Ok(())
+        })();
+        let submitted = crate::ops::end_and_wait();
+        queued?;
+        submitted
+    }
+
     /// Q6_K × Q8_K matvec for `nseq` activations.
     ///
     /// `iters` > 1 dispatches repeatedly with a barrier between, for timing the

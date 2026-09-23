@@ -287,3 +287,128 @@ fn vulkan_against_rocm_on_identical_hardware() {
     }
     eprintln!();
 }
+
+#[test]
+fn the_tiled_gemm_agrees_with_the_scalar_reference() {
+    // Same arithmetic as the matvec, different work decomposition: a lane owns
+    // (row, group) instead of (row), and the 8 lanes sharing a row combine with
+    // subgroupClusteredAdd. That reshuffles which lane accumulates what, so the
+    // float reduction order changes and the bar is REDUCTION — but a wrong
+    // cluster boundary or row mapping is an outright error, not a tolerance
+    // question, and would fail this badly.
+    if skip("the_tiled_gemm_agrees_with_the_scalar_reference") {
+        return;
+    }
+    for (rows, k, nseq) in [
+        (256usize, 768usize, 1usize), // 3 blocks, one token
+        (1024, 2048, 1),
+        (512, 4096, 1), // 16 blocks
+        (1024, 2048, 8),
+        (256, 2048, 32), // the widest tile
+        (2048, 2048, 16),
+        (37, 2048, 4), // rows not a multiple of 32: the tail
+        (7, 2048, 1),  // fewer rows than one workgroup covers
+    ] {
+        let blocks = k / QK_K;
+        let w = weights(rows, blocks, 71 + rows as u32 + nseq as u32);
+        let pw = llamd_vulkan::PlanarWeights::upload(&w, rows, blocks).expect("upload");
+
+        let mut acts = Vec::new();
+        let mut per_seq = Vec::new();
+        for s in 0..nseq {
+            let x: Vec<f32> = (0..k)
+                .map(|i| ((i as f32) * 0.013 + s as f32 * 0.77).sin())
+                .collect();
+            let a = quantize_q8_k(&x);
+            per_seq.push(a.clone());
+            acts.extend(a);
+        }
+        let (qb, sb, ad) = bias_and_sums(&acts);
+        let d_qb = llamd_vulkan::VkBuf::from_bytes(&qb).expect("qb");
+        let d_sb = llamd_vulkan::VkBuf::from_i32(&sb).expect("sb");
+        let d_ad = llamd_vulkan::VkBuf::from_f32(&ad).expect("ad");
+        let d_out = llamd_vulkan::VkBuf::new(rows * nseq * 4).expect("out");
+        pw.matvec_gemm_host(&d_qb, &d_sb, &d_ad, &d_out, nseq, 1)
+            .expect("gemm");
+        let mut got = vec![0.0f32; rows * nseq];
+        d_out.download_f32(&mut got).expect("download");
+
+        let mut worst = 0.0f32;
+        let mut acc = 0.0f64;
+        let mut n = 0usize;
+        for (s, a) in per_seq.iter().enumerate() {
+            for r in 0..rows {
+                let want = dot_q6k_q8k(&w[r * blocks * B..(r + 1) * blocks * B], a, k);
+                worst = worst.max((got[s * rows + r] - want).abs());
+                acc += (want as f64) * (want as f64);
+                n += 1;
+            }
+        }
+        let rms = (acc / n as f64).sqrt() as f32;
+        let bound = REDUCTION * rms.max(1.0);
+        assert!(
+            worst <= bound,
+            "{rows}x{k} nseq {nseq}: worst {worst:.3e} exceeds {bound:.3e} (rms {rms:.3e})"
+        );
+        eprintln!(
+            "  {rows:>5} rows, {blocks:>2} blocks, nseq {nseq:>2}: worst {worst:.3e}, bound {bound:.3e}"
+        );
+    }
+}
+
+#[test]
+fn tiled_gemm_against_the_matvec_by_token_count() {
+    // The question the GEMM was written to answer: at how many tokens does
+    // staging the activation in shared memory and covering 32 rows per workgroup
+    // beat one subgroup per row?
+    //
+    // Kernel-level, so cache-assisted — this card has 64 MB of Infinity Cache and
+    // §9-§10 record two optimisations that looked good here and were rejected by
+    // the engine. Treated as a direction to look, not a verdict; the engine A/B
+    // in vulkan_prefill.rs decides.
+    if skip("tiled_gemm_against_the_matvec_by_token_count") {
+        return;
+    }
+    let (rows, k) = (4096usize, 2048usize); // attn_q's shape
+    let blocks = k / QK_K;
+    let w = weights(rows, blocks, 5);
+    let pw = llamd_vulkan::PlanarWeights::upload(&w, rows, blocks).expect("upload");
+
+    eprintln!("\n  attn_q [2048->4096], kernel only");
+    eprintln!(
+        "  {:>6} {:>12} {:>12} {:>10}",
+        "tokens", "matvec us", "gemm us", "gemm/mv"
+    );
+    for nseq in [1usize, 2, 4, 8, 16, 32] {
+        let mut acts = Vec::new();
+        for s in 0..nseq {
+            let x: Vec<f32> = (0..k)
+                .map(|i| ((i as f32) * 0.011 + s as f32).sin())
+                .collect();
+            acts.extend(quantize_q8_k(&x));
+        }
+        let (qb, sb, ad) = bias_and_sums(&acts);
+        let d_qb = llamd_vulkan::VkBuf::from_bytes(&qb).expect("qb");
+        let d_sb = llamd_vulkan::VkBuf::from_i32(&sb).expect("sb");
+        let d_ad = llamd_vulkan::VkBuf::from_f32(&ad).expect("ad");
+        let d_out = llamd_vulkan::VkBuf::new(rows * nseq * 4).expect("out");
+        let iters = 200usize;
+
+        pw.matvec(&d_qb, &d_sb, &d_ad, &d_out, nseq, 1)
+            .expect("warm mv");
+        let t = std::time::Instant::now();
+        pw.matvec(&d_qb, &d_sb, &d_ad, &d_out, nseq, iters)
+            .expect("mv");
+        let mv = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+        pw.matvec_gemm_host(&d_qb, &d_sb, &d_ad, &d_out, nseq, 1)
+            .expect("warm gemm");
+        let t = std::time::Instant::now();
+        pw.matvec_gemm_host(&d_qb, &d_sb, &d_ad, &d_out, nseq, iters)
+            .expect("gemm");
+        let gm = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+        eprintln!("  {nseq:>6} {mv:>12.1} {gm:>12.1} {:>9.2}x", gm / mv);
+    }
+    eprintln!("  (< 1.00x means the GEMM is faster)");
+}

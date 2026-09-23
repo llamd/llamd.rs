@@ -1262,3 +1262,92 @@ The next step is the one llama.cpp already took — a real tiled GEMM over token
 with the activation staged in shared memory and specialization constants so the
 accumulator loop is compile-time bounded and stays in registers rather than
 scratch.
+
+---
+
+## 16. The tiled GEMM: built, measured, and the wrong target
+
+§15 named a tiled GEMM as the way to close prefill's 3.3× gap to llama.cpp. It is
+built and validated, it is **slower than the kernel it replaces**, and the more
+useful result is why.
+
+### Three variants, all slower
+
+On `attn_q` [2048→4096], kernel-only, against the plain matvec:
+
+| variant | scratch | vs matvec |
+|---|---|---|
+| a lane owns (row, group) | 0 | 1.09 – 1.68× slower |
+| 4 rows per lane | **32 KB** | 1.45 – 4.59× slower |
+| 2 rows per lane | 0 | 1.09 – 1.76× slower |
+
+All correct — validated against the scalar reference at 3, 8 and 16 blocks per
+row, at 1 to 32 tokens, and at row counts that do not divide the tile (37, 7).
+
+### What each variant ruled out
+
+**The first was a parallelism error.** Giving a lane one (row, group) pair means a
+row is covered by 8 lanes instead of 64 — it bought 8× activation reuse by giving
+up 8× parallelism.
+
+**The second was registers, and measurement said so directly.** RADV reported
+`Scratch size: 32768`: `acc[4][32]` is 128 floats indexed by a loop whose bound is
+a push constant, so the compiler cannot unroll it and the array goes to scratch.
+Worth noting that the *original* matvec's `acc[32]` does **not** spill —
+`Scratch size: 0, Spilled VGPRs: 0, VGPRs: 72`. Registers were never the matvec's
+problem, so the specialization-constant fix §15 proposed would have fixed nothing.
+
+**The third ruled out the remaining explanation.** Two rows per lane does not
+spill, and has a strictly better instruction mix than the matvec — 16 dot4 per 8
+activation loads against 8 per 8. It is still slower.
+
+So not registers, and not instruction count. **What is left is latency.** The
+matvec runs one row per subgroup at 72 VGPRs, which puts 262144 lanes on
+`attn_q` — two waves per hardware slot, so a stalled wave always has a partner to
+hide behind. Halving the subgroup count to buy fewer instructions removes exactly
+the latency hiding that was paying for them.
+
+### The premise was wrong anyway, and the earlier data said so
+
+This kernel serves the attention projections. At 32 tokens those are **3.5% of a
+prefill tile's weight traffic**:
+
+| tokens | distinct experts | expert MB/layer | attention % | expert % |
+|---|---|---|---|---|
+| 1 | 8 | 31 | 33.3% | 66.7% |
+| 8 | 52 | 200 | 7.2% | 92.8% |
+| 16 | 82 | 319 | 4.6% | 95.4% |
+| **32** | **112** | **433** | **3.5%** | **96.5%** |
+| 512 | 128 | 495 | 3.0% | 97.0% |
+
+The attention weights are read once per tile however many tokens it holds. The
+routed experts are not: each token picks its own eight of 128, and at 32 tokens
+112 distinct experts get touched. **A perfect kernel here would win 3.5%.**
+
+§15's own tile sweep had already said this and it was not read carefully enough:
+16 → 32 tokens gained **3%**. That flattening is the signature of a cost that does
+not share, and it was pointing at the expert path.
+
+### What would actually work
+
+At 32 tokens, 112 distinct experts serve 256 token-expert pairs — **2.3 tokens per
+chosen expert**. Today the grouped kernels run one row per `(token, expert)` pair
+with `NS = 1`, so an expert's weights are read once per token that chose it.
+
+Grouping **expert-major** instead — sort the tile's tokens by expert, gather their
+activations, run one matmul per expert against all its tokens, scatter the results
+— reads each expert's weights once and serves 2.3 tokens with them. That is ~2.3×
+on 96.5% of the traffic, against 3.5% for anything done to the attention path. It
+is also what `ggml_mul_mat_id` does.
+
+The kernel and its tests are kept, as the HIP graph, split-k and planar
+experiments were, because the finding is the deliverable: **the matvec's
+decomposition is already near-optimal for a latency-bound kernel, and prefill is
+limited somewhere else entirely.**
+
+A note on method. This is the fourth optimisation in this repo that measured well
+in theory and lost in practice, and the pattern across all four is the same:
+arithmetic about bytes or instructions predicted a win, and occupancy or latency
+decided otherwise. The arithmetic that *did* hold up was the traffic breakdown
+above — which was available before the kernel was written, and would have said
+not to write it.

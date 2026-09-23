@@ -1,0 +1,187 @@
+#version 450
+//
+// Q6_K x Q8_K with ROWS_PER_LANE output rows per lane.
+//
+// WHY THE FIRST ATTEMPT WAS SLOWER, recorded because the reasoning was wrong in
+// an instructive way. That version gave a lane one (row, group) pair, so a row
+// was covered by 8 lanes instead of 64 — it bought 8x activation reuse by giving
+// up 8x parallelism, and measured 1.09x to 1.68x SLOWER at every token count.
+//
+// WHAT THE NUMBERS ACTUALLY SAID. RADV reports the matvec at 72 VGPRs with zero
+// scratch, so registers were never the constraint. The constraint is the
+// instruction mix: per token per block a lane issues 8 activation loads to feed
+// 8 dot4 ops, so barely a third of its instructions are arithmetic. At 32 tokens
+// the kernel reaches about 0.9 T dot4/s against roughly 9 T the card can issue.
+//
+// THE FIX IS ROWS PER LANE, NOT ROWS PER SUBGROUP. A lane keeps the matvec's
+// decomposition — it strides over u across every block, so a row still has 64
+// lanes on it — and additionally holds the weights for ROWS_PER_LANE rows. The
+// activation for a token is then loaded ONCE and consumed ROWS_PER_LANE times:
+// 8 loads feed 8*ROWS_PER_LANE dot4 ops.
+//
+// Parallelism falls by ROWS_PER_LANE and the work per lane rises by the same
+// factor, so total occupancy is unchanged as long as there are still enough
+// waves to fill the card: 4096 rows at 4 per lane is 65536 lanes against a
+// 131072-thread capacity.
+//
+// SAME ARITHMETIC as q6k.glsl, held to the same scalar reference.
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer W  { uint  w[];    };
+layout(std430, binding = 1) readonly  buffer QB { uint  qb[];   };
+layout(std430, binding = 2) readonly  buffer SB { int   sb[];   };
+layout(std430, binding = 3) readonly  buffer AD { float ad[];   };
+layout(std430, binding = 4) writeonly buffer O  { float outv[]; };
+
+layout(push_constant) uniform Push {
+    uint ql_u; uint qh_u; uint sc_u; uint d_u;
+    uint blocks; uint rows; uint nseq; uint pad;
+} pc;
+#include "common.glsl"
+
+// Rows a single lane accumulates.
+//
+// MEASURED, AND THE ANSWER IS THAT THIS KERNEL IS NOT USED. Three variants, all
+// slower than the plain matvec on attn_q:
+//
+//   (row, group) per lane          scratch 0       1.09 - 1.68x slower
+//   4 rows per lane                scratch 32 KB   1.45 - 4.59x slower
+//   2 rows per lane                scratch 0       1.09 - 1.76x slower
+//
+// 4 rows spills: acc[4][32] is 128 floats indexed by a loop the compiler cannot
+// unroll. But 2 rows does NOT spill, has a better instruction mix than the
+// matvec (16 dot4 per 8 activation loads against 8), and is still slower. That
+// rules out both registers and instruction count as the explanation.
+//
+// WHAT IS LEFT is latency. The matvec runs one row per subgroup at 72 VGPRs,
+// which puts 262144 lanes on attn_q — two waves per hardware slot, so a stalled
+// wave always has a partner to hide behind. Halving the subgroup count to buy
+// fewer instructions removes exactly the latency hiding that was paying for
+// them.
+//
+// AND THE PREMISE WAS WRONG ANYWAY. This kernel serves the attention
+// projections, which at 32 tokens are 3.5% of a prefill tile's weight traffic;
+// the routed experts are 96.5%, because each token picks its own eight and they
+// barely overlap. The prefill tile sweep had already said so — 16 to 32 tokens
+// gained 3% — and that is the signature of a cost that does not share.
+//
+// Kept, with its tests, because the finding is the deliverable: the matvec's
+// decomposition is already near-optimal for a latency-bound kernel, and prefill
+// is limited by the expert path instead. See benchmarks.md §16.
+#define ROWS_PER_LANE 2
+
+void main() {
+    uint lane = gl_SubgroupInvocationID;
+    // Each subgroup owns ROWS_PER_LANE consecutive rows.
+    uint row0 = (gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID) * ROWS_PER_LANE;
+    if (row0 >= pc.rows) return;
+
+    float acc[ROWS_PER_LANE][MAX_SEQ];
+    for (int r = 0; r < ROWS_PER_LANE; ++r)
+        for (int t = 0; t < MAX_SEQ; ++t) acc[r][t] = 0.0;
+
+    uint n_u4 = pc.blocks * 8u;
+    for (uint u = lane; u < n_u4; u += gl_SubgroupSize) {
+        uint b   = u >> 3u;
+        uint jb0 = (u & 7u) << 4u;
+        uint h   = jb0 >> 6u;
+        uint m0  = jb0 & 63u;
+        uint shl = (m0 >= 32u) ? 2u : 0u;
+        uint s4  = shl + 4u;
+
+        // Unpack this group's weights for every row in the tile. Held in
+        // registers across the token loop below — this is the reuse.
+        uint lo[ROWS_PER_LANE][4], hi[ROWS_PER_LANE][4];
+        int  scl[ROWS_PER_LANE], sch[ROWS_PER_LANE];
+        float dw[ROWS_PER_LANE];
+        int  cl[ROWS_PER_LANE], ch[ROWS_PER_LANE];
+
+        for (int r = 0; r < ROWS_PER_LANE; ++r) {
+            uint row = row0 + uint(r);
+            bool live = row < pc.rows;
+            uint ri = row * pc.blocks;
+            uint qlr = pc.ql_u + ri * 32u;
+            uint qhr = pc.qh_u + ri * 16u;
+            uint scr = pc.sc_u + ri * 4u;
+
+            uint q0 = 0u, q1 = 0u, q2 = 0u, q3 = 0u;
+            uint h0 = 0u, h1 = 0u, h2 = 0u, h3 = 0u;
+            if (live) {
+                q0 = w[qlr + u * 4u + 0u];
+                q1 = w[qlr + u * 4u + 1u];
+                q2 = w[qlr + u * 4u + 2u];
+                q3 = w[qlr + u * 4u + 3u];
+                uint hb = qhr + b * 16u + h * 8u + ((m0 & 31u) >> 2u);
+                h0 = w[hb + 0u]; h1 = w[hb + 1u]; h2 = w[hb + 2u]; h3 = w[hb + 3u];
+            }
+            lo[r][0] = (q0 & 0x0F0F0F0Fu) | (((h0 >> shl) & 0x03030303u) << 4u);
+            lo[r][1] = (q1 & 0x0F0F0F0Fu) | (((h1 >> shl) & 0x03030303u) << 4u);
+            lo[r][2] = (q2 & 0x0F0F0F0Fu) | (((h2 >> shl) & 0x03030303u) << 4u);
+            lo[r][3] = (q3 & 0x0F0F0F0Fu) | (((h3 >> shl) & 0x03030303u) << 4u);
+            hi[r][0] = ((q0 >> 4u) & 0x0F0F0F0Fu) | (((h0 >> s4) & 0x03030303u) << 4u);
+            hi[r][1] = ((q1 >> 4u) & 0x0F0F0F0Fu) | (((h1 >> s4) & 0x03030303u) << 4u);
+            hi[r][2] = ((q2 >> 4u) & 0x0F0F0F0Fu) | (((h2 >> s4) & 0x03030303u) << 4u);
+            hi[r][3] = ((q3 >> 4u) & 0x0F0F0F0Fu) | (((h3 >> s4) & 0x03030303u) << 4u);
+
+            uint swl = dotPacked4x8AccSatEXT(lo[r][0], 0x01010101u, 0u);
+            swl = dotPacked4x8AccSatEXT(lo[r][1], 0x01010101u, swl);
+            swl = dotPacked4x8AccSatEXT(lo[r][2], 0x01010101u, swl);
+            swl = dotPacked4x8AccSatEXT(lo[r][3], 0x01010101u, swl);
+            uint swh = dotPacked4x8AccSatEXT(hi[r][0], 0x01010101u, 0u);
+            swh = dotPacked4x8AccSatEXT(hi[r][1], 0x01010101u, swh);
+            swh = dotPacked4x8AccSatEXT(hi[r][2], 0x01010101u, swh);
+            swh = dotPacked4x8AccSatEXT(hi[r][3], 0x01010101u, swh);
+            cl[r] = -128 * int(swl) + 32 * 128 * 16;
+            ch[r] = -128 * int(swh) + 32 * 128 * 16;
+
+            uint si = b * 16u + h * 8u + (m0 >> 4u);
+            scl[r] = live ? bitfieldExtract(int(w[scr + (si >> 2u)]), int(8u * (si & 3u)), 8) : 0;
+            uint sj = si + 4u;
+            sch[r] = live ? bitfieldExtract(int(w[scr + (sj >> 2u)]), int(8u * (sj & 3u)), 8) : 0;
+            uint di = pc.d_u + ((ri + b) >> 1u);
+            vec2 dp = live ? unpackHalf2x16(w[di]) : vec2(0.0);
+            dw[r] = (((ri + b) & 1u) == 0u) ? dp.x : dp.y;
+        }
+
+        uint bu  = b * 64u + h * 32u + (m0 >> 2u);
+        uint g16 = b * 16u + h * 8u + (m0 >> 4u);
+        for (uint t = 0u; t < pc.nseq; ++t) {
+            // Loaded ONCE per token and consumed ROWS_PER_LANE times.
+            uint ab = t * pc.blocks * 64u + bu;
+            uint a0 = qb[ab + 0u], a1 = qb[ab + 1u], a2 = qb[ab + 2u], a3 = qb[ab + 3u];
+            uint ah = ab + 16u;
+            uint b0 = qb[ah + 0u], b1 = qb[ah + 1u], b2 = qb[ah + 2u], b3 = qb[ah + 3u];
+            int sbl = sb[t * pc.blocks * 16u + g16];
+            int sbh = sb[t * pc.blocks * 16u + g16 + 4u];
+            float adv = ad[t * pc.blocks + b];
+
+            for (int r = 0; r < ROWS_PER_LANE; ++r) {
+                uint wl = dotPacked4x8AccSatEXT(lo[r][0], a0, 0u);
+                wl = dotPacked4x8AccSatEXT(lo[r][1], a1, wl);
+                wl = dotPacked4x8AccSatEXT(lo[r][2], a2, wl);
+                wl = dotPacked4x8AccSatEXT(lo[r][3], a3, wl);
+                uint wh = dotPacked4x8AccSatEXT(hi[r][0], b0, 0u);
+                wh = dotPacked4x8AccSatEXT(hi[r][1], b1, wh);
+                wh = dotPacked4x8AccSatEXT(hi[r][2], b2, wh);
+                wh = dotPacked4x8AccSatEXT(hi[r][3], b3, wh);
+                int il = scl[r] * (int(wl) + cl[r] - 32 * sbl);
+                int ih = sch[r] * (int(wh) + ch[r] - 32 * sbh);
+                acc[r][t] += dw[r] * adv * float(il + ih);
+            }
+        }
+    }
+
+    for (int r = 0; r < ROWS_PER_LANE; ++r) {
+        uint row = row0 + uint(r);
+        for (uint t = 0u; t < pc.nseq; ++t) {
+            float sum = subgroupAdd(acc[r][t]);
+            if (subgroupElect() && row < pc.rows) outv[t * pc.rows + row] = sum;
+        }
+    }
+}

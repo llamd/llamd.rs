@@ -22,23 +22,24 @@ use crate::{DeviceInfo, Error, PlanarWeights, Result, VkBuf, device_info, init};
 pub enum Pipeline {
     Q6kMatvec = 0,
     Q6kX3 = 1,
-    Q6kGrouped = 2,
-    Q6kGroupedPa = 3,
-    MatvecF32 = 4,
-    Embed = 5,
-    RmsScale = 6,
-    NormQuant = 7,
-    Quantize = 8,
-    RmsNormMul = 9,
-    NormRope = 10,
-    KNormRopeStore = 11,
-    Attention = 12,
-    Add = 13,
-    SiluMul = 14,
-    Router = 15,
-    MoeCombineAdd = 16,
-    Argmax = 17,
-    ArgmaxFinal = 18,
+    Q6kGemm = 2,
+    Q6kGrouped = 3,
+    Q6kGroupedPa = 4,
+    MatvecF32 = 5,
+    Embed = 6,
+    RmsScale = 7,
+    NormQuant = 8,
+    Quantize = 9,
+    RmsNormMul = 10,
+    NormRope = 11,
+    KNormRopeStore = 12,
+    Attention = 13,
+    Add = 14,
+    SiluMul = 15,
+    Router = 16,
+    MoeCombineAdd = 17,
+    Argmax = 18,
+    ArgmaxFinal = 19,
 }
 
 impl Pipeline {
@@ -47,6 +48,7 @@ impl Pipeline {
         match self {
             Pipeline::Q6kMatvec => "q6k_matvec",
             Pipeline::Q6kX3 => "q6k_x3",
+            Pipeline::Q6kGemm => "q6k_gemm",
             Pipeline::Q6kGrouped => "q6k_grouped",
             Pipeline::Q6kGroupedPa => "q6k_grouped_pa",
             Pipeline::MatvecF32 => "matvec_f32",
@@ -67,9 +69,10 @@ impl Pipeline {
         }
     }
 
-    pub const ALL: [Pipeline; 19] = [
+    pub const ALL: [Pipeline; 20] = [
         Pipeline::Q6kMatvec,
         Pipeline::Q6kX3,
+        Pipeline::Q6kGemm,
         Pipeline::Q6kGrouped,
         Pipeline::Q6kGroupedPa,
         Pipeline::MatvecF32,
@@ -330,6 +333,48 @@ pub fn matvec(
         &[w.buf(), qb, sb, ad, out],
         p,
         groups_for_rows(rows),
+        1,
+    )
+}
+
+/// Rows a single lane accumulates in the GEMM kernel. Must match
+/// `ROWS_PER_LANE` in `shaders/q6k_gemm.comp`.
+pub const GEMM_ROWS_PER_LANE: usize = 2;
+
+/// Rows covered by one GEMM workgroup: one subgroup owns `GEMM_ROWS_PER_LANE`
+/// rows, and a 256-thread workgroup holds `256 / subgroup_size` subgroups.
+pub fn gemm_rows_per_workgroup() -> usize {
+    let sg = subgroup_size();
+    let subgroups = if sg == 0 { 1 } else { (256 / sg) as usize };
+    subgroups * GEMM_ROWS_PER_LANE
+}
+
+/// The tiled GEMM: 32 output rows per workgroup with the activation staged in
+/// shared memory.
+///
+/// Same arithmetic as [`matvec`], different work decomposition. Worth using when
+/// there are many tokens to share each staged activation across — which is
+/// prefill. Whether it beats `matvec` at a given token count is measured, not
+/// assumed.
+#[allow(clippy::too_many_arguments)]
+pub fn matvec_gemm(
+    w: &PlanarWeights,
+    qb: &VkBuf,
+    sb: &VkBuf,
+    ad: &VkBuf,
+    out: &VkBuf,
+    rows: usize,
+    nseq: usize,
+) -> Result<()> {
+    if nseq == 0 || nseq > crate::MAX_SEQ {
+        return Err(Error::malformed("matvec_gemm", format!("nseq {nseq}")));
+    }
+    let p = planes(w).u(4, w.blocks()).u(5, rows).u(6, nseq);
+    dispatch(
+        Pipeline::Q6kGemm,
+        &[w.buf(), qb, sb, ad, out],
+        p,
+        rows.div_ceil(gemm_rows_per_workgroup()) as u32,
         1,
     )
 }
