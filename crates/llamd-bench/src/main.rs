@@ -131,10 +131,30 @@ fn main() {
         total_cpu / total_gpu
     );
 
-    println!("\n  NOTE ON WHAT THIS IS NOT. These are synthetic weights at real");
-    println!("  shapes, one activation vector, weights already resident. It is a");
-    println!("  kernel measurement, not tokens/second: no attention, no KV cache,");
-    println!("  no sampling. The comparison against llama.cpp's hipified kernels");
-    println!("  is the number that decides the project's premise, and it needs a");
-    println!("  HIP build of the reference.\n");
+    // The bar, measured on this card with llama-bench and its hipified
+    // kernels. Recorded here so the gap is visible in the same place as the
+    // kernel numbers, rather than living in somebody's memory.
+    const REF_TG: f64 = 73.04; // t/s, qwen3moe 30B.A3B Q6_K, ngl 99
+    const REF_PP: f64 = 640.25;
+    const ACTIVE_BYTES: f64 = 3.3e9 * (6.5625 / 8.0); // ~3.3B active at Q6_K
+
+    println!("\n  THE BAR — llama.cpp with hipified CUDA kernels, this card:");
+    println!("    prompt  {REF_PP:.0} t/s        generate  {REF_TG:.1} t/s");
+
+    let best_bw = 178.5f64;
+    let projected = 1000.0 / (ACTIVE_BYTES / (best_bw * 1e9) * 1e3);
+    println!("\n  WHERE LLAMD STANDS. The GPU kernel is validated but is NOT yet");
+    println!("  wired into the forward pass, which still runs on the CPU reference");
+    println!("  at ~3.0 s/token — about 0.33 t/s. So there is no end-to-end number");
+    println!("  to compare yet, and quoting the kernel ratios as though there were");
+    println!("  would be dishonest: they are measured against a deliberately");
+    println!("  unoptimised CPU path, not against llama.cpp.");
+    println!("\n  What the kernel bandwidth DOES say: a MoE token touches roughly");
+    println!(
+        "  {:.1} GiB of active weights, so at the {best_bw:.0} GB/s measured on the",
+        ACTIVE_BYTES / (1u64 << 30) as f64
+    );
+    println!("  output projection the arithmetic alone would allow ~{projected:.0} t/s —");
+    println!("  the same order as the reference's {REF_TG:.0}. The kernel is not the");
+    println!("  bottleneck; the missing integration is.\n");
 }

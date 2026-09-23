@@ -120,8 +120,31 @@ batching the experts into one launch, or an asynchronous stream that does not
 synchronise per call.
 
 Note the CPU reference is deliberately unoptimised, so these ratios say
-nothing about llama.cpp. **The comparison against hipified llama.cpp is still
-outstanding and is the only one that tests the premise.**
+nothing about llama.cpp.
+
+### The bar, measured
+
+llama.cpp built with `GGML_HIP=ON` for gfx1201, on this card:
+
+```text
+  qwen3moe 30B.A3B Q6_K · ROCm · ngl 99
+    pp64   640.25 ± 267.19 t/s
+    tg32    73.04 ±  11.23 t/s
+```
+
+**LLAMD has no end-to-end number to set against that yet.** The GPU kernel is
+validated but is not wired into the forward pass, which still runs on the CPU
+reference at ~3.0 s/token — about 0.33 t/s. Quoting the kernel speedups as
+though they were a comparison with llama.cpp would be dishonest: they are
+measured against a deliberately unoptimised path.
+
+What the kernel bandwidth does say is more useful. A MoE token touches roughly
+2.5 GiB of active weights, so at the 178 GB/s measured on the output
+projection the arithmetic alone would permit **~66 t/s** — the same order as
+the reference's 73. **The kernel is not the bottleneck; the missing
+integration is.** That makes the next step concrete rather than speculative:
+hold weights resident across the whole model, run the forward pass on the
+device, and only then is there a number that tests the premise.
 
 ## Gaps worth knowing about
 
