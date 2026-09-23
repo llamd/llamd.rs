@@ -49,7 +49,11 @@ fn main() {
     // Two translation units: llamd.hip holds the matvec kernels and their
     // host-facing entry points, llamd_forward.hip the resident forward pass
     // whose entry points take device pointers and never synchronise.
-    let sources = ["kernels/llamd.hip", "kernels/llamd_forward.hip"];
+    let sources = [
+        "kernels/llamd.hip",
+        "kernels/llamd_forward.hip",
+        "kernels/llamd_batch.hip",
+    ];
     let mut objs = Vec::new();
     for src in sources {
         let stem = Path::new(src)

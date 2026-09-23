@@ -776,3 +776,90 @@ need ~180 GB/s, well under the ~260 already achieved. That is a change to the
 engine's shape — a second KV position, activations in pairs, and a batch
 dimension through every kernel — and it is the only path to 140 on this card that
 the measurements support.
+
+---
+
+## 11. Batched decode: 212.7 tok/s, and where llama.cpp still wins
+
+§10 concluded that the remaining route was not a kernel: read each weight once
+for several tokens instead of once for one. That is now built and measured.
+
+**What batching can share, and what it cannot.** The Q, K, V and O projections
+(743.2 MB/token) and the output projection (255.3 MB) are the *same matrices* for
+every sequence, so one read serves the whole batch. The routed experts
+(1486.4 MB, 60% of the traffic) are not: each sequence picks its own 8 of 128 and
+at batch 2 only ~3% of those picks coincide. Per-token traffic therefore falls to
+1986 MB at batch 2 and 1736 at batch 4 — 1.25× and 1.43×, not 2× and 4×. That is
+mixture-of-experts, not an implementation limit.
+
+**It is aggregate throughput, not latency.** Token N+1 of a sequence depends on
+token N, so the sequences batched here are independent — separate streams, or
+speculative candidates. Each individual sequence still sees batch-1 latency.
+
+### Measured, 64 decode steps, warmed
+
+| batch | ms/pass | ms/token | **tok/s total** | vs b=1 |
+|---|---|---|---|---|
+| 1 | 10.72 | 10.722 | **93.3** | 1.00× |
+| 2 | 14.65 | 7.324 | **136.5** | 1.46× |
+| 4 | 22.44 | 5.609 | **178.3** | 1.91× |
+| 8 | 37.61 | 4.701 | **212.7** | 2.28× |
+
+**Better than the bandwidth model predicted** (128 / 146 / 157), because batching
+also fixes occupancy: the expert matrices are 0.86–10.3 MB and at batch 1 simply
+do not have enough rows to fill 32 WGPs. Batching multiplies the row space.
+
+Correctness is asserted against the single-sequence path at every width: batch 2,
+4 and 8 each produce exactly the tokens eight separate `forward` calls produce.
+A batched kernel that leaked one sequence's activation into another's accumulator
+would still emit fluent text, so this comparison is the test.
+
+Staging the activation in LDS was worth 3.5%: the global version re-reads each
+sequence's activation for every output row, up to 64 times per workgroup at
+batch 8. Kept, gated on the activation fitting in 24 KiB so occupancy survives.
+
+### The honest comparison: llama.cpp batched, same card, same model
+
+`llama-batched-bench -npp 1 -ntg 64 -npl 1,2,4,8`:
+
+| batch | **llamd** | **llama.cpp** | |
+|---|---|---|---|
+| 1 | **93.3** | 69.9 | llamd **+33%** |
+| 2 | 136.5 | **145.8** | llama.cpp +7% |
+| 4 | 178.3 | **229.5** | llama.cpp +29% |
+| 8 | 212.7 | **290.9** | llama.cpp +37% |
+
+*(llama.cpp's batch-1 figure is 69.9 in this harness and 94.4–95.6 under
+`llama-bench`; the harnesses differ in context allocation. Within
+`llama-batched-bench` the two engines are measured identically.)*
+
+**LLAMD wins at batch 1 and loses from batch 2 up.** Scaling tells the story:
+llamd 1.46×/1.91×/2.28×, llama.cpp 2.09×/3.28×/4.16×.
+
+The reason is structural, not a tuning gap. At batch 1 the problem is pure
+bandwidth and a tight matrix-vector kernel is the right answer — which is why
+llamd's batch-1 path, after §8's fusions, is 1.08× llama.cpp. At batch B the
+arithmetic intensity rises by B and the right answer becomes a matrix-*matrix*
+kernel: tile over rows *and* sequences, hold a weight tile in registers, reuse it
+across every sequence in the tile. llama.cpp does that. LLAMD's batched kernel
+still computes one row per wave with `nseq` accumulators, which shares the weight
+*read* but not the weight *register*.
+
+### State of the fork
+
+| | llamd | llama.cpp | |
+|---|---|---|---|
+| single-stream decode | **102.98 tok/s** | 94.4 – 95.6 | **1.08×** |
+| batch 8 aggregate | 212.7 | 290.9 | 0.73× |
+| token agreement | 5/5 every run | — | exact |
+
+The premise — that a kernel written for RDNA4 can beat CUDA hipified to it —
+holds where it was tested: batch-1 decode, which is what a single user
+experiences. It does not yet hold for batched serving, and the reason is
+identified rather than mysterious.
+
+**Next, concretely:** a row×sequence register-tiled Q6_K kernel. Each wave takes
+4 rows and all `nseq` sequences, decoding a weight block once into registers and
+consuming it 4×nseq times instead of nseq times. That is the change that turns
+2.28× scaling into something nearer 4×, and it is the last structural gap between
+this engine and llama.cpp.

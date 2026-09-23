@@ -143,9 +143,13 @@ instead. The bar depends on configuration, so both are recorded.
 **LLAMD is faster than llama.cpp on this card: 101.1-102.1 tok/s against
 94.4-95.6**, measured warmed over 64 generated tokens, emitting the same tokens
 as the CPU reference and llama.cpp on all five agreement prompts. That is
-1.07-1.10x. See [benchmarks.md](benchmarks.md) §8-§10, including three
-optimisations that measured well standalone and were rejected by the engine: HIP
-graph capture, split-k, and a planar Q6_K repack for 16-byte loads.
+1.07-1.10x. Batched decode reaches **212.7 tok/s aggregate at batch 8**, though llama.cpp
+scales better there (290.9) because it switches to matrix-matrix kernels with
+register tiling while LLAMD still runs one row per wave.
+
+See [benchmarks.md](benchmarks.md) §8-§11, including three optimisations that
+measured well standalone and were rejected by the engine: HIP graph capture,
+split-k, and a planar Q6_K repack for 16-byte loads.
 
 The earlier milestone, kept for the reasoning that produced it:
 

@@ -24,7 +24,7 @@
 
 use llamd_core::{Error, Result};
 use llamd_models::Model;
-use llamd_rocm::{DevBuf, op};
+use llamd_rocm::{DevBuf, bop, op};
 
 /// One layer's weights, already on the device.
 struct DeviceLayer {
@@ -97,6 +97,8 @@ pub struct DeviceModel {
     kc: Vec<DevBuf>,
     vc: Vec<DevBuf>,
     max_kv: usize,
+    /// Sequences this instance's buffers are sized for.
+    max_seq: usize,
     s: Scratch,
     /// Bytes of weights uploaded, for reporting.
     weight_bytes: usize,
@@ -238,6 +240,14 @@ impl DeviceModel {
     /// serve — the KV cache is allocated once, because growing it mid-token
     /// would mean a device allocation inside the hot path.
     pub fn load(model: &Model, max_kv: usize) -> Result<Self> {
+        Self::load_batched(model, max_kv, 1)
+    }
+
+    /// Load with room for `max_seq` concurrent sequences.
+    ///
+    /// Activations and the KV cache scale with `max_seq`; the weights do not,
+    /// which is the entire point of batching.
+    pub fn load_batched(model: &Model, max_kv: usize, max_seq: usize) -> Result<Self> {
         // Everything queues on a stream of our own: the default stream cannot
         // be captured into a graph.
         llamd_rocm::stream_init()?;
@@ -351,7 +361,17 @@ impl DeviceModel {
             });
         }
 
-        let f = |n: usize| DevBuf::zeroed(n * 4);
+        if max_seq == 0 || max_seq > llamd_rocm::max_seq().max(1) {
+            return Err(Error::malformed(
+                "device model",
+                format!(
+                    "max_seq {max_seq} outside 1..={}",
+                    llamd_rocm::max_seq().max(1)
+                ),
+            ));
+        }
+        // Every activation carries a sequence dimension. The weights do not.
+        let f = |n: usize| DevBuf::zeroed(n * max_seq * 4);
         // The largest activation any matvec consumes decides the quantized
         // activation scratch: attn_out takes n_head*hd, the output projection
         // n_embd, the experts n_ff_expert.
@@ -360,6 +380,9 @@ impl DeviceModel {
         // any single projection's input.
         let max_act = n_embd.max(n_head * hd).max(n_used * n_ffe);
         let max_blocks = max_act.div_ceil(256);
+        // `ad` is indexed by (sequence, expert, block) on the down projection,
+        // which is the widest use.
+        let ad_len = max_blocks.max((n_ffe / 256) * n_used);
 
         let s = Scratch {
             x: f(n_embd)?,
@@ -369,11 +392,11 @@ impl DeviceModel {
             k: f(kv_dim)?,
             v: f(kv_dim)?,
             attn: f(n_head * hd)?,
-            aq: DevBuf::zeroed(max_blocks * 256)?,
-            ad: f(max_blocks)?,
+            aq: DevBuf::zeroed(max_blocks * 256 * max_seq)?,
+            ad: f(ad_len)?,
             router_logits: f(hp.n_expert)?,
             router_probs: f(hp.n_expert)?,
-            expert_ids: DevBuf::zeroed(n_used * 4)?,
+            expert_ids: DevBuf::zeroed(n_used * 4 * max_seq)?,
             expert_w: f(n_used)?,
             e_gate: f(n_used * n_ffe)?,
             e_up: f(n_used * n_ffe)?,
@@ -382,17 +405,17 @@ impl DeviceModel {
             scores: f(n_head * max_kv)?,
             logits: f(hp.n_vocab)?,
             amax_v: f(ARGMAX_BLOCKS)?,
-            amax_i: DevBuf::zeroed(ARGMAX_BLOCKS * 4)?,
-            out_token: DevBuf::zeroed(4)?,
-            meta: DevBuf::zeroed(8)?,
+            amax_i: DevBuf::zeroed(ARGMAX_BLOCKS * 4 * max_seq)?,
+            out_token: DevBuf::zeroed(4 * max_seq)?,
+            meta: DevBuf::zeroed(8 * max_seq)?,
             inv: f(1)?,
         };
 
         let mut kc = Vec::with_capacity(hp.n_layer);
         let mut vc = Vec::with_capacity(hp.n_layer);
         for _ in 0..hp.n_layer {
-            kc.push(DevBuf::zeroed(max_kv * kv_dim * 4)?);
-            vc.push(DevBuf::zeroed(max_kv * kv_dim * 4)?);
+            kc.push(DevBuf::zeroed(max_kv * kv_dim * 4 * max_seq)?);
+            vc.push(DevBuf::zeroed(max_kv * kv_dim * 4 * max_seq)?);
         }
 
         Ok(DeviceModel {
@@ -405,6 +428,7 @@ impl DeviceModel {
             kc,
             vc,
             max_kv,
+            max_seq,
             s,
             weight_bytes: need as usize,
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
@@ -693,6 +717,243 @@ impl DeviceModel {
             return Err(Error::other(format!("argmax returned {}", got[0])));
         }
         Ok(got[0] as u32)
+    }
+
+    /// Decode `nseq` INDEPENDENT sequences in one pass, returning one token each.
+    ///
+    /// WHY THIS IS THE ONLY REMAINING LEVER. At batch 1 a token reads 2.485 GB
+    /// of weights at ~260 GB/s cold, and three attempts to raise that bandwidth
+    /// were rejected by whole-token measurement (HIP graphs, split-k, planar
+    /// Q6_K — benchmarks.md §8-§10). Batching attacks the bytes instead: the Q,
+    /// K, V and O projections and the output projection are the SAME matrices
+    /// for every sequence, so one read serves `nseq` tokens.
+    ///
+    /// WHAT DOES NOT DIVIDE. The routed experts. Each sequence picks its own 8
+    /// of 128 and at batch 2 only ~3% coincide, so 1486 of the 2485 MB is paid
+    /// per sequence regardless. Per-token traffic therefore goes to 1986 MB at
+    /// batch 2 (1.25x) and 1736 at batch 4 (1.43x) — not 1/2 and 1/4.
+    ///
+    /// INDEPENDENT is load-bearing. Token N+1 of a sequence depends on token N,
+    /// so these must be separate streams or speculative candidates; this raises
+    /// aggregate throughput, not single-stream latency.
+    pub fn forward_batch(&mut self, tokens: &[u32], positions: &[usize]) -> Result<Vec<u32>> {
+        let nseq = tokens.len();
+        if nseq == 0 || nseq != positions.len() {
+            return Err(Error::malformed(
+                "batch forward",
+                format!("{nseq} tokens, {} positions", positions.len()),
+            ));
+        }
+        if nseq > self.max_seq {
+            return Err(Error::malformed(
+                "batch forward",
+                format!("{nseq} sequences exceeds the {} allocated", self.max_seq),
+            ));
+        }
+        for (i, &p) in positions.iter().enumerate() {
+            if p >= self.max_kv {
+                return Err(Error::malformed(
+                    "batch forward",
+                    format!(
+                        "sequence {i} position {p} beyond the {} allocated",
+                        self.max_kv
+                    ),
+                ));
+            }
+        }
+
+        // meta is [token0, pos0, token1, pos1, ...] so a kernel reads its own
+        // sequence's pair with one index.
+        let mut meta = Vec::with_capacity(nseq * 2);
+        for (t, p) in tokens.iter().zip(positions) {
+            meta.push(*t as i32);
+            meta.push(*p as i32);
+        }
+        self.s.meta.upload_i32(&meta)?;
+
+        let hp = &self.hp;
+        let (n_embd, n_head, n_head_kv, hd) = (hp.n_embd, hp.n_head, hp.n_head_kv, hp.n_head_dim);
+        let kv_dim = hp.kv_dim();
+        let (n_expert, n_used, n_ffe) = (hp.n_expert, hp.n_expert_used, hp.n_ff_expert);
+        let eps = hp.rms_eps;
+        let fb = hp.rope_freq_base;
+        let max_kv = self.max_kv;
+        let s = &self.s;
+
+        bop::embed(&self.tok_embd, &s.meta, &s.x, self.embd_blocks, nseq)?;
+
+        for il in 0..hp.n_layer {
+            let l = &self.layers[il];
+
+            // One norm and one quantization serve Q, K and V for every sequence.
+            bop::rms_norm_quant(
+                &s.x,
+                &l.attn_norm,
+                &s.xb,
+                &s.aq,
+                &s.ad,
+                &s.inv,
+                n_embd,
+                nseq,
+                eps,
+            )?;
+            // THE SHARING: three matrices, nseq sequences, each weight byte read
+            // once and used nseq times.
+            bop::matvec_x3(
+                (&l.attn_q, &l.attn_k, &l.attn_v),
+                &s.aq,
+                &s.ad,
+                (&s.q, &s.k, &s.v),
+                n_embd / 256,
+                (n_head * hd, kv_dim, kv_dim),
+                nseq,
+            )?;
+
+            bop::norm_rope(
+                &s.q,
+                l.attn_q_norm.as_ref(),
+                &s.meta,
+                n_head,
+                hd,
+                nseq,
+                fb,
+                eps,
+            )?;
+            bop::k_norm_rope_store(
+                &s.k,
+                l.attn_k_norm.as_ref(),
+                &s.v,
+                &self.kc[il],
+                &self.vc[il],
+                &s.meta,
+                n_head_kv,
+                hd,
+                max_kv,
+                nseq,
+                fb,
+                eps,
+            )?;
+            bop::attention(
+                &s.q,
+                &self.kc[il],
+                &self.vc[il],
+                &s.attn,
+                &s.scores,
+                &s.meta,
+                n_head,
+                n_head_kv,
+                hd,
+                max_kv,
+                nseq,
+            )?;
+
+            bop::quantize(&s.attn, &s.aq, &s.ad, ((n_head * hd) / 256) * nseq)?;
+            bop::matvec(
+                &l.attn_out,
+                &s.aq,
+                &s.ad,
+                &s.xb2,
+                (n_head * hd) / 256,
+                n_embd,
+                nseq,
+            )?;
+            bop::add(&s.x, &s.xb2, &s.x, n_embd * nseq)?;
+
+            bop::rms_norm_quant(
+                &s.x,
+                &l.ffn_norm,
+                &s.xb,
+                &s.aq,
+                &s.ad,
+                &s.inv,
+                n_embd,
+                nseq,
+                eps,
+            )?;
+            bop::matvec_f32(
+                &l.ffn_gate_inp,
+                &s.xb,
+                &s.router_logits,
+                n_embd,
+                n_expert,
+                nseq,
+            )?;
+            bop::router(
+                &s.router_logits,
+                n_expert,
+                n_used,
+                &s.expert_ids,
+                &s.expert_w,
+                &s.router_probs,
+                nseq,
+            )?;
+
+            // No weight sharing here — each sequence routes independently — but
+            // still one launch, which the small expert matrices need for
+            // occupancy.
+            bop::grouped_x2(
+                &l.ffn_gate_exps,
+                &l.ffn_up_exps,
+                &s.expert_ids,
+                &s.aq,
+                &s.ad,
+                &s.e_gate,
+                &s.e_up,
+                n_embd / 256,
+                n_ffe,
+                n_used,
+                nseq,
+            )?;
+            bop::silu_mul(&s.e_gate, &s.e_up, &s.e_act, n_used * n_ffe * nseq)?;
+            bop::quantize(&s.e_act, &s.aq, &s.ad, ((n_used * n_ffe) / 256) * nseq)?;
+            bop::grouped_pa(
+                &l.ffn_down_exps,
+                &s.expert_ids,
+                &s.aq,
+                &s.ad,
+                &s.e_down,
+                n_ffe / 256,
+                n_embd,
+                n_used,
+                nseq,
+            )?;
+            bop::moe_combine_add(&s.e_down, &s.expert_w, &s.x, &s.x, n_used, n_embd, nseq)?;
+        }
+
+        bop::rms_norm_mul(&s.x, &self.output_norm, &s.xb, n_embd, nseq, eps)?;
+        bop::quantize(&s.xb, &s.aq, &s.ad, (n_embd / 256) * nseq)?;
+        bop::matvec(
+            &self.output,
+            &s.aq,
+            &s.ad,
+            &s.logits,
+            n_embd / 256,
+            hp.n_vocab,
+            nseq,
+        )?;
+        bop::argmax(
+            &s.logits,
+            hp.n_vocab,
+            &s.amax_v,
+            &s.amax_i,
+            &s.out_token,
+            ARGMAX_BLOCKS,
+            nseq,
+        )?;
+
+        // ONE synchronise for the whole batch.
+        llamd_rocm::sync()?;
+
+        let mut got = vec![0i32; nseq];
+        s.out_token.download_i32(&mut got)?;
+        let mut out = Vec::with_capacity(nseq);
+        for (i, &g) in got.iter().enumerate() {
+            if g < 0 || g as usize >= hp.n_vocab {
+                return Err(Error::other(format!("sequence {i} argmax returned {g}")));
+            }
+            out.push(g as u32);
+        }
+        Ok(out)
     }
 
     /// The logits for the last token, copied back. For comparing against the

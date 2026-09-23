@@ -21,7 +21,9 @@
 
 #![deny(unsafe_code)]
 
+pub mod batch;
 pub mod forward;
+pub use batch::{bop, max_seq};
 pub use forward::{DevBuf, free_memory, graph, op, stream_init, sync};
 
 use llamd_core::{Error, Result};

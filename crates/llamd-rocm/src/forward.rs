@@ -96,8 +96,13 @@ impl DevBuf {
         self.ptr
     }
 
-    fn as_f32(&self) -> *mut f32 {
+    pub(crate) fn as_f32(&self) -> *mut f32 {
         self.ptr as *mut f32
+    }
+
+    /// Read-only view, for kernel parameters declared `const float *`.
+    pub(crate) fn as_f32_const(&self) -> *const f32 {
+        self.ptr as *const f32
     }
 
     pub fn upload_bytes(&self, host: &[u8]) -> Result<()> {
