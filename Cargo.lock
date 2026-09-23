@@ -98,6 +98,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "llamd-rocm"
+version = "0.1.0"
+dependencies = [
+ "llamd-core",
+ "llamd-quant",
+ "llamd-tensor",
+]
+
+[[package]]
 name = "llamd-runtime"
 version = "0.1.0"
 dependencies = [
@@ -143,6 +152,7 @@ dependencies = [
  "llamd-gguf",
  "llamd-models",
  "llamd-quant",
+ "llamd-rocm",
  "llamd-runtime",
  "llamd-tensor",
  "llamd-tokenizer",

@@ -30,7 +30,7 @@ inheriting the reference's design would defeat the purpose.
 | 13 | `src/llama-batch.cpp` | 1,161 | `llamd-runtime` | **Reimplement.** Batch assembly and splitting. | Batched output equals sequential output | `—` |
 | 14 | MoE routing | — | `llamd-models` | **Done.** softmax over 128 → top-8 → renormalise, with ggml's 6.1e-5 clamp and ties broken toward the lower index. | **Selection identical to ggml across 4 seeds**, set-compared since ggml documents top-k order as unspecified. Weights validated by invariant only — see the gap below | `ok` |
 | 15 | `src/llama-sampler.cpp` | 4,431 | `llamd-sampling` | **Reimplement the chain.** temp, top-k, top-p, min-p, typical, penalties, mirostat, grammar. | Same seed + same logits → same token. Exact. | `—` |
-| 16 | `ggml-cuda` (hipified) | 46,122 | `llamd-rocm` | **Do NOT port.** This is the whole point: a backend written *for* RDNA4 rather than CUDA-with-substitutions. wave32/64, LDS budget, matrix cores, occupancy. | Every kernel vs the CPU reference; then benchmarked against hipified llama.cpp on the same card | `—` |
+| 16 | `ggml-cuda` (hipified) | 46,122 | `llamd-rocm` | **First kernel written for RDNA4**, not ported: Q6_K×Q8_K matvec, one wave32 per output row, no LDS staging. ROCm detected at build time so the workspace still builds without a GPU. | **Matches the CPU reference at 7.6e-8 – 4.8e-6** on the real card, held to `REDUCTION` since both run the same integer arithmetic. Wave-width control fails at 5.0e-1. Not yet benchmarked | `gpu` |
 | 17 | `ggml-vulkan` | 38,029 | `llamd-vulkan` | **Reimplement, first-class.** Portable path and a cross-check on ROCm: two independent GPU implementations disagreeing is a strong bug signal. | vs CPU reference; benchmarked vs llama.cpp Vulkan | `—` |
 | 18 | `tools/server` | — | `llamd-server` | **Reimplement, narrow.** OpenAI-compatible surface only — what OpenCode actually calls. Not the full upstream server. | OpenCode drives LLAMD end to end | `—` |
 | 19 | `src/llama-chat.cpp` | 1,032 | `llamd-server` | **Reimplement Qwen templates only.** Getting the chat template wrong makes an instruct model continue the document instead of following it — a failure this project has already met once. | Rendered prompt must be byte-identical to the oracle's | `—` |
@@ -72,6 +72,25 @@ amplifies arbitrarily small numerical differences into arbitrarily large output
 differences.** A ROCm or Vulkan kernel must match the quantized path, not
 approximate it — and it should be compared against ggml at `REDUCTION`, not
 against the f32 reference at `QUANTIZED_MATMUL`.
+
+## The first RDNA4 kernel, and why it is shaped that way
+
+`q6k_q8k_matvec` assigns **one wave32 per output row**, accumulates in
+registers, and reduces with `__shfl_down` — no LDS, no barriers.
+
+The CUDA idiom would stage a tile of weights through shared memory so several
+outputs can reuse it. With a single activation vector **there is no reuse**:
+each weight is read exactly once. Staging would add a barrier and an occupancy
+cost for nothing. That is the first place the two designs part company, and it
+is the kind of decision a hipified CUDA backend cannot make.
+
+Reported correctly now, after two mistakes worth keeping in mind on this
+hardware: `multiProcessorCount` counts **workgroup processors**, each holding
+two CUs, so the R9700's 64 CUs appear as 32; and `major`/`minor` give `12.0`
+where `gcnArchName` gives the real `gfx1201`, which is what hipcc compiled for.
+
+Benchmarking against hipified llama.cpp is the next step and the one that
+decides whether the project's premise holds.
 
 ## Gaps worth knowing about
 
