@@ -23,6 +23,7 @@
 
 pub mod batch;
 pub mod forward;
+pub mod udot;
 pub use batch::{bop, max_seq};
 pub use forward::{DevBuf, free_memory, graph, op, stream_init, sync};
 
@@ -629,6 +630,57 @@ pub struct PlanarWeights {
 }
 
 impl PlanarWeights {
+    /// Host-in, host-out udot4 matvec for `nseq` activations, for validation.
+    ///
+    /// The udot4 route replaces 16 multiply-accumulates per 16 weights with 4
+    /// dot instructions, using the identity in llamd_udot.hip. Values must agree
+    /// with the scalar reference to within reduction error; the integer part of
+    /// the identity is exact, only the float regrouping differs.
+    pub fn matvec_udot(&self, acts: &[llamd_quant::BlockQ8K], nseq: usize) -> Result<Vec<f32>> {
+        if nseq == 0 || acts.len() != self.blocks * nseq {
+            return Err(Error::Shape {
+                expected: vec![self.blocks * nseq],
+                got: vec![acts.len()],
+            });
+        }
+        let mut qs = Vec::with_capacity(acts.len() * llamd_quant::QK_K);
+        let mut ad = Vec::with_capacity(acts.len());
+        for b in acts {
+            qs.extend_from_slice(&b.qs);
+            ad.push(b.d);
+        }
+        #[cfg(not(rocm))]
+        {
+            let _ = (qs, ad);
+            Err(Error::unsupported("rocm", "not built with ROCm support"))
+        }
+        #[cfg(rocm)]
+        {
+            let mut out = vec![0.0f32; self.rows * nseq];
+            let _guard = SCRATCH.lock().expect("scratch mutex");
+            // SAFETY: the planar buffer holds rows*blocks blocks and `off` came
+            // from the same layout; qs/ad are sized blocks*nseq and out
+            // rows*nseq, matching what the entry point is told.
+            #[allow(unsafe_code)]
+            let rc = unsafe {
+                crate::udot::ffi::llamd_u_matvec_host(
+                    self.buf.ptr(),
+                    self.off.as_ptr(),
+                    qs.as_ptr(),
+                    ad.as_ptr(),
+                    out.as_mut_ptr(),
+                    self.blocks as i32,
+                    self.rows as i32,
+                    nseq as i32,
+                )
+            };
+            if rc != 0 {
+                return Err(Error::other("HIP udot matvec failed"));
+            }
+            Ok(out)
+        }
+    }
+
     /// Repack interleaved Q6_K bytes and upload.
     pub fn upload(src: &[u8], rows: usize, blocks: usize) -> Result<Self> {
         let packed = llamd_quant::repack_q6k_planar(src, rows, blocks)?;

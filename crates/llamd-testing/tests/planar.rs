@@ -145,3 +145,164 @@ fn planar_is_faster_on_a_cold_tensor() {
         "planar and interleaved disagree by {worst:.3e} (rms {rms:.3e})"
     );
 }
+
+#[test]
+fn udot_agrees_with_the_scalar_reference() {
+    // The udot4 route replaces 16 multiply-accumulates per 16 weights with 4
+    // dot instructions, via the identity
+    //   S sc*(w-32)*a = sc*[S w*b - 128*S w - 32*S b + 65536],  b = a+128.
+    // The integer part of that is exact; only the float regrouping differs, so
+    // the bar is reduction error and a failure here means the identity or the
+    // packing is wrong, not that the hardware rounded differently.
+    if skip_no_gpu("udot_agrees_with_the_scalar_reference") {
+        return;
+    }
+    for (rows, k, nseq) in [
+        (256usize, 768usize, 1usize), // expert down: 3 blocks
+        (1024, 2048, 1),              // the common shape
+        (512, 4096, 1),               // attn_out: 16 blocks
+        (1024, 2048, 4),              // batched
+        (256, 2048, 8),               // widest batch
+    ] {
+        let blocks = k / QK_K;
+        let w = weights(rows, blocks, 97 + rows as u32);
+        let pw = llamd_rocm::PlanarWeights::upload(&w, rows, blocks).expect("planar");
+
+        // A different activation per sequence, so a kernel that used sequence
+        // 0's activation for all of them would fail rather than pass.
+        let mut acts = Vec::new();
+        let mut per_seq = Vec::new();
+        for s in 0..nseq {
+            let x: Vec<f32> = (0..k)
+                .map(|i| ((i as f32) * 0.017 + s as f32 * 1.7).sin())
+                .collect();
+            let a = quantize_q8_k(&x);
+            per_seq.push(a.clone());
+            acts.extend(a);
+        }
+
+        let got = pw.matvec_udot(&acts, nseq).expect("udot matvec");
+        assert_eq!(got.len(), rows * nseq);
+
+        let mut worst = 0.0f32;
+        let mut rms_acc = 0.0f64;
+        let mut n = 0usize;
+        for (s, a) in per_seq.iter().enumerate() {
+            for r in 0..rows {
+                let want = dot_q6k_q8k(&w[r * blocks * B..(r + 1) * blocks * B], a, k);
+                let have = got[s * rows + r];
+                worst = worst.max((have - want).abs());
+                rms_acc += (want as f64) * (want as f64);
+                n += 1;
+            }
+        }
+        let rms = (rms_acc / n as f64).sqrt() as f32;
+        let bound = REDUCTION * rms.max(1.0);
+        assert!(
+            worst <= bound,
+            "{rows}x{k} nseq {nseq}: worst deviation {worst:.3e} exceeds {bound:.3e} (rms {rms:.3e})"
+        );
+        eprintln!(
+            "  {rows:>5} rows, {blocks:>2} blocks, nseq {nseq}: worst {worst:.3e}, bound {bound:.3e}"
+        );
+    }
+}
+
+#[test]
+fn the_fused_quantize_matches_the_host() {
+    // The fused kernel does rms-scale, quantize, bias to unsigned and group-sum
+    // in one pass. Each of those is a place to be subtly wrong, and a wrong
+    // activation shows up as a wrong token forty-eight layers later — which is
+    // exactly how it was found. Compared here against quantize_q8_k directly.
+    if skip_no_gpu("the_fused_quantize_matches_the_host") {
+        return;
+    }
+    let mut x: Vec<f32> = Vec::new();
+    x.extend((0..QK_K).map(|i| ((i as f32) * 0.11).sin() * 3.0));
+    x.extend((0..QK_K).map(|i| -((i as f32) * 0.07).cos().abs() * 2.0)); // negative peak
+    x.extend(std::iter::repeat_n(0.0f32, QK_K)); // all zero
+    x.extend((0..QK_K).map(|i| if i % 2 == 0 { 0.5 } else { -0.5 })); // ties
+    x.extend((0..QK_K).map(|i| if i == 0 { -8.0 } else { 8.0 })); // upper clamp
+
+    let host = quantize_q8_k(&x);
+    let (qb, sb, d) = llamd_rocm::udot::quantize_host(&x).expect("fused quantize");
+    assert_eq!(d.len(), host.len());
+
+    for (b, h) in host.iter().enumerate() {
+        assert_eq!(h.d, d[b], "block {b} scale");
+        for i in 0..QK_K {
+            // The biased form must be exactly q + 128.
+            let want = (h.qs[i] as i32 + 128) as u8;
+            assert_eq!(
+                qb[b * QK_K + i],
+                want,
+                "block {b} element {i}: host q {} -> want biased {want}, got {}",
+                h.qs[i],
+                qb[b * QK_K + i]
+            );
+        }
+        for g in 0..16 {
+            let want: i32 = (0..16).map(|j| h.qs[g * 16 + j] as i32 + 128).sum();
+            assert_eq!(sb[b * 16 + g], want, "block {b} group {g} sum");
+        }
+    }
+    eprintln!(
+        "  {} blocks: biased quants and group sums all exact",
+        host.len()
+    );
+}
+
+#[test]
+fn the_fused_norm_quant_matches_the_host() {
+    if skip_no_gpu("the_fused_norm_quant_matches_the_host") {
+        return;
+    }
+    let n = 2048usize;
+    let nseq = 2usize;
+    let w: Vec<f32> = (0..n)
+        .map(|i| 0.9 + ((i as f32) * 0.003).sin() * 0.2)
+        .collect();
+    let mut x = Vec::with_capacity(n * nseq);
+    for s in 0..nseq {
+        x.extend((0..n).map(|i| ((i as f32) * 0.013 + s as f32 * 2.1).sin() * 1.7));
+    }
+    let eps = 1e-6f32;
+    let (out, qb, _sb, d) =
+        llamd_rocm::udot::norm_quant_host(&x, &w, nseq, eps).expect("fused norm_quant");
+
+    for s in 0..nseq {
+        let xs = &x[s * n..(s + 1) * n];
+        let ss: f32 = xs.iter().map(|v| v * v).sum();
+        let inv = 1.0 / (ss / n as f32 + eps).sqrt();
+        let want: Vec<f32> = xs.iter().zip(&w).map(|(v, ww)| v * inv * ww).collect();
+        let worst = want
+            .iter()
+            .zip(&out[s * n..(s + 1) * n])
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < 1e-4,
+            "sequence {s}: f32 output differs by {worst:e}"
+        );
+
+        let hq = quantize_q8_k(&want);
+        for (b, h) in hq.iter().enumerate() {
+            assert!(
+                (h.d - d[s * hq.len() + b]).abs() <= h.d.abs() * 1e-5,
+                "sequence {s} block {b} scale: host {} gpu {}",
+                h.d,
+                d[s * hq.len() + b]
+            );
+            for i in 0..QK_K {
+                let want_b = (h.qs[i] as i32 + 128) as u8;
+                let got_b = qb[s * n + b * QK_K + i];
+                assert_eq!(
+                    got_b, want_b,
+                    "sequence {s} block {b} element {i}: host {} gpu {}",
+                    want_b, got_b
+                );
+            }
+        }
+    }
+    eprintln!("  fused norm+quant matches the host for {nseq} sequences");
+}

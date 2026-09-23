@@ -53,6 +53,7 @@ fn main() {
         "kernels/llamd.hip",
         "kernels/llamd_forward.hip",
         "kernels/llamd_batch.hip",
+        "kernels/llamd_udot.hip",
     ];
     let mut objs = Vec::new();
     for src in sources {

@@ -24,31 +24,30 @@
 
 use llamd_core::{Error, Result};
 use llamd_models::Model;
-use llamd_rocm::{DevBuf, bop, op};
+use llamd_rocm::{DevBuf, PlanarWeights, bop, op, udot};
 
 /// One layer's weights, already on the device.
 struct DeviceLayer {
     attn_norm: DevBuf,
-    /// INTERLEAVED, i.e. ggml's own 210-byte blocks, and not planar.
+    /// PLANAR: four 16-byte-aligned planes rather than ggml's 210-byte
+    /// interleaved blocks.
     ///
-    /// A planar repack into four 16-byte-aligned planes is implemented
-    /// (`llamd_quant::repack_q6k_planar`, `llamd_rocm::PlanarWeights`) and
-    /// measures 439.7 -> 510.6 GB/s on a 243 MiB tensor. In the engine it
-    /// measured 102.0 tok/s against 103.1 interleaved — no better, and 18.3 s
-    /// of repack at load against 3.8 s. Kept as evidence, not used. See
-    /// benchmarks.md §9.
-    attn_q: DevBuf,
-    attn_k: DevBuf,
-    attn_v: DevBuf,
+    /// The repack was measured neutral at batch 1 (§10), and it is a
+    /// PRECONDITION for the udot4 kernel: packing four weights into a uint32
+    /// needs four consecutive value indices sharing a scale group, which the
+    /// interleaved layout cannot give a lane. That is what the repack is for.
+    attn_q: PlanarWeights,
+    attn_k: PlanarWeights,
+    attn_v: PlanarWeights,
     attn_q_norm: Option<DevBuf>,
     attn_k_norm: Option<DevBuf>,
-    attn_out: DevBuf,
+    attn_out: PlanarWeights,
     ffn_norm: DevBuf,
     /// The MoE gate. F32 in this model, not Q6_K.
     ffn_gate_inp: DevBuf,
-    ffn_gate_exps: DevBuf,
-    ffn_up_exps: DevBuf,
-    ffn_down_exps: DevBuf,
+    ffn_gate_exps: PlanarWeights,
+    ffn_up_exps: PlanarWeights,
+    ffn_down_exps: PlanarWeights,
 }
 
 /// Activation buffers, allocated once and reused for every token.
@@ -77,6 +76,11 @@ struct Scratch {
     out_token: DevBuf,
     /// One float: 1/rms, handed from fk_rms_scale to fk_norm_quant.
     inv: DevBuf,
+    /// The activation biased to unsigned (q XOR 0x80) and its per-16 group sums.
+    /// udot4 is an UNSIGNED instruction; these two carry the correction that
+    /// makes it reproduce the signed dot product exactly.
+    qb: DevBuf,
+    sb: DevBuf,
     /// `[token, pos]`, device-resident.
     ///
     /// WHY THESE LIVE ON THE DEVICE. A captured HIP graph freezes its kernel
@@ -93,7 +97,7 @@ pub struct DeviceModel {
     embd_blocks: usize,
     layers: Vec<DeviceLayer>,
     output_norm: DevBuf,
-    output: DevBuf,
+    output: PlanarWeights,
     kc: Vec<DevBuf>,
     vc: Vec<DevBuf>,
     max_kv: usize,
@@ -228,6 +232,22 @@ fn up_quant(model: &Model, name: &str) -> Result<DevBuf> {
     DevBuf::from_bytes(raw(model, name)?).map_err(|e| Error::other(format!("{name}: {e}")))
 }
 
+/// Upload a Q6_K tensor repacked into planes, for 16-byte loads and udot4.
+fn up_planar(model: &Model, name: &str) -> Result<PlanarWeights> {
+    let info = model.info(name)?;
+    let k = info.dims[0] as usize;
+    let rows = info.elems() as usize / k;
+    let ty = llamd_quant::QuantType::from_ggml(info.ggml_type)?;
+    if ty != llamd_quant::QuantType::Q6K {
+        return Err(Error::unsupported(
+            "planar upload",
+            format!("{name} is {ty:?}, not Q6_K"),
+        ));
+    }
+    PlanarWeights::upload(raw(model, name)?, rows, k / 256)
+        .map_err(|e| Error::other(format!("{name}: {e}")))
+}
+
 /// Upload an F32 tensor. Norms and the MoE gate are stored F32, and
 /// `Model::tensor` returns them without conversion.
 fn up_f32(model: &Model, name: &str) -> Result<DevBuf> {
@@ -305,7 +325,7 @@ impl DeviceModel {
         let embd_blocks = n_embd / 256;
         let output_norm = up_f32(model, &model.output_norm)?;
         let output = match &model.output {
-            Some(o) => up_quant(model, o)?,
+            Some(o) => up_planar(model, o)?,
             None => {
                 return Err(Error::unsupported(
                     "device model",
@@ -319,9 +339,9 @@ impl DeviceModel {
             let l = &model.layers[il];
             layers.push(DeviceLayer {
                 attn_norm: up_f32(model, &l.attn_norm)?,
-                attn_q: up_quant(model, &l.attn_q)?,
-                attn_k: up_quant(model, &l.attn_k)?,
-                attn_v: up_quant(model, &l.attn_v)?,
+                attn_q: up_planar(model, &l.attn_q)?,
+                attn_k: up_planar(model, &l.attn_k)?,
+                attn_v: up_planar(model, &l.attn_v)?,
                 attn_q_norm: l
                     .attn_q_norm
                     .as_ref()
@@ -332,7 +352,7 @@ impl DeviceModel {
                     .as_ref()
                     .map(|n| up_f32(model, n))
                     .transpose()?,
-                attn_out: up_quant(model, &l.attn_out)?,
+                attn_out: up_planar(model, &l.attn_out)?,
                 ffn_norm: up_f32(model, &l.ffn_norm)?,
                 ffn_gate_inp: up_f32(
                     model,
@@ -340,19 +360,19 @@ impl DeviceModel {
                         .as_ref()
                         .ok_or_else(|| Error::unsupported("layer", "no MoE router"))?,
                 )?,
-                ffn_gate_exps: up_quant(
+                ffn_gate_exps: up_planar(
                     model,
                     l.ffn_gate_exps
                         .as_ref()
                         .ok_or_else(|| Error::unsupported("layer", "no gate experts"))?,
                 )?,
-                ffn_up_exps: up_quant(
+                ffn_up_exps: up_planar(
                     model,
                     l.ffn_up_exps
                         .as_ref()
                         .ok_or_else(|| Error::unsupported("layer", "no up experts"))?,
                 )?,
-                ffn_down_exps: up_quant(
+                ffn_down_exps: up_planar(
                     model,
                     l.ffn_down_exps
                         .as_ref()
@@ -409,6 +429,8 @@ impl DeviceModel {
             out_token: DevBuf::zeroed(4 * max_seq)?,
             meta: DevBuf::zeroed(8 * max_seq)?,
             inv: f(1)?,
+            qb: DevBuf::zeroed(ad_len * 256 * max_seq)?,
+            sb: DevBuf::zeroed(ad_len * 16 * 4 * max_seq)?,
         };
 
         let mut kc = Vec::with_capacity(hp.n_layer);
@@ -518,14 +540,19 @@ impl DeviceModel {
                 // and V projections fill the card alongside Q instead of
                 // running alone at 64 workgroups.
                 // nsub=4 measured: attn_q goes 38.8 -> 25.5 us, 177 -> 269 GB/s.
-                op::matvec_x3_splitk(
+                // PLANAR, not udot, at batch 1. Measured: udot gave 96.02
+                // tok/s against planar's 102.98 here, because a single sequence
+                // is bandwidth-bound and udot's packing and correction terms are
+                // pure added instructions with nothing to amortise them over.
+                // From batch 2 up the same kernel wins by 3-29% — see
+                // benchmarks.md §12.
+                let _ = nsub_qkv;
+                op::planar_x3(
                     (&l.attn_q, &l.attn_k, &l.attn_v),
                     &s.aq,
                     &s.ad,
                     (&s.q, &s.k, &s.v),
-                    n_embd / 256,
                     (n_head * hd, kv_dim_of(hp), kv_dim_of(hp)),
-                    nsub_qkv,
                 )?;
             });
 
@@ -562,20 +589,8 @@ impl DeviceModel {
             });
 
             phase!(attn_out, {
-                // attn_out is [4096 -> 2048]: 2048 rows is 2048 waves against
-                // a 4096-wave card, so one wave per row leaves half the GPU
-                // idle and it measured 202 GB/s. Four waves per row, each
-                // taking 4 of the 16 blocks.
                 op::quantize(&s.attn, &s.aq, &s.ad, (n_head * hd) / 256)?;
-                // nsub=1: the standalone bench liked 4 here, the engine did not.
-                op::matvec(
-                    &l.attn_out,
-                    &s.aq,
-                    &s.ad,
-                    &s.xb2,
-                    (n_head * hd) / 256,
-                    n_embd,
-                )?;
+                op::planar_matvec(&l.attn_out, &s.aq, &s.ad, &s.xb2, n_embd)?;
                 op::add(&s.x, &s.xb2, &s.x, n_embd)?;
             });
 
@@ -596,7 +611,8 @@ impl DeviceModel {
             phase!(experts, {
                 // Gate and up in one launch, for the same reason as q/k/v.
                 // nsub=2 measured: 44.5 -> 31.3 us per matrix, 232 -> 330 GB/s.
-                op::matvec_grouped_x2_splitk(
+                let _ = nsub_gu;
+                op::planar_grouped_x2(
                     &l.ffn_gate_exps,
                     &l.ffn_up_exps,
                     &s.expert_ids,
@@ -604,10 +620,8 @@ impl DeviceModel {
                     &s.ad,
                     &s.e_gate,
                     &s.e_up,
-                    n_embd / 256,
                     n_ffe,
                     n_used,
-                    nsub_gu,
                 )?;
                 // SiLU on the GATE only, then elementwise with up.
                 op::silu_mul(&s.e_gate, &s.e_up, &s.e_act, n_used * n_ffe)?;
@@ -616,16 +630,15 @@ impl DeviceModel {
                 op::quantize(&s.e_act, &s.aq, &s.ad, (n_used * n_ffe) / 256)?;
                 // blocks is only 3 here, so nsub=2 is the most the shape allows.
                 // Measured 41.8 -> 35.0 us, 247 -> 295 GB/s.
-                op::matvec_grouped_per_act_splitk(
+                let _ = nsub_dn;
+                op::planar_grouped_per_act(
                     &l.ffn_down_exps,
                     &s.expert_ids,
                     &s.aq,
                     &s.ad,
                     &s.e_down,
-                    n_ffe / 256,
                     n_embd,
                     n_used,
-                    nsub_dn,
                 )?;
             });
 
@@ -636,7 +649,8 @@ impl DeviceModel {
 
         phase!(output, {
             op::rms_norm_mul(&s.x, &self.output_norm, &s.xb, n_embd, eps)?;
-            self.qmatvec(&self.output, &s.xb, &s.logits, n_embd, hp.n_vocab)?;
+            op::quantize(&s.xb, &s.aq, &s.ad, n_embd / 256)?;
+            op::planar_matvec(&self.output, &s.aq, &s.ad, &s.logits, hp.n_vocab)?;
             op::argmax(
                 &s.logits,
                 hp.n_vocab,
@@ -786,11 +800,12 @@ impl DeviceModel {
             let l = &self.layers[il];
 
             // One norm and one quantization serve Q, K and V for every sequence.
-            bop::rms_norm_quant(
+            udot::norm_quant(
                 &s.x,
                 &l.attn_norm,
                 &s.xb,
-                &s.aq,
+                &s.qb,
+                &s.sb,
                 &s.ad,
                 &s.inv,
                 n_embd,
@@ -799,12 +814,15 @@ impl DeviceModel {
             )?;
             // THE SHARING: three matrices, nseq sequences, each weight byte read
             // once and used nseq times.
-            bop::matvec_x3(
+            // udot4: 4 dot instructions per 16 weights per sequence, plus 4
+            // shared across all of them, where the previous kernel spent 16
+            // multiply-accumulates per sequence.
+            udot::x3(
                 (&l.attn_q, &l.attn_k, &l.attn_v),
-                &s.aq,
+                &s.qb,
+                &s.sb,
                 &s.ad,
                 (&s.q, &s.k, &s.v),
-                n_embd / 256,
                 (n_head * hd, kv_dim, kv_dim),
                 nseq,
             )?;
@@ -847,23 +865,16 @@ impl DeviceModel {
                 nseq,
             )?;
 
-            bop::quantize(&s.attn, &s.aq, &s.ad, ((n_head * hd) / 256) * nseq)?;
-            bop::matvec(
-                &l.attn_out,
-                &s.aq,
-                &s.ad,
-                &s.xb2,
-                (n_head * hd) / 256,
-                n_embd,
-                nseq,
-            )?;
+            udot::quantize(&s.attn, &s.qb, &s.sb, &s.ad, ((n_head * hd) / 256) * nseq)?;
+            udot::matvec(&l.attn_out, &s.qb, &s.sb, &s.ad, &s.xb2, n_embd, nseq)?;
             bop::add(&s.x, &s.xb2, &s.x, n_embd * nseq)?;
 
-            bop::rms_norm_quant(
+            udot::norm_quant(
                 &s.x,
                 &l.ffn_norm,
                 &s.xb,
-                &s.aq,
+                &s.qb,
+                &s.sb,
                 &s.ad,
                 &s.inv,
                 n_embd,
@@ -891,28 +902,34 @@ impl DeviceModel {
             // No weight sharing here — each sequence routes independently — but
             // still one launch, which the small expert matrices need for
             // occupancy.
-            bop::grouped_x2(
+            udot::grouped_x2(
                 &l.ffn_gate_exps,
                 &l.ffn_up_exps,
                 &s.expert_ids,
-                &s.aq,
+                &s.qb,
+                &s.sb,
                 &s.ad,
                 &s.e_gate,
                 &s.e_up,
-                n_embd / 256,
                 n_ffe,
                 n_used,
                 nseq,
             )?;
             bop::silu_mul(&s.e_gate, &s.e_up, &s.e_act, n_used * n_ffe * nseq)?;
-            bop::quantize(&s.e_act, &s.aq, &s.ad, ((n_used * n_ffe) / 256) * nseq)?;
-            bop::grouped_pa(
+            udot::quantize(
+                &s.e_act,
+                &s.qb,
+                &s.sb,
+                &s.ad,
+                ((n_used * n_ffe) / 256) * nseq,
+            )?;
+            udot::grouped_per_act(
                 &l.ffn_down_exps,
                 &s.expert_ids,
-                &s.aq,
+                &s.qb,
+                &s.sb,
                 &s.ad,
                 &s.e_down,
-                n_ffe / 256,
                 n_embd,
                 n_used,
                 nseq,
@@ -921,13 +938,13 @@ impl DeviceModel {
         }
 
         bop::rms_norm_mul(&s.x, &self.output_norm, &s.xb, n_embd, nseq, eps)?;
-        bop::quantize(&s.xb, &s.aq, &s.ad, (n_embd / 256) * nseq)?;
-        bop::matvec(
+        udot::quantize(&s.xb, &s.qb, &s.sb, &s.ad, (n_embd / 256) * nseq)?;
+        udot::matvec(
             &self.output,
-            &s.aq,
+            &s.qb,
+            &s.sb,
             &s.ad,
             &s.logits,
-            n_embd / 256,
             hp.n_vocab,
             nseq,
         )?;

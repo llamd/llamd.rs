@@ -863,3 +863,116 @@ identified rather than mysterious.
 consuming it 4×nseq times instead of nseq times. That is the change that turns
 2.28× scaling into something nearer 4×, and it is the last structural gap between
 this engine and llama.cpp.
+
+---
+
+## 12. The register-tiled kernel: udot4, and llamd ahead at batch 1 and 2
+
+§11 named the gap precisely: at batch B the arithmetic intensity rises by B and
+the right answer is a matrix-*matrix* kernel that reuses a weight tile across
+sequences. llama.cpp does that; llamd was still computing one row per wave with
+`nseq` accumulators, sharing the weight *read* but not the weight *register*.
+
+### What RDNA4 actually has
+
+`__builtin_amdgcn_sdot4` needs target feature `dot1-insts`, which gfx1201 does
+not have. It has **`udot4` and `udot8` — unsigned**. Probed, not assumed.
+
+That looks fatal: Q6_K weights are signed after the `−32`, and Q8_K activations
+are signed int8. It is not, because of an identity. Q6_K stores `w` in 0..63
+*before* the subtraction, and an int8 `a` becomes unsigned by `b = a + 128`,
+which is exactly `a XOR 0x80`. Over a group of 16 values sharing one scale:
+
+```
+  Σ sc·(w−32)·a  =  sc · [ Σw·b  −  128·Σw  −  32·Σb  +  32·128·16 ]
+```
+
+- **`Σw·b`** — 4 `udot4` per 16 values, **per sequence**
+- **`Σw`** — 4 `udot4` per 16 values, **shared by every sequence** ← the tile
+- **`Σb`** — precomputed per activation group; Q8_K's `bsums` is this quantity
+
+So 16 weights against `nseq` sequences cost `4·nseq + 4` dot instructions where
+the previous kernel spent `16·nseq` MACs. At batch 8 that is **36 against 128**.
+
+The identity was verified on device against the reference before the kernel was
+written, including the signed and clamping cases.
+
+**Planar is a precondition, which is what it was for.** Packing four weights
+into a `uint32` needs four *consecutive* value indices, and they must share a
+scale group. ggml's interleaved layout gives a lane two strided bytes per half;
+the planar repack (§10, measured neutral on its own) gives it 16 consecutive
+ones — exactly one scale group.
+
+### Results
+
+| batch | **llamd** | **llama.cpp** | |
+|---|---|---|---|
+| 1 | **103.76** | 94.4 – 95.6 | **llamd 1.09×** |
+| 2 | **148.36** | 145.84 | **llamd 1.02×** |
+| 4 | 214.85 | 229.51 | llama.cpp 1.07× |
+| 8 | 279.69 | 290.90 | llama.cpp 1.04× |
+
+Against §11's kernel: batch 2 136.5 → 148.4, batch 4 178.3 → 214.9, batch 8
+212.7 → 279.7 — **+31% at batch 8**. Every batch width still produces exactly
+the tokens the single-sequence path produces, and the planar and udot kernels
+now agree on all eight test prompts.
+
+**udot4 loses at batch 1** (96.0 against planar's 103.8) and the engine uses
+planar there. A single sequence is purely bandwidth-bound, so the packing and
+the correction terms are added instructions with nothing to amortise them over.
+The crossover is between batch 1 and 2.
+
+Fusing the bias-and-sum pass into the quantizer was worth the rest: it had been
+a separate kernel at each of the five quantization points in a layer, 240 extra
+launches per batched pass, plus a full read and write of the activation.
+
+### A bug worth recording, because of how it presented
+
+Mid-refactor, batched output became fluent nonsense — `"The"` produced `"arf"`,
+then `"-no"` on a rerun of the same input. Non-determinism says uninitialised or
+aliased memory, not arithmetic, and that is what it was: two `rms_norm_quant`
+call sites failed to be replaced while the edit that *removed* the `bias_sums`
+after them succeeded, so the expert path consumed the biased activation left
+over from the previous `attn_out` quantization.
+
+What made it cheap to find was refusing to guess. The fused quantizer and the
+fused norm+quantizer were each compared against `quantize_q8_k` directly and
+both were exact, which moved suspicion off the kernels and onto the wiring in
+one step. **A kernel that is correct in isolation and wrong in the engine is a
+plumbing bug**, and the way to tell them apart is a test at the boundary.
+
+It also exposed a weakness in the batch test: it compared the batched path
+against `forward()`, which after this change runs a *different kernel*. The
+reference is now `forward_batch` at `nseq=1`, holding the kernel fixed and
+varying only the batch width, with the cross-kernel comparison reported
+separately.
+
+### Row tiling: built, measured, neutral
+
+One row per wave means every row re-reads the whole activation — for `attn_q` at
+batch 8 that is ~67 MB of activation reads per layer against 6.9 MB of weights.
+Cache-resident, so it does not appear as bandwidth; it appears as load
+instructions, which is what remains after `udot4` cuts the arithmetic.
+
+A templated `UR`-rows-per-wave kernel loads each activation group once and
+consumes it `UR` times. In the engine at batch 8: **tile 1 → 279.18, tile 2 →
+280.37, tile 4 → 278.65 tok/s.** Inside the run-to-run spread. Default stays 1.
+
+The honest caveat: tiling is wired only into `uk_matvec`, which serves
+`attn_out` and the output projection. `x3` and the grouped expert kernels carry
+most of the traffic and are not tiled. **Extending it there is the open work**,
+and the sweep stays in the test suite so the answer keeps coming from the engine.
+
+### Where the fork stands
+
+| | llamd | llama.cpp | |
+|---|---|---|---|
+| single-stream decode | **103.76 tok/s** | 94.4 – 95.6 | **1.09×** |
+| batch 2 | **148.36** | 145.84 | **1.02×** |
+| batch 4 | 214.85 | 229.51 | 0.94× |
+| batch 8 | 279.69 | 290.90 | 0.96× |
+| token agreement | exact, every run | — | |
+
+An RDNA4-native engine written in Rust is ahead of hipified CUDA at batch 1 and
+batch 2, and within 4–6% at batch 4 and 8 — from 0.004× four commits ago. The
+remaining gap is one identified piece of work, not a mystery.
