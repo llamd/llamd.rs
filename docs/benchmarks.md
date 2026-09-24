@@ -1436,3 +1436,121 @@ kernel costs more in latency hiding than it saves in instructions at this tile
 size, so the next thing worth trying is a larger tile — which needs the
 accumulator loop compile-time bounded through specialization constants, and is now
 a measurement about the expert path rather than the attention path.
+
+---
+
+## 18. Specialization constants: a wider tile without the register cost
+
+§17 ended by naming the next experiment: a larger prefill tile, which needs the
+accumulator loop compile-time bounded. This is that experiment, and it produced
+two results — one expected, one not.
+
+### The obstacle, measured before it was fixed
+
+Every matvec-shaped shader holds its per-token partial sums in `float acc[MAX_SEQ]`.
+GLSL has no variable-length arrays, so `MAX_SEQ` is the widest batch the engine
+will ever run, and **every** dispatch pays for it — a batch-1 decode allocates 32
+(now 64) registers and uses one.
+
+Raising `MAX_SEQ` from 32 to 64, so a 64-token tile could exist at all, was
+therefore a regression before it was an improvement:
+
+| | prefill, tile 32 |
+|---|---|
+| `MAX_SEQ 32` | 598.5 t/s |
+| `MAX_SEQ 64`, unspecialized | **541.7 t/s** |
+
+`RADV_DEBUG=shaderstats` explains it exactly: 192 VGPRs, which on gfx1201 is
+**one wave per SIMD** instead of three. The kernel is latency-bound — it waits on
+memory — so occupancy is the thing it cannot afford to lose.
+
+### The fix
+
+```glsl
+layout(constant_id = 0) const int ACC_N = 64;
+...
+float acc[ACC_N];
+for (int i = 0; i < ACC_N; ++i) { if (i >= count) break; ... }
+```
+
+A specialization constant is substituted at pipeline-creation time, so the array
+is sized and the loop unrolled per *variant*, from one source. The host builds
+seven variants of each of the four shaders — `ACC_N` ∈ {1, 2, 4, 8, 16, 32, 64} —
+and `dispatch_acc` picks the narrowest variant that fits the call. Register cost
+now spans **12 to 192 VGPRs** where it was flat at 192.
+
+### What it is worth, A/B in one process
+
+`ops::set_acc_specialized(false)` forces every dispatch to the widest variant,
+which is the unspecialized engine exactly. Alternating arms, best of 3:
+
+| batch | specialized | widest variant | |
+|---|---|---|---|
+| 1 | **126.46 t/s** | 58.41 t/s | **2.165×** |
+| 2 | **200.24** | 102.88 | 1.946× |
+| 4 | **276.89** | 167.39 | 1.654× |
+| 8 | **410.96** | 276.04 | 1.489× |
+
+The gain shrinks with batch size, as it should: at batch 8 the wide accumulator is
+half used, at batch 1 it is 1/64 used.
+
+This also settled a false alarm. Decode read ~105 t/s in a single run just after
+the `MAX_SEQ` change and looked 4% down. The card was idle (21 °C, 9 W), so it was
+not thermal — and best-of-3 puts batch 1 at 126.46 t/s, **above every earlier
+reading in this document**. The dip was single-run noise, not a regression.
+
+### And the answer to §17's actual question: tile 64 loses
+
+With the register cost removed, the tile sweep could finally be run honestly:
+
+| prefill tile | tok/s |
+|---|---|
+| 16 | 542.3 |
+| **32** | **638.7** |
+| 64 | 551.0 |
+
+**Tile 64 loses despite sharing 1.77× more expert weight reads** — 4.07 tokens per
+chosen expert against 2.29 at tile 32. The widest variant is still the 192-VGPR
+one, so the tile that most needs sharing is also the tile with the least
+occupancy, and on a latency-bound kernel that trade goes the wrong way. Tile 32
+stays the default. The experiment §17 proposed was worth running and the answer
+was no.
+
+### A cache-size consequence that had to be fixed first
+
+A prefill tile shares one KV slice (`kv_stride = 0`), so the number of tile slots
+and the number of KV slots are different quantities. They had been the same field.
+At 64 they would have allocated **7.55 GB** of KV cache against 0.94 GB at 8, on a
+31.9 GiB card holding a 23.37 GiB model — it would not have fit. `load_with_slots`
+now takes them separately.
+
+### Prompt ingestion, end to end
+
+| prompt | §15 | §17 | **now** | vs one-at-a-time |
+|---|---|---|---|---|
+| 64 | 613.7 | 810.7 | **889.0** | 7.79× |
+| 128 | 611.1 | 774.4 | **843.7** | 7.97× |
+| 256 | 549.9 | 695.7 | **751.4** | 7.54× |
+| 512 | 487.8 | 598.5 | **639.1** | 8.38× |
+
+A 512-token prompt: **5.83 s → 0.801 s.**
+
+### Correctness
+
+Specialization changes which binary runs, per dispatch, per batch width — exactly
+the kind of change that can be right at one width and wrong at another. So the
+whole ladder is re-checked: `vulkan_oracle` 6/6 against the scalar reference,
+prefill equal to sequential decode across every tile width from 1 to 32,
+expert-major equal to token-major, and all five prompts still token-for-token
+equal to llama.cpp. 131 passed, 0 failed, 18 ignored.
+
+### Where llamd stands against llama.cpp
+
+| | llamd | llama.cpp |
+|---|---|---|
+| decode, 1 stream | **113 – 126** | 94.4 – 95.6 |
+| decode, batch 8 | **397 – 411** | 290.9 |
+| **prefill (pp512)** | 639.1 | **1632** |
+
+Prefill is **2.55×** behind, from 3.3× at §15. Decode is ahead by 1.18–1.33× at one
+stream and 1.37–1.41× at batch 8.
