@@ -72,13 +72,30 @@ void main() {
     uint row = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
     if (row >= pc.rows) return;
 
-    float acc[ACC_N];
-    for (int i = 0; i < ACC_N; ++i) acc[i] = 0.0;
-    Q6K_ACC(w, pc.ql_u, pc.qh_u, pc.sc_u, pc.d_u, row * pc.blocks, 0u, 0u, 0u, ACC_N, acc)
+    // TOKEN CHUNKING, and it is what lets the prefill tile be wide.
+    //
+    // The accumulator is ACC_N wide whatever pc.nseq is, so 512 tokens run as 16
+    // chunks of 32 instead of needing 512 floats per lane. The weight row is
+    // re-read once per chunk — exactly what a tile of 32 already paid, so the
+    // attention path costs no more than before — and in exchange the TILE can be
+    // wide enough that an expert sees every token of its group at once. That is
+    // where the traffic is: 96.5% of it. See benchmarks.md §19.
+    //
+    // `base` and `live` derive only from pc.nseq and ACC_N, both uniform, so every
+    // lane of the subgroup runs the same number of iterations and the subgroupAdd
+    // below is not reached divergently.
+    for (uint base = 0u; base < pc.nseq; base += uint(ACC_N)) {
+        uint live = min(uint(ACC_N), pc.nseq - base);
+        float acc[ACC_N];
+        for (int i = 0; i < ACC_N; ++i) acc[i] = 0.0;
+        Q6K_ACC(w, pc.ql_u, pc.qh_u, pc.sc_u, pc.d_u, row * pc.blocks,
+                base * pc.blocks * 64u, base * pc.blocks * 16u, base * pc.blocks,
+                ACC_N, live, acc)
 
-    for (int s = 0; s < ACC_N; ++s) {
-        if (uint(s) >= pc.nseq) break;
-        float t = subgroupAdd(acc[s]);
-        if (subgroupElect()) outv[uint(s) * pc.rows + row] = t;
+        for (int s = 0; s < ACC_N; ++s) {
+            if (uint(s) >= live) break;
+            float t = subgroupAdd(acc[s]);
+            if (subgroupElect()) outv[(base + uint(s)) * pc.rows + row] = t;
+        }
     }
 }

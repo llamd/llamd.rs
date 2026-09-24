@@ -20,8 +20,16 @@
 // AQ   activation base, in uints
 // AS   activation group-sum base
 // AA   activation scale base
-// NS   how many sequences to accumulate into ACC
-// ACC  inout float[MAX_SEQ]
+// NS    the COMPILE-TIME accumulator width to loop over (ACC_N, or 1)
+// NLIVE the RUNTIME number of those slots that hold a real sequence
+// ACC   inout float[MAX_SEQ]
+//
+// NS AND NLIVE ARE SEPARATE ON PURPOSE. NS must be a constant or the loop cannot
+// unroll and ACC lands in scratch — that was the whole point of specializing it.
+// But a wide tile is chunked ACC_N tokens at a time, so the LAST chunk is short,
+// and looping the full NS there would read activation slots past the tile. Hence
+// a constant bound with a runtime break, which is the same shape the expert
+// shaders already use.
 //
 // NS IS EXPLICIT, NOT pc.nseq, and that distinction is load-bearing. For the
 // attention and output projections every sequence multiplies the same matrix, so
@@ -40,7 +48,7 @@
 // weight buffer.
 //
 // Requires pc.blocks.
-#define Q6K_ACC(WB, QLU, QHU, SCU, DU, RI, AQ, AS, AA, NS, ACC)                \
+#define Q6K_ACC(WB, QLU, QHU, SCU, DU, RI, AQ, AS, AA, NS, NLIVE, ACC)         \
 {                                                                              \
     uint _nu4 = pc.blocks * 8u;                                                \
     uint _qlr = (QLU) + (RI) * 32u;                                            \
@@ -94,6 +102,7 @@
         int _cl = -128 * int(_swl) + 32 * 128 * 16;                              \
         int _ch = -128 * int(_swh) + 32 * 128 * 16;                              \
         for (uint _s = 0u; _s < uint(NS); ++_s) {                                 \
+            if (_s >= uint(NLIVE)) break;                                        \
             uint _ab = (AQ) + _s * pc.blocks * 64u + _bu;                        \
             uint _wl = dotPacked4x8AccSatEXT(_l0, qb[_ab + 0u], 0u);             \
             _wl = dotPacked4x8AccSatEXT(_l1, qb[_ab + 1u], _wl);                 \

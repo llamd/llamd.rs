@@ -36,6 +36,7 @@ const SHADERS: &[&str] = &[
     "moe_group",
     "q6k_expert_major",
     "q6k_expert_major_pa",
+    "q6k_expert_rt",
 ];
 
 fn main() {

@@ -21,9 +21,27 @@
 
 #![deny(unsafe_code)]
 
-/// The widest tile the shaders' accumulator arrays are sized for — must match
-/// `MAX_SEQ` in `shaders/common.glsl`, asserted by `max_seq_matches_the_shaders`.
+/// The widest ACCUMULATOR the shaders are sized for — must match `MAX_SEQ` in
+/// `shaders/common.glsl`, asserted by `max_seq_matches_the_shaders`.
+///
+/// This is no longer the widest tile. The matvec-shaped shaders chunk the token
+/// dimension internally, so `MAX_SEQ` bounds how many tokens one chunk holds in
+/// registers, while [`MAX_TILE`] bounds how many a dispatch may carry.
 pub const MAX_SEQ: usize = 64;
+
+/// The most tokens one dispatch may carry.
+///
+/// SEPARATE FROM [`MAX_SEQ`] BECAUSE THEY STOPPED BEING THE SAME THING. While the
+/// accumulator width and the tile width were one number, a wide tile meant wide
+/// `float acc[]` arrays, 192 VGPRs and one wave per SIMD — so tile 64 measured
+/// SLOWER than tile 32 despite moving 1.8x less weight traffic (benchmarks.md
+/// §18, §19). Chunking inside the shaders unties them: the tile can be 512 for
+/// the sake of expert weight reuse while a chunk stays 32 for the sake of
+/// occupancy.
+///
+/// It bounds buffer sizing, not registers — per-token activations, scores and
+/// expert outputs are allocated for this many tokens.
+pub const MAX_TILE: usize = 512;
 
 pub mod ops;
 pub use ops::{Pipeline, Push, begin, end_and_wait, subgroup_size};
@@ -392,7 +410,7 @@ impl PlanarWeights {
         nseq: usize,
         iters: usize,
     ) -> Result<()> {
-        if nseq == 0 || nseq > MAX_SEQ {
+        if nseq == 0 || nseq > MAX_TILE {
             return Err(Error::malformed("vulkan matvec", format!("nseq {nseq}")));
         }
         if out.bytes() < self.rows * nseq * 4 {

@@ -43,6 +43,7 @@ pub enum Pipeline {
     MoeGroup = 20,
     Q6kExpertMajor = 21,
     Q6kExpertMajorPa = 22,
+    Q6kExpertRt = 23,
 }
 
 impl Pipeline {
@@ -72,10 +73,11 @@ impl Pipeline {
             Pipeline::MoeGroup => "moe_group",
             Pipeline::Q6kExpertMajor => "q6k_expert_major",
             Pipeline::Q6kExpertMajorPa => "q6k_expert_major_pa",
+            Pipeline::Q6kExpertRt => "q6k_expert_rt",
         }
     }
 
-    pub const ALL: [Pipeline; 23] = [
+    pub const ALL: [Pipeline; 24] = [
         Pipeline::Q6kMatvec,
         Pipeline::Q6kX3,
         Pipeline::Q6kGemm,
@@ -99,6 +101,7 @@ impl Pipeline {
         Pipeline::MoeGroup,
         Pipeline::Q6kExpertMajor,
         Pipeline::Q6kExpertMajorPa,
+        Pipeline::Q6kExpertRt,
     ];
 }
 
@@ -268,6 +271,63 @@ pub fn acc_specialized() -> bool {
     ACC_SPECIALIZED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// How many tokens one accumulator chunk holds.
+///
+/// The matvec-shaped shaders loop the token dimension in chunks of their `ACC_N`,
+/// so this is what the host asks for and therefore which specialized variant runs.
+/// It is the whole knob that decides the prefill trade: a chunk is how many tokens
+/// share one weight read, and also how many floats a lane must hold. 32 measured
+/// best — 16 moves at 87% of peak bandwidth but doubles expert traffic, 64 halves
+/// the traffic again but drops to 33% of peak. Swept in `vulkan_prefill.rs`.
+static TOKEN_CHUNK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(32);
+
+/// Set the chunk width. 0 means "no chunking": ask for the full token count, which
+/// is the pre-chunking behaviour and what the A/B arm uses.
+pub fn set_token_chunk(n: usize) {
+    TOKEN_CHUNK.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn token_chunk() -> usize {
+    TOKEN_CHUNK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Rows one lane of the row-tiled expert kernel accumulates. Must match `ROWS` in
+/// `shaders/q6k_expert_rt.comp`.
+pub const RT_ROWS: usize = 4;
+
+/// Tokens per chunk in the row-tiled kernel. `RT_ROWS * RT_ACC` accumulators is
+/// the register budget, and 64 is where this card falls to 2 waves per SIMD, so
+/// raising one means lowering the other.
+pub const RT_ACC: usize = 16;
+
+/// On by default: measured faster at every tile width and bit-exact against the
+/// kernel it replaces (`row_tiled_experts_equal_the_untiled_kernel`). It is a
+/// modest 1.03x — see benchmarks.md §20 for why it cannot be more than ~1.2x.
+static EXPERT_RT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Use the row-tiled expert kernel instead of the one-row-per-subgroup one.
+pub fn set_expert_rt(on: bool) {
+    EXPERT_RT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn expert_rt_enabled() -> bool {
+    EXPERT_RT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Workgroups to cover `rows` when each lane group owns `RT_ROWS` of them.
+fn groups_for_rows_tiled(rows: usize) -> u32 {
+    let per = rows_per_workgroup().max(1) * RT_ROWS;
+    rows.div_ceil(per) as u32
+}
+
+/// The accumulator width to request for a dispatch carrying `nseq` tokens.
+fn acc_for(nseq: usize) -> usize {
+    match token_chunk() {
+        0 => nseq,
+        c => nseq.min(c),
+    }
+}
+
 /// Guard an output buffer against what a shader will write. An undersized
 /// storage buffer is not a fault in Vulkan — the write is simply dropped or
 /// clamped — so it would surface as wrong numbers, not an error.
@@ -389,7 +449,7 @@ pub fn matvec(
         p,
         groups_for_rows(rows),
         1,
-        nseq,
+        acc_for(nseq),
     )
 }
 
@@ -487,7 +547,7 @@ pub fn matvec_x3(
         p,
         groups_for_rows(rows.0 + rows.1 + rows.2),
         1,
-        nseq,
+        acc_for(nseq),
     )
 }
 
@@ -973,8 +1033,9 @@ pub fn expert_major(
         p,
         groups_for_rows(rows),
         n_expert as u32,
-        // A group can hold at most every token in the tile.
-        nseq,
+        // A group can hold every token in the tile, and the shader chunks it, so
+        // what is requested here is the CHUNK width, not the group's size.
+        acc_for(nseq),
     )
 }
 
@@ -1006,6 +1067,46 @@ pub fn expert_major_per_act(
         p,
         groups_for_rows(rows),
         n_expert as u32,
-        nseq,
+        acc_for(nseq),
+    )
+}
+
+/// The routed expert projections, expert-major AND row-tiled: one activation load
+/// feeds `RT_ROWS` rows of dots.
+///
+/// `by_slot` picks which index the activation is gathered by — the token for gate
+/// and up, the (token, slot) PAIR for down, because each expert consumed its own
+/// silu(gate)*up. One shader serves both; getting this flag wrong produces fluent
+/// nonsense rather than an error.
+#[allow(clippy::too_many_arguments)]
+pub fn expert_row_tiled(
+    w: &PlanarWeights,
+    qb: &VkBuf,
+    sb: &VkBuf,
+    ad: &VkBuf,
+    out: &VkBuf,
+    g: (&VkBuf, &VkBuf, &VkBuf, &VkBuf),
+    rows: usize,
+    n_used: usize,
+    nseq: usize,
+    n_expert: usize,
+    by_slot: bool,
+) -> Result<()> {
+    need(out, rows * n_used * nseq, "expert_row_tiled out")?;
+    let p = planes(w)
+        .u(4, w.blocks())
+        .u(5, rows)
+        .u(6, n_used)
+        .u(7, nseq)
+        .u(8, usize::from(by_slot));
+    dispatch_acc(
+        Pipeline::Q6kExpertRt,
+        &[w.buf(), qb, sb, ad, out, g.0, g.1, g.2, g.3],
+        p,
+        groups_for_rows_tiled(rows),
+        n_expert as u32,
+        // The shader's ACC_N is its token chunk, and the register budget is
+        // RT_ROWS * ACC_N — so this asks for RT_ACC, never the tile width.
+        nseq.min(RT_ACC),
     )
 }

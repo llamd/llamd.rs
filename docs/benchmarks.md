@@ -1646,3 +1646,117 @@ So the order is forced, and it is the opposite of what §16 tried:
 
 Doing 2 before 1 would measure nothing: at 69% of memory peak the ALU is not the
 limit, which is the same mistake §16 made and the same reason it is recorded.
+
+---
+
+## 20. The wide-tile expert GEMM: built, and the two models it refuted
+
+§19 laid out an ordered plan whose first step was worth 2.8×: widen the prefill
+tile so each expert's weights are read once instead of once per 32-token tile.
+Both halves of that were built. The first was worth **0%**, the second **3%**, and
+what they ruled out is worth more than what they gained.
+
+### What was built
+
+**Token chunking, in the four matvec-shaped shaders.** `float acc[ACC_N]` no
+longer bounds the tile: the shaders loop the token dimension in chunks of `ACC_N`
+internally, re-reading the weight row per chunk. `MAX_SEQ` (64) is now the
+accumulator width and the new `MAX_TILE` (512) is the tile width — they had been
+one number, which is what capped the tile at 32.
+
+**A row-tiled expert kernel**, `q6k_expert_rt.comp`, the 24th pipeline. The
+activation index `qb[ab]` depends on `(token, K)` and **not on row**, so with one
+row per subgroup every activation load feeds exactly one row of dots. This one
+hoists the token loop above a row loop: one load, `ROWS` rows of dots. Counted per
+lane per K-group:
+
+| | 1 row × 32 tokens | 4 rows × 16 tokens |
+|---|---|---|
+| weight loads | 8 | 32 |
+| activation loads | 352 | 176 |
+| work units | 32 | 64 |
+| **loads per unit** | **11.25** | **3.25** |
+
+### Result 1: the traffic model was wrong
+
+| prefill tile | before | after chunking |
+|---|---|---|
+| 32 | 631.7 | 659.5 |
+| **64** | **550.8** | **681.9** |
+| 128 | — | 676.4 |
+| 256 | — | 669.1 |
+| 512 | — | 670.8 |
+
+Chunking **removed the tile-64 cliff** — 550.8 → 681.9, and that part worked
+exactly as intended. But the surface is then **flat from 64 to 512**, where §19's
+model predicted 5.5× from the 13.8× drop in expert weight traffic. A 2-D sweep of
+tile against chunk is flat in both:
+
+| tile | chunk 8 | chunk 16 | chunk 32 | chunk 64 |
+|---|---|---|---|---|
+| 32 | 631.8 | 644.9 | 636.4 | 636.8 |
+| 64 | 652.1 | **666.5** | 657.0 | 543.7 |
+| 512 | 620.8 | 633.0 | 644.6 | 542.6 |
+
+`RADV_DEBUG=shaderstats` rules out the usual suspects across all 161 pipeline
+variants: VGPRs 12/24/48/72/96 with only the `ACC_N=64` variants at 192, **zero
+spilled registers and zero scratch anywhere**. At chunk 32 that is 5–7 waves per
+SIMD. And at tile 512 the engine moves 24.8 GB in 0.76 s — **31 GB/s, 5% of
+peak**. So above tile 64 it is neither bandwidth-bound nor occupancy-bound.
+
+### Result 2: the load-count model was wrong too
+
+| tile | 1 row | 4 rows | |
+|---|---|---|---|
+| 32 | 638.0 | 663.1 | 1.039× |
+| 64 | 662.6 | **681.4** | 1.029× |
+| 512 | 645.0 | 670.1 | 1.039× |
+
+Cutting inner-loop loads per unit of work by 3.5× is worth **3%**.
+
+### What that proves, and it is the useful part
+
+Two independent kernel-level improvements to the expert path — 13.8× less weight
+traffic, 3.5× fewer loads — produced 3% between them. The expert matmuls cannot be
+where the time is. §17's token-major A/B bounds it directly: token-major reads
+2.3× more expert weight at tile 32 and cost 1.23× overall, so if `f` is the expert
+matmuls' share of prefill time,
+
+    f × 2.3 + (1 − f) = 1.23   →   f ≈ 0.18
+
+**The routed expert matmuls are ~18% of prefill time.** They are 96.5% of its
+weight traffic and 67% of its arithmetic, and they are 18% of its wall clock. No
+amount of work on that kernel can exceed 1.2×, and two attempts have now returned
+1.03× of it.
+
+So §19's factorisation was wrong in its first term. The 2.8× that llama.cpp gains
+between ubatch 32 and 512 without coopmat is not expert weight reuse — llamd now
+has that reuse and gained nothing. It has to be the other 82%: the per-token
+attention half, its norms, RoPE, the O(T²) scores, the quantize steps and the
+combine, which in llamd are ~20 separate dispatches per layer over small kernels.
+
+### Where this leaves the engine
+
+| | before | after |
+|---|---|---|
+| pp512 | 654.6 t/s | **680.3** (+3.9%) |
+| pp256 | 851.8 | **880.6** |
+| pp128 | 992.5 | **1033.2** |
+| pp64 | 1028.0 | **1079.6** |
+| tile 64 | 550.8 | **681.9** (+23.8%) |
+| vs one-at-a-time | 7.46× | **7.71×** |
+
+Correctness held throughout: prefill equals sequential decode across **100**
+(tile, length) cases with a 290-token prompt that actually exercises multi-chunk
+paths — the previous 26-token prompt made every tile ≥32 a single chunk, so the
+chunk loop was never tested twice; the row-tiled kernel is **exact** against the
+one it replaces across 45 cases; 131 passed, 0 failed.
+
+### The next step is a profiler, not another model
+
+Two models have now predicted large gains and delivered ~0. Both were built on
+counting — traffic, then instructions — and both were consistent with every number
+available at the time. The thing neither could see is where 82% of the time goes.
+That needs RGP or RADV performance counters against the real 48-layer pass, and
+until it exists any further projection about prefill should be treated as what the
+last two turned out to be.

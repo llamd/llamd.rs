@@ -188,7 +188,7 @@ impl VulkanModel {
                 format!("kv_slots {kv_slots} must be in 1..={max_seq}"),
             ));
         }
-        if max_kv == 0 || max_seq == 0 || max_seq > llamd_vulkan::MAX_SEQ {
+        if max_kv == 0 || max_seq == 0 || max_seq > llamd_vulkan::MAX_TILE {
             return Err(Error::malformed(
                 "vulkan model",
                 format!("max_kv {max_kv}, max_seq {max_seq}"),
@@ -336,7 +336,11 @@ impl VulkanModel {
             s,
             weight_bytes,
             expert_major_min_tokens: 16,
-            prefill_tile: max_seq.min(32),
+            // The tile is no longer bounded by the accumulator width — the shaders
+            // chunk the token dimension — so this is now a free measurement rather
+            // than a register limit. 64 measured best and the surface is flat from
+            // 64 to 512, which is itself the finding: see benchmarks.md §20.
+            prefill_tile: max_seq.min(64),
             fuse_qkv: true,
         })
     }
@@ -554,30 +558,62 @@ impl VulkanModel {
                         n_used,
                         nseq,
                     )?;
-                    ops::expert_major(
-                        &l.ffn_gate_exps,
-                        &s.qb,
-                        &s.sb,
-                        &s.ad,
-                        &s.e_gate,
-                        grp,
-                        n_ffe,
-                        n_used,
-                        nseq,
-                        n_expert,
-                    )?;
-                    ops::expert_major(
-                        &l.ffn_up_exps,
-                        &s.qb,
-                        &s.sb,
-                        &s.ad,
-                        &s.e_up,
-                        grp,
-                        n_ffe,
-                        n_used,
-                        nseq,
-                        n_expert,
-                    )?;
+                    if ops::expert_rt_enabled() {
+                        ops::expert_row_tiled(
+                            &l.ffn_gate_exps,
+                            &s.qb,
+                            &s.sb,
+                            &s.ad,
+                            &s.e_gate,
+                            grp,
+                            n_ffe,
+                            n_used,
+                            nseq,
+                            n_expert,
+                            false,
+                        )?;
+                    } else {
+                        ops::expert_major(
+                            &l.ffn_gate_exps,
+                            &s.qb,
+                            &s.sb,
+                            &s.ad,
+                            &s.e_gate,
+                            grp,
+                            n_ffe,
+                            n_used,
+                            nseq,
+                            n_expert,
+                        )?;
+                    }
+                    if ops::expert_rt_enabled() {
+                        ops::expert_row_tiled(
+                            &l.ffn_up_exps,
+                            &s.qb,
+                            &s.sb,
+                            &s.ad,
+                            &s.e_up,
+                            grp,
+                            n_ffe,
+                            n_used,
+                            nseq,
+                            n_expert,
+                            false,
+                        )?;
+                    } else {
+                        ops::expert_major(
+                            &l.ffn_up_exps,
+                            &s.qb,
+                            &s.sb,
+                            &s.ad,
+                            &s.e_up,
+                            grp,
+                            n_ffe,
+                            n_used,
+                            nseq,
+                            n_expert,
+                        )?;
+                    }
                 } else {
                     ops::grouped(
                         &l.ffn_gate_exps,
@@ -616,18 +652,36 @@ impl VulkanModel {
                     // The grouping above still holds: the router has not run again. The
                     // activation here is per (token, slot), NOT per token, because each
                     // expert consumed its own silu(gate)*up.
-                    ops::expert_major_per_act(
-                        &l.ffn_down_exps,
-                        &s.qb,
-                        &s.sb,
-                        &s.ad,
-                        &s.e_down,
-                        (&s.g_start, &s.g_count, &s.p_token, &s.p_slot),
-                        n_embd,
-                        n_used,
-                        nseq,
-                        n_expert,
-                    )?;
+                    let dg = (&s.g_start, &s.g_count, &s.p_token, &s.p_slot);
+                    if ops::expert_rt_enabled() {
+                        ops::expert_row_tiled(
+                            &l.ffn_down_exps,
+                            &s.qb,
+                            &s.sb,
+                            &s.ad,
+                            &s.e_down,
+                            dg,
+                            n_embd,
+                            n_used,
+                            nseq,
+                            n_expert,
+                            // by_slot: the down input is per (token, slot).
+                            true,
+                        )?;
+                    } else {
+                        ops::expert_major_per_act(
+                            &l.ffn_down_exps,
+                            &s.qb,
+                            &s.sb,
+                            &s.ad,
+                            &s.e_down,
+                            dg,
+                            n_embd,
+                            n_used,
+                            nseq,
+                            n_expert,
+                        )?;
+                    }
                 } else {
                     ops::grouped_per_act(
                         &l.ffn_down_exps,
