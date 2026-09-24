@@ -195,6 +195,22 @@ impl Push {
 }
 
 fn dispatch(p: Pipeline, bufs: &[&VkBuf], push: Push, gx: u32, gy: u32) -> Result<()> {
+    dispatch_acc(p, bufs, push, gx, gy, 0)
+}
+
+/// `acc_n` selects the pipeline variant whose accumulator is at least that wide.
+/// Shaders with no accumulator pass 0 and ignore it.
+fn dispatch_acc(
+    p: Pipeline,
+    bufs: &[&VkBuf],
+    push: Push,
+    gx: u32,
+    gy: u32,
+    acc_n: usize,
+) -> Result<()> {
+    // 0 asks the C side for the widest variant, which is the pre-specialization
+    // behaviour and what the A/B compares against.
+    let acc_n = if acc_specialized() { acc_n } else { 0 };
     if bufs.len() > 12 {
         return Err(Error::malformed(
             "dispatch",
@@ -223,6 +239,7 @@ fn dispatch(p: Pipeline, bufs: &[&VkBuf], push: Push, gx: u32, gy: u32) -> Resul
                 push.0.as_ptr(),
                 gx,
                 gy,
+                acc_n as i32,
             )
         };
         if rc != 0 {
@@ -233,6 +250,22 @@ fn dispatch(p: Pipeline, bufs: &[&VkBuf], push: Push, gx: u32, gy: u32) -> Resul
         }
         Ok(())
     }
+}
+
+/// Whether a dispatch picks the accumulator variant matching its token count, or
+/// always takes the widest.
+///
+/// Exists so the specialization can be A/B'd in one process. The narrow variants
+/// should be strictly better — fewer registers, more waves — and if a measurement
+/// says otherwise that is worth knowing rather than arguing about.
+static ACC_SPECIALIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_acc_specialized(on: bool) {
+    ACC_SPECIALIZED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn acc_specialized() -> bool {
+    ACC_SPECIALIZED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Guard an output buffer against what a shader will write. An undersized
@@ -350,12 +383,13 @@ pub fn matvec(
     nseq: usize,
 ) -> Result<()> {
     let p = planes(w).u(4, w.blocks()).u(5, rows).u(6, nseq);
-    dispatch(
+    dispatch_acc(
         Pipeline::Q6kMatvec,
         &[w.buf(), qb, sb, ad, out],
         p,
         groups_for_rows(rows),
         1,
+        nseq,
     )
 }
 
@@ -437,7 +471,7 @@ pub fn matvec_x3(
         .u(14, rows.1)
         .u(15, rows.2)
         .u(16, nseq);
-    dispatch(
+    dispatch_acc(
         Pipeline::Q6kX3,
         &[
             w.0.buf(),
@@ -453,6 +487,7 @@ pub fn matvec_x3(
         p,
         groups_for_rows(rows.0 + rows.1 + rows.2),
         1,
+        nseq,
     )
 }
 
@@ -932,12 +967,14 @@ pub fn expert_major(
         .u(5, rows)
         .u(6, n_used)
         .u(7, nseq);
-    dispatch(
+    dispatch_acc(
         Pipeline::Q6kExpertMajor,
         &[w.buf(), qb, sb, ad, out, g.0, g.1, g.2, g.3],
         p,
         groups_for_rows(rows),
         n_expert as u32,
+        // A group can hold at most every token in the tile.
+        nseq,
     )
 }
 
@@ -963,11 +1000,12 @@ pub fn expert_major_per_act(
         .u(5, rows)
         .u(6, n_used)
         .u(7, nseq);
-    dispatch(
+    dispatch_acc(
         Pipeline::Q6kExpertMajorPa,
         &[w.buf(), qb, sb, ad, out, g.0, g.1, g.2, g.3],
         p,
         groups_for_rows(rows),
         n_expert as u32,
+        nseq,
     )
 }

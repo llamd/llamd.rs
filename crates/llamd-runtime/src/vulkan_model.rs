@@ -80,6 +80,14 @@ pub struct VulkanModel {
     vc: Vec<VkBuf>,
     max_kv: usize,
     max_seq: usize,
+    /// Independent-sequence slices the KV cache holds.
+    ///
+    /// DECOUPLED FROM `max_seq` on purpose. A prefill tile of N tokens needs ONE
+    /// slice — the slots are positions in one sequence and share the cache, which
+    /// is what `kv_stride = 0` expresses — while N independent decode sequences
+    /// need N. Sizing the cache by the prefill tile would cost 7.55 GB at 64
+    /// tokens against 0.94 GB at 8, on top of 23.4 GB of weights.
+    kv_slots: usize,
     s: Scratch,
     weight_bytes: usize,
     /// Tokens per pass at or above which the expert matmuls are grouped BY
@@ -102,8 +110,19 @@ pub struct VulkanModel {
     /// does not. The threshold is a field rather than a constant so the two can
     /// still be A/B'd in one process.
     pub expert_major_min_tokens: usize,
-    /// Tokens per prefill pass. Defaults to `max_seq`; smaller trades weight
-    /// sharing for registers, and which wins is measured rather than argued.
+    /// Tokens per prefill pass. Defaults to 32, MEASURED.
+    ///
+    /// A wider tile shares each expert's weights across more tokens — 4.07 tokens
+    /// per expert at 64 against 2.29 at 32 — and costs registers, because the
+    /// accumulator is that wide. On a 512-token prompt:
+    ///
+    ///   tile 16   542.3 tok/s
+    ///   tile 32   638.7 tok/s
+    ///   tile 64   551.0 tok/s
+    ///
+    /// 64 loses despite the extra sharing: its variant needs 192 VGPRs, which is
+    /// one wave per SIMD where 32 fits three, and this kernel is latency-bound —
+    /// the same reason the tiled GEMM attempt failed (benchmarks.md §16).
     pub prefill_tile: usize,
     /// Issue Q, K and V as one dispatch rather than three.
     ///
@@ -142,13 +161,31 @@ fn up_f32(model: &Model, name: &str) -> Result<VkBuf> {
 }
 
 impl VulkanModel {
+    /// `max_seq` is the widest pass — the prefill tile. `kv_slots` is how many
+    /// INDEPENDENT sequences may decode at once, and is what the KV cache is
+    /// sized by; prefill needs only one slice however wide its tile.
     pub fn load(model: &Model, max_kv: usize, max_seq: usize) -> Result<Self> {
+        Self::load_with_slots(model, max_kv, max_seq, max_seq.min(8))
+    }
+
+    pub fn load_with_slots(
+        model: &Model,
+        max_kv: usize,
+        max_seq: usize,
+        kv_slots: usize,
+    ) -> Result<Self> {
         llamd_vulkan::init()?;
         let hp = model.hparams.clone();
         if !hp.arch.is_moe() {
             return Err(Error::unsupported(
                 "vulkan model",
                 "only MoE models are wired up",
+            ));
+        }
+        if kv_slots == 0 || kv_slots > max_seq {
+            return Err(Error::malformed(
+                "vulkan model",
+                format!("kv_slots {kv_slots} must be in 1..={max_seq}"),
             ));
         }
         if max_kv == 0 || max_seq == 0 || max_seq > llamd_vulkan::MAX_SEQ {
@@ -281,8 +318,8 @@ impl VulkanModel {
         let mut kc = Vec::with_capacity(hp.n_layer);
         let mut vc = Vec::with_capacity(hp.n_layer);
         for _ in 0..hp.n_layer {
-            kc.push(VkBuf::new(max_kv * kv_dim * 4 * max_seq)?);
-            vc.push(VkBuf::new(max_kv * kv_dim * 4 * max_seq)?);
+            kc.push(VkBuf::new(max_kv * kv_dim * 4 * kv_slots)?);
+            vc.push(VkBuf::new(max_kv * kv_dim * 4 * kv_slots)?);
         }
 
         Ok(VulkanModel {
@@ -295,10 +332,11 @@ impl VulkanModel {
             vc,
             max_kv,
             max_seq,
+            kv_slots,
             s,
             weight_bytes,
             expert_major_min_tokens: 16,
-            prefill_tile: max_seq,
+            prefill_tile: max_seq.min(32),
             fuse_qkv: true,
         })
     }
@@ -309,6 +347,17 @@ impl VulkanModel {
 
     /// One pass over `nseq` independent sequences, returning a token each.
     pub fn forward_batch(&mut self, tokens: &[u32], positions: &[usize]) -> Result<Vec<u32>> {
+        if tokens.len() > self.kv_slots {
+            return Err(Error::malformed(
+                "forward_batch",
+                format!(
+                    "{} independent sequences exceeds the {} KV slices allocated; \
+                     a wider PREFILL tile does not imply more slices",
+                    tokens.len(),
+                    self.kv_slots
+                ),
+            ));
+        }
         let kv_dim = self.hp.kv_dim();
         let stride = self.max_kv * kv_dim;
         self.run(tokens, positions, stride, true)?

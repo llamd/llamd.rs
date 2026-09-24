@@ -19,12 +19,16 @@ use llamd_runtime::VulkanModel;
 use llamd_testing::{oracle_model, skip};
 
 fn open(max_kv: usize, max_seq: usize) -> Option<(Model, VulkanModel)> {
+    open_slots(max_kv, max_seq, max_seq.min(8))
+}
+
+fn open_slots(max_kv: usize, max_seq: usize, kv_slots: usize) -> Option<(Model, VulkanModel)> {
     let path = oracle_model()?;
     if !llamd_vulkan::available() {
         return None;
     }
     let model = Model::open(&path).ok()?;
-    VulkanModel::load(&model, max_kv, max_seq)
+    VulkanModel::load_with_slots(&model, max_kv, max_seq, kv_slots)
         .ok()
         .map(|v| (model, v))
 }
@@ -155,7 +159,9 @@ fn prefill_then_generate_reads_coherently() {
 fn prefill_throughput_against_one_at_a_time() {
     // The number the feature exists for: tokens per second of PROMPT INGESTION,
     // against the one-at-a-time path it replaces and against llama.cpp's pp512.
-    let Some((model, mut vk)) = open(600, llamd_vulkan::MAX_SEQ) else {
+    // A wide prefill tile with only 8 KV slices: a tile shares one slice, so
+    // sizing the cache by the tile would cost 7.55 GB instead of 0.94 GB.
+    let Some((model, mut vk)) = open_slots(600, llamd_vulkan::MAX_SEQ, 8) else {
         skip("prefill_throughput", "no model or no Vulkan");
         return;
     };
@@ -183,7 +189,7 @@ fn prefill_throughput_against_one_at_a_time() {
     eprintln!("\n  512-token prompt, prefill tile sweep:");
     eprintln!("  {:<7} {:>10} {:>13}", "tile", "seconds", "tokens/s");
     let mut best = (1usize, f64::MAX);
-    for tile in [1usize, 4, 8, 16, 32] {
+    for tile in [1usize, 4, 8, 16, 32, 64] {
         if tile > llamd_vulkan::MAX_SEQ {
             continue;
         }

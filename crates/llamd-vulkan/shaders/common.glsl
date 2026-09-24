@@ -27,7 +27,7 @@
 // bound that is a push constant, so the compiler cannot unroll and the array may
 // land in scratch. Whether raising it pays is therefore a question for the
 // engine, not for arithmetic — measured in vulkan_prefill.rs.
-#define MAX_SEQ 32
+#define MAX_SEQ 64
 #define WG 256
 
 // Q8_K quantization, shared by the two shaders that produce activations.

@@ -46,36 +46,51 @@ layout(push_constant) uniform Push {
 #include "common.glsl"
 #include "q6k.glsl"
 
+// The accumulator width, a SPECIALIZATION CONSTANT.
+//
+// WHY. `float acc[MAX_SEQ]` is sized at compile time, so raising MAX_SEQ from 32
+// to 64 cost every pass 192 VGPRs instead of 72 — one wave per SIMD instead of
+// three — even a pass using 32 slots. Measured: a 512-token prompt at tile 32
+// went from 598.5 to 541.7 tok/s purely from the wider array.
+//
+// Specialized, each pipeline variant carries only the slots it needs, and the
+// loops below unroll because the bound is a constant rather than a push value.
+// The host creates one variant per power of two and picks by token count.
+layout(constant_id = 0) const int ACC_N = 64;
+
 void main() {
     uint grow = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
     uint total = pc.rows0 + pc.rows1 + pc.rows2;
     if (grow >= total) return;
 
-    float acc[MAX_SEQ];
-    for (int i = 0; i < MAX_SEQ; ++i) acc[i] = 0.0;
+    float acc[ACC_N];
+    for (int i = 0; i < ACC_N; ++i) acc[i] = 0.0;
 
     if (grow < pc.rows0) {
         Q6K_ACC(w0, pc.q_ql, pc.q_qh, pc.q_sc, pc.q_d, grow * pc.blocks,
-                0u, 0u, 0u, pc.nseq, acc)
-        for (uint s = 0u; s < pc.nseq; ++s) {
+                0u, 0u, 0u, ACC_N, acc)
+        for (int s = 0; s < ACC_N; ++s) {
+            if (uint(s) >= pc.nseq) break;
             float t = subgroupAdd(acc[s]);
-            if (subgroupElect()) o0[s * pc.rows0 + grow] = t;
+            if (subgroupElect()) o0[uint(s) * pc.rows0 + grow] = t;
         }
     } else if (grow < pc.rows0 + pc.rows1) {
         uint row = grow - pc.rows0;
         Q6K_ACC(w1, pc.k_ql, pc.k_qh, pc.k_sc, pc.k_d, row * pc.blocks,
-                0u, 0u, 0u, pc.nseq, acc)
-        for (uint s = 0u; s < pc.nseq; ++s) {
+                0u, 0u, 0u, ACC_N, acc)
+        for (int s = 0; s < ACC_N; ++s) {
+            if (uint(s) >= pc.nseq) break;
             float t = subgroupAdd(acc[s]);
-            if (subgroupElect()) o1[s * pc.rows1 + row] = t;
+            if (subgroupElect()) o1[uint(s) * pc.rows1 + row] = t;
         }
     } else {
         uint row = grow - pc.rows0 - pc.rows1;
         Q6K_ACC(w2, pc.v_ql, pc.v_qh, pc.v_sc, pc.v_d, row * pc.blocks,
-                0u, 0u, 0u, pc.nseq, acc)
-        for (uint s = 0u; s < pc.nseq; ++s) {
+                0u, 0u, 0u, ACC_N, acc)
+        for (int s = 0; s < ACC_N; ++s) {
+            if (uint(s) >= pc.nseq) break;
             float t = subgroupAdd(acc[s]);
-            if (subgroupElect()) o2[s * pc.rows2 + row] = t;
+            if (subgroupElect()) o2[uint(s) * pc.rows2 + row] = t;
         }
     }
 }

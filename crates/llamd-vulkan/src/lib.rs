@@ -23,7 +23,7 @@
 
 /// The widest tile the shaders' accumulator arrays are sized for — must match
 /// `MAX_SEQ` in `shaders/common.glsl`, asserted by `max_seq_matches_the_shaders`.
-pub const MAX_SEQ: usize = 32;
+pub const MAX_SEQ: usize = 64;
 
 pub mod ops;
 pub use ops::{Pipeline, Push, begin, end_and_wait, subgroup_size};
@@ -454,6 +454,7 @@ pub(crate) mod ffi {
         pub fn llamd_vk_pipeline_count() -> c_int;
         pub fn llamd_vk_pipeline_name(i: c_int) -> *const c_char;
         pub fn llamd_vk_begin() -> c_int;
+        #[allow(clippy::too_many_arguments)]
         pub fn llamd_vk_dispatch(
             pipe: c_int,
             bufs: *const *mut c_void,
@@ -461,6 +462,7 @@ pub(crate) mod ffi {
             push: *const u32,
             gx: u32,
             gy: u32,
+            acc_n: c_int,
         ) -> c_int;
         pub fn llamd_vk_end_and_wait() -> c_int;
         pub fn llamd_vk_subgroup_size() -> u32;

@@ -49,8 +49,12 @@ struct Ctx {
     bool recording = false;
     VkDescriptorSetLayout dlayout = VK_NULL_HANDLE;
     VkPipelineLayout playout = VK_NULL_HANDLE;
-    // One pipeline per shader, indexed by the build order in build.rs.
-    std::vector<VkPipeline> pipes;
+    // One pipeline per (shader, accumulator width). The width is a
+    // specialization constant, so a 32-token pass gets a variant carrying 32
+    // slots rather than paying the 64-slot register cost. Shaders that do not
+    // declare the constant simply ignore the specialization info, so every
+    // pipeline gets the same set of variants and no name matching is needed.
+    std::vector<std::vector<VkPipeline>> pipes;
     VkPhysicalDeviceMemoryProperties memprops{};
     char name[256] = {0};
     char driver[256] = {0};
@@ -143,7 +147,12 @@ bool begin_cmd() {
 // The SPIR-V, embedded by build.rs.
 #include "shaders_spv.h"
 
-VkPipeline make_pipeline(const uint32_t *spv, size_t words) {
+// The accumulator widths variants are built for. Powers of two, so a token count
+// maps to a variant by rounding up.
+static const int ACC_VARIANTS[] = {1, 2, 4, 8, 16, 32, 64};
+static const int N_ACC = (int)(sizeof(ACC_VARIANTS) / sizeof(ACC_VARIANTS[0]));
+
+VkPipeline make_pipeline(const uint32_t *spv, size_t words, int acc_n) {
     VkShaderModuleCreateInfo mi{};
     mi.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     mi.codeSize = words * sizeof(uint32_t);
@@ -156,6 +165,17 @@ VkPipeline make_pipeline(const uint32_t *spv, size_t words) {
     st.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     st.module = mod;
     st.pName = "main";
+
+    VkSpecializationMapEntry me{};
+    me.constantID = 0;
+    me.offset = 0;
+    me.size = sizeof(int);
+    VkSpecializationInfo si{};
+    si.mapEntryCount = 1;
+    si.pMapEntries = &me;
+    si.dataSize = sizeof(int);
+    si.pData = &acc_n;
+    st.pSpecializationInfo = &si;
 
     VkComputePipelineCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
@@ -336,12 +356,17 @@ int llamd_vk_init() {
     if (!g.push_desc) return -1;
 
     const size_t n_pipes = sizeof(SPV_TABLE) / sizeof(SPV_TABLE[0]);
-    g.pipes.resize(n_pipes, VK_NULL_HANDLE);
+    g.pipes.assign(n_pipes, {});
     for (size_t i = 0; i < n_pipes; ++i) {
-        g.pipes[i] = make_pipeline(SPV_TABLE[i].code, SPV_TABLE[i].words);
-        if (g.pipes[i] == VK_NULL_HANDLE) {
-            fprintf(stderr, "llamd-vulkan: pipeline %s failed to create\n", SPV_TABLE[i].name);
-            return -1;
+        g.pipes[i].resize(N_ACC, VK_NULL_HANDLE);
+        for (int v = 0; v < N_ACC; ++v) {
+            g.pipes[i][v] = make_pipeline(SPV_TABLE[i].code, SPV_TABLE[i].words,
+                                          ACC_VARIANTS[v]);
+            if (g.pipes[i][v] == VK_NULL_HANDLE) {
+                fprintf(stderr, "llamd-vulkan: pipeline %s (acc %d) failed\n",
+                        SPV_TABLE[i].name, ACC_VARIANTS[v]);
+                return -1;
+            }
         }
     }
 
@@ -446,11 +471,19 @@ int llamd_vk_begin() {
     return 0;
 }
 
+// `acc_n` is the accumulator width the caller needs; the nearest variant at or
+// above it is used. 0 asks for the widest, which is the safe default for a shader
+// that does not declare the constant.
 int llamd_vk_dispatch(int pipe, void *const *bufs, int nbuf,
-                      const uint32_t *push, uint32_t gx, uint32_t gy)
+                      const uint32_t *push, uint32_t gx, uint32_t gy, int acc_n)
 {
     if (!g.ok || !g.recording) return -1;
     if (pipe < 0 || pipe >= llamd_vk_pipeline_count()) return -1;
+    int v = N_ACC - 1;
+    for (int i = 0; i < N_ACC; ++i) {
+        if (ACC_VARIANTS[i] >= acc_n) { v = i; break; }
+    }
+    if (acc_n <= 0) v = N_ACC - 1;
     if (nbuf < 0 || nbuf > 12) return -1;
     if (gx == 0 || gy == 0) return 0;          // nothing to do, not an error
 
@@ -469,7 +502,7 @@ int llamd_vk_dispatch(int pipe, void *const *bufs, int nbuf,
         wr[i].pBufferInfo = &bi[i];
     }
 
-    vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pipes[(size_t)pipe]);
+    vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pipes[(size_t)pipe][(size_t)v]);
     g.push_desc(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.playout, 0, (uint32_t)nbuf, wr);
     vkCmdPushConstants(g.cmd, g.playout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        32 * sizeof(uint32_t), push);
@@ -516,7 +549,7 @@ int llamd_vk_matvec(void *w, const uint64_t *off, void *qb, void *sb, void *ad,
 
     if (llamd_vk_begin() != 0) return -1;
     for (int i = 0; i < (iters > 0 ? iters : 1); ++i) {
-        if (llamd_vk_dispatch(0, bufs, 5, pc, groups, 1) != 0) return -1;
+        if (llamd_vk_dispatch(0, bufs, 5, pc, groups, 1, nseq) != 0) return -1;
     }
     return llamd_vk_end_and_wait();
 }

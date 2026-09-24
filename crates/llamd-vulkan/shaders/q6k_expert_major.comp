@@ -43,6 +43,18 @@ layout(push_constant) uniform Push {
 } pc;
 #include "common.glsl"
 
+// The accumulator width, a SPECIALIZATION CONSTANT.
+//
+// WHY. `float acc[MAX_SEQ]` is sized at compile time, so raising MAX_SEQ from 32
+// to 64 cost every pass 192 VGPRs instead of 72 — one wave per SIMD instead of
+// three — even a pass using 32 slots. Measured: a 512-token prompt at tile 32
+// went from 598.5 to 541.7 tok/s purely from the wider array.
+//
+// Specialized, each pipeline variant carries only the slots it needs, and the
+// loops below unroll because the bound is a constant rather than a push value.
+// The host creates one variant per power of two and picks by token count.
+layout(constant_id = 0) const int ACC_N = 64;
+
 void main() {
     // gl_WorkGroupID.y IS the expert id. The host dispatches n_expert of them and
     // the empty ones return at once — at 32 tokens only 16 of 128 are empty, and
@@ -56,8 +68,8 @@ void main() {
     uint row = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
     if (row >= pc.rows) return;
 
-    float acc[MAX_SEQ];
-    for (int i = 0; i < MAX_SEQ; ++i) acc[i] = 0.0;
+    float acc[ACC_N];
+    for (int i = 0; i < ACC_N; ++i) acc[i] = 0.0;
 
     uint ri = (expert * pc.rows + row) * pc.blocks;
     uint qlr = pc.ql_u + ri * 32u;
@@ -108,7 +120,8 @@ void main() {
 
         // THE REUSE: the weights above were unpacked once; every token that chose
         // this expert now consumes them.
-        for (int i = 0; i < count; ++i) {
+        for (int i = 0; i < ACC_N; ++i) {
+            if (i >= count) break;
             uint tok = uint(ptoken[start + i]);
             uint ab = tok * pc.blocks * 64u + bu;
             uint wl = dotPacked4x8AccSatEXT(l0, qb[ab + 0u], 0u);
@@ -128,7 +141,8 @@ void main() {
         }
     }
 
-    for (int i = 0; i < count; ++i) {
+    for (int i = 0; i < ACC_N; ++i) {
+        if (i >= count) break;
         float sum = subgroupAdd(acc[i]);
         if (subgroupElect()) outv[uint(pslot[start + i]) * pc.rows + row] = sum;
     }

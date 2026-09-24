@@ -225,3 +225,51 @@ fn fusing_qkv_measured_in_one_process() {
     vk.fuse_qkv = true;
     eprintln!("  (< 1.00x means fusing is faster)");
 }
+
+#[test]
+#[ignore = "uploads 23 GiB to the device; needs a free GPU and the real model"]
+fn specialized_accumulators_against_the_widest() {
+    // Does picking the accumulator variant by token count actually help, or did
+    // raising MAX_SEQ to 64 cost something the specialization does not recover?
+    // A/B in one process, alternating, best of three — decode readings drifted
+    // about 4% across this session on unchanged code, which is enough to fake
+    // either answer if the arms are compared across runs.
+    let Some((model, mut vk)) = open(68, 8) else {
+        skip("specialized_accumulators", "no model or no Vulkan");
+        return;
+    };
+    let _ = &model;
+    const N: usize = 48;
+    eprintln!(
+        "\n  {:<6} {:>13} {:>13} {:>10}",
+        "batch", "specialized", "widest", "speedup"
+    );
+    for nseq in [1usize, 2, 4, 8] {
+        let mut best = [f64::MAX; 2]; // [specialized, widest]
+        for _ in 0..3 {
+            for (arm, spec) in [(0usize, true), (1usize, false)] {
+                llamd_vulkan::ops::set_acc_specialized(spec);
+                let mut toks: Vec<u32> = (0..nseq).map(|i| CASES[i % CASES.len()].1).collect();
+                for pos in 0..6 {
+                    toks = vk.forward_batch(&toks, &vec![pos; nseq]).expect("warm");
+                }
+                let t = std::time::Instant::now();
+                for pos in 0..N {
+                    toks = vk.forward_batch(&toks, &vec![pos; nseq]).expect("timed");
+                }
+                let ms = t.elapsed().as_secs_f64() * 1e3 / N as f64;
+                if ms < best[arm] {
+                    best[arm] = ms;
+                }
+            }
+        }
+        eprintln!(
+            "  {nseq:<6} {:>9.2} t/s {:>9.2} t/s {:>9.3}x",
+            nseq as f64 * 1000.0 / best[0],
+            nseq as f64 * 1000.0 / best[1],
+            best[1] / best[0]
+        );
+    }
+    llamd_vulkan::ops::set_acc_specialized(true);
+    eprintln!("  (> 1.00x means specializing helps)");
+}
