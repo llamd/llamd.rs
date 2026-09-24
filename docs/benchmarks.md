@@ -1554,3 +1554,95 @@ equal to llama.cpp. 131 passed, 0 failed, 18 ignored.
 
 Prefill is **2.55×** behind, from 3.3× at §15. Decode is ahead by 1.18–1.33× at one
 stream and 1.37–1.41× at batch 8.
+
+---
+
+## 19. Where the prefill gap actually is, measured
+
+§18 left prefill 2.55× behind on a llama.cpp figure of 1632 t/s that was quoted
+from an earlier run. That figure was wrong, and the real gap is larger. This
+section replaces it and decomposes it.
+
+### llama.cpp is not one number — it is a curve in n_ubatch
+
+Same card, same model, `llama-bench -p 512 -n 0`:
+
+| n_ubatch | llama.cpp ROCm | llama.cpp Vulkan | llamd (tile) |
+|---|---|---|---|
+| 32 | 523.8 | 676.1 | **656.4** |
+| 64 | 673.8 | — | 550.8 |
+| 128 | 778.2 | — | — |
+| 256 | 1540.4 | — | — |
+| 512 | 2040.6 | **3213.6** | — |
+
+**At matched width, llamd is competitive**: 656.4 against llama.cpp Vulkan's
+676.1 at ubatch 32 — 3% behind — and 25% *ahead* of its ROCm path. The deficit
+is not a worse kernel. It is that llama.cpp can run a 512-wide ubatch and llamd
+cannot get past 32.
+
+### Why llamd cannot widen, in one number
+
+Weight traffic to ingest 512 tokens, from the model geometry (one expert-layer is
+3.87 MB, attention is 15.48 MB/layer, 48 layers, 8 of 128 experts per token, and
+`E(p) = 128(1-(127/128)^p)` distinct experts for `p` routed pairs):
+
+| tile | tokens/expert | traffic | measured | achieved GB/s | % of 637.8 |
+|---|---|---|---|---|---|
+| 8 | 0.50 | 648.5 GB | 1.381 s | 470 | 74% |
+| 16 | 1.00 | 506.2 GB | 0.909 s | **557** | **87%** |
+| 32 | 2.00 | 341.6 GB | 0.780 s | 438 | 69% |
+| 64 | 4.00 | 193.0 GB | 0.930 s | **208** | **33%** |
+| 128 | 8.00 | 98.3 GB | — | — | — |
+| 256 | 16.00 | 49.3 GB | — | — | — |
+| 512 | 32.00 | **24.8 GB** | — | — | — |
+
+Traffic falls 13.8× from tile 32 to tile 512 — and **achieved bandwidth falls
+with it**, from 87% of peak at `ACC_N=16` to 33% at `ACC_N=64`. That is the
+`float acc[ACC_N]` array of §18: it is the thing that makes a wide tile
+worth having, and the thing that makes a wide tile impossible. Tile 64 has 1.8×
+less traffic than tile 32 and is still slower, because it moves that traffic at
+half the rate.
+
+### How much is tiling, and how much is hardware
+
+`GGML_VK_DISABLE_COOPMAT=1` answers this directly:
+
+| llama.cpp Vulkan, pp512, ub 512 | t/s |
+|---|---|
+| with `KHR_coopmat` | **3213.6** |
+| without | 1834.3 |
+
+The device reports `matrix cores: KHR_coopmat` and `int dot: 1`. So the 4.9× gap
+factors cleanly:
+
+- **2.8× is tiling** — a wide ubatch and a matrix-matrix kernel, no special
+  hardware. llama.cpp reaches 1834 t/s this way.
+- **1.75× is cooperative matrix** on top of that.
+
+2.8 × 1.75 = 4.9, which is the gap.
+
+### What that means for the work
+
+The budget is not tight once the tile is wide. At tile 512 the traffic is 24.8 GB,
+so **3213 t/s needs only 156 GB/s** — a third of what the tile-32 kernel already
+achieves. The binding constraint becomes arithmetic: 2.78 TFLOP for 512 tokens,
+so 3213 t/s is **17.5 TFLOPS effective**, against roughly 66 TFLOPS of `udot4`
+ceiling on this part. llamd is at 3.56 TFLOPS today.
+
+So the order is forced, and it is the opposite of what §16 tried:
+
+1. **Widen the tile by moving the token dimension out of the per-lane accumulator
+   array** — into lanes and LDS, i.e. a real register-tiled GEMM, this time on the
+   expert path (96.5% of traffic) rather than the attention path (3.5%) that §16
+   spent itself on. Expected: 654 → ~1800 t/s.
+2. **Then `VK_KHR_cooperative_matrix`.** It is worth 1.75× to llama.cpp here and
+   is the one mechanism this device exposes that llamd does not touch. Expected:
+   ~1800 → ~3200 t/s, parity.
+3. **To pass it**, the candidate is int8 coopmat fed straight from the planar
+   Q6_K layout. llama.cpp's coopmat path dequantizes to fp16; the §V2 identity
+   keeps the whole product integral, so int8 matrix ops would halve the operand
+   bytes in LDS and, on RDNA4, run at roughly twice the fp16 matrix rate. This is
+   unverified and is the first thing to check, not the first thing to build.
+
+Doing 2 before 1 would measure nothing: at 69% of memory peak the ALU is not the
+limit, which is the same mistake §16 made and the same reason it is recorded.
