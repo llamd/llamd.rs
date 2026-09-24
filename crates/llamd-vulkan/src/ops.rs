@@ -44,6 +44,7 @@ pub enum Pipeline {
     Q6kExpertMajor = 21,
     Q6kExpertMajorPa = 22,
     Q6kExpertRt = 23,
+    AttentionScalar = 24,
 }
 
 impl Pipeline {
@@ -74,10 +75,11 @@ impl Pipeline {
             Pipeline::Q6kExpertMajor => "q6k_expert_major",
             Pipeline::Q6kExpertMajorPa => "q6k_expert_major_pa",
             Pipeline::Q6kExpertRt => "q6k_expert_rt",
+            Pipeline::AttentionScalar => "attention_scalar",
         }
     }
 
-    pub const ALL: [Pipeline; 24] = [
+    pub const ALL: [Pipeline; 25] = [
         Pipeline::Q6kMatvec,
         Pipeline::Q6kX3,
         Pipeline::Q6kGemm,
@@ -102,6 +104,7 @@ impl Pipeline {
         Pipeline::Q6kExpertMajor,
         Pipeline::Q6kExpertMajorPa,
         Pipeline::Q6kExpertRt,
+        Pipeline::AttentionScalar,
     ];
 }
 
@@ -344,6 +347,21 @@ pub fn profile_read() -> Vec<(Pipeline, f64)> {
             })
             .collect()
     }
+}
+
+static ATTN_SCALAR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Run the PREVIOUS attention kernel instead of the rewritten one.
+///
+/// Exists so the rewrite can be A/B'd with both arms alternating in one process.
+/// A before/after across two builds cannot decide a few percent on this card: four
+/// runs of one build spanned 98.82 to 117.18 tok/s at batch 1.
+pub fn set_attention_scalar(on: bool) {
+    ATTN_SCALAR.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn attention_scalar() -> bool {
+    ATTN_SCALAR.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Rows one lane of the row-tiled expert kernel accumulates. Must match `ROWS` in
@@ -788,7 +806,11 @@ pub fn attention(
         .u(5, n_head / n_head_kv)
         .u(6, kv_stride);
     dispatch(
-        Pipeline::Attention,
+        if attention_scalar() {
+            Pipeline::AttentionScalar
+        } else {
+            Pipeline::Attention
+        },
         &[q, kc, vc, out, scores, meta],
         p,
         (nseq * n_head) as u32,

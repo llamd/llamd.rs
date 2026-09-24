@@ -134,3 +134,107 @@ fn where_prefill_time_goes() {
         }
     }
 }
+
+/// Did the attention rewrite cost decode anything?
+///
+/// §22 left this open. A before/after across two builds could not decide it: four
+/// runs of ONE build spanned 98.82 to 117.18 tok/s at batch 1, which is 19%, and
+/// the question was whether a 3% change was real. So both kernels are kept as
+/// pipelines and this alternates them inside one process, best of three — the only
+/// measurement shape this card's 64 MB of Infinity Cache and its run-to-run drift
+/// cannot fake.
+#[test]
+#[ignore = "uploads 23 GiB to the device; needs a free GPU and the real model"]
+fn attention_rewrite_against_the_previous_kernel() {
+    let Some(path) = oracle_model() else {
+        eprintln!("  SKIP attention_rewrite_ab: no LLAMD_TEST_MODEL");
+        return;
+    };
+    if !llamd_vulkan::available() {
+        eprintln!("  SKIP attention_rewrite_ab: no Vulkan");
+        return;
+    }
+    let model = Model::open(&path).expect("open");
+    let mut vk =
+        VulkanModel::load_with_slots(&model, 600, llamd_vulkan::MAX_TILE, 8).expect("load");
+    let vocab = llamd_tokenizer::Vocab::from_gguf(model.gguf()).expect("vocab");
+    let text = "Explain how a compiler turns source code into machine instructions,                 covering lexing, parsing, type checking, optimisation and code generation.";
+    let mut prompt = Vec::new();
+    while prompt.len() < 512 {
+        prompt.extend_from_slice(&vocab.encode(text, false));
+    }
+    prompt.truncate(512);
+
+    // Decode: `batch` streams, 16 passes, at a fixed 64 tokens of context.
+    let decode = |vk: &mut VulkanModel, batch: usize, scalar: bool| -> f64 {
+        ops::set_attention_scalar(scalar);
+        let toks: Vec<u32> = std::iter::repeat_n(prompt[0], batch).collect();
+        let pos: Vec<usize> = (0..batch).map(|_| 64).collect();
+        let _ = vk.forward_batch(&toks, &pos).expect("warm");
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            for _ in 0..16 {
+                let _ = vk.forward_batch(&toks, &pos).expect("decode");
+            }
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        (batch * 16) as f64 / best
+    };
+    let prefill = |vk: &mut VulkanModel, scalar: bool| -> f64 {
+        ops::set_attention_scalar(scalar);
+        let _ = vk.prefill(&prompt, 0).expect("warm");
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let _ = vk.prefill(&prompt, 0).expect("prefill");
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        512.0 / best
+    };
+
+    eprintln!("  alternating arms in one process, best of 3");
+    eprintln!(
+        "  {:<18}{:>12}{:>12}{:>10}",
+        "case", "rewritten", "previous", "speedup"
+    );
+    for batch in [1usize, 2, 4, 8] {
+        // Rewritten first on even batches, previous first on odd, so a warming
+        // trend cannot favour one arm consistently.
+        let (new, old) = if batch % 2 == 0 {
+            let n = decode(&mut vk, batch, false);
+            (n, decode(&mut vk, batch, true))
+        } else {
+            let o = decode(&mut vk, batch, true);
+            (decode(&mut vk, batch, false), o)
+        };
+        eprintln!(
+            "  {:<18}{:>12}{:>12}{:>10}",
+            format!("decode batch {batch}"),
+            format!("{new:.2}"),
+            format!("{old:.2}"),
+            format!("{:.3}x", new / old)
+        );
+    }
+    let po = prefill(&mut vk, true);
+    let pn = prefill(&mut vk, false);
+    eprintln!(
+        "  {:<18}{:>12}{:>12}{:>10}",
+        "prefill pp512",
+        format!("{pn:.1}"),
+        format!("{po:.1}"),
+        format!("{:.3}x", pn / po)
+    );
+    ops::set_attention_scalar(false);
+
+    // And the arms must agree, or the comparison is between two different models.
+    ops::set_attention_scalar(true);
+    let a = vk.prefill(&prompt, 0).expect("prefill scalar");
+    ops::set_attention_scalar(false);
+    let b = vk.prefill(&prompt, 0).expect("prefill vec4");
+    eprintln!(
+        "  same next token from both kernels: {} ({a} vs {b})",
+        if a == b { "yes" } else { "NO" }
+    );
+    assert_eq!(a, b, "the two attention kernels disagree on the next token");
+}

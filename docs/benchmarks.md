@@ -1934,10 +1934,39 @@ peak — and run at 4852 G MAC/s against a ~32800 ceiling, so there is headroom.
 Prefill is **2.40× behind**, from 4.9×. Against llama.cpp's non-coopmat path it is
 **0.73×**, from 0.37×.
 
-### Three things measured and NOT concluded
+### The decode question, now settled by an A/B
 
-Decode at batch 4–8 read ~3% below a single-run baseline of 276.59/411.30. Best of
-four gives 267.7/398.1. It is **not** reported as a regression, because:
+It is settled the only way it could be: **both kernels kept as pipelines and
+alternated inside one process**, best of three, with the arm order flipped between
+batch sizes so a warming trend cannot favour one consistently
+(`attention_rewrite_against_the_previous_kernel`).
+
+| case | rewritten | previous | |
+|---|---|---|---|
+| decode batch 1 | 112.50 | 97.38 | **1.155×** |
+| decode batch 2 | 213.25 | 203.96 | 1.046× |
+| decode batch 4 | 377.46 | 351.70 | 1.073× |
+| decode batch 8 | 552.56 | 516.42 | 1.070× |
+| **prefill pp512** | **1337.7** | 674.2 | **1.984×** |
+
+Both arms emit the same next token (1119), so this compares two kernels and not two
+models.
+
+**The rewrite is faster at every batch size — 4.6% to 15.5% on decode.** There was
+no regression. The ~3% was drift between two builds, which is exactly what the
+three failed explanations below were evidence of and what I should have concluded
+from them at the time instead of leaving it open.
+
+(These decode figures are higher than the table above because this harness holds
+context at 64 tokens and repeats 16 passes; the throughput test generates 64 tokens
+with a growing cache. The two are not comparable to each other — only within
+themselves, which is the point of an A/B.)
+
+### The three explanations that failed, and why that was the answer
+
+Before the A/B existed, decode at batch 4–8 read ~3% below a single-run baseline of
+276.59/411.30 and best-of-four gave 267.7/398.1. Three candidate causes were
+tested and all three came back null:
 
 1. The profiler shows attention is **2.5%** of decode at batch 8 — it cannot
    account for 3%.
@@ -1947,9 +1976,15 @@ four gives 267.7/398.1. It is **not** reported as a regression, because:
    at batch 2, 400.02 vs 398.08 at batch 8) — a third counting model refuted.
 
 And the run-to-run spread at batch 1 across four runs was 98.82, 111.55, 112.20,
-117.18 — 19%. A single-run baseline sits anywhere in that. Deciding this needs an
-in-process A/B, which a shader change cannot have. The fast path was kept anyway:
-it is the correct shape, and it costs nothing.
+117.18 — 19%. A single-run baseline sits anywhere in that.
+
+The claim made here first — that deciding it "needs an in-process A/B, which a
+shader change cannot have" — was **wrong**, and it was the one claim not tested.
+A shader change can have one: keep both shaders as pipelines and flip between them
+at runtime, which is the pattern `set_expert_rt` and `set_acc_specialized` already
+established in this same file. `attention_scalar.comp` is retained for exactly that
+and must not be "fixed" — it is only useful as long as it is what was measured.
+The fast path was kept too: it is the correct shape and costs nothing.
 
 ### Correctness
 
