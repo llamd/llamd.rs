@@ -38,6 +38,8 @@ const SHADERS: &[&str] = &[
     "q6k_expert_major_pa",
     "q6k_expert_rt",
     "attention_scalar",
+    "q6k_expert_rt2",
+    "q6k_expert_rt8",
 ];
 
 fn main() {

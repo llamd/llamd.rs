@@ -602,6 +602,60 @@ int llamd_vk_end_and_wait() {
     return 0;
 }
 
+/// What cooperative-matrix shapes this device actually supports.
+///
+/// The one fact that decides whether prefill can pass llama.cpp. Its Vulkan
+/// backend reports `matrix cores: KHR_coopmat` on this part and measured 1.75x from
+/// it (benchmarks.md §19), and llamd's matmuls are at ~15% of the plain
+/// dot-product ceiling — so the question is not whether to use it but which
+/// (M, N, K, types) the driver will accept. Enumerated rather than assumed: the
+/// shapes are per-driver, and guessing one produces a pipeline that fails to
+/// compile at load rather than a wrong number.
+///
+/// Writes a newline-separated report. Returns the count, or -1 if the device does
+/// not expose the extension.
+int llamd_vk_coopmat_report(char *out, int max) {
+    if (!g.ok || !out || max <= 0) return -1;
+    out[0] = 0;
+    auto fn = (PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR)
+        vkGetInstanceProcAddr(g.instance,
+                              "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR");
+    if (!fn) return -1;
+    uint32_t n = 0;
+    if (fn(g.phys, &n, nullptr) != VK_SUCCESS || n == 0) return 0;
+    std::vector<VkCooperativeMatrixPropertiesKHR> props(n);
+    for (auto &p : props) p.sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+    if (fn(g.phys, &n, props.data()) != VK_SUCCESS) return -1;
+
+    auto ty = [](VkComponentTypeKHR t) -> const char * {
+        switch (t) {
+            case VK_COMPONENT_TYPE_FLOAT16_KHR: return "f16";
+            case VK_COMPONENT_TYPE_FLOAT32_KHR: return "f32";
+            case VK_COMPONENT_TYPE_FLOAT64_KHR: return "f64";
+            case VK_COMPONENT_TYPE_SINT8_KHR:   return "s8";
+            case VK_COMPONENT_TYPE_SINT16_KHR:  return "s16";
+            case VK_COMPONENT_TYPE_SINT32_KHR:  return "s32";
+            case VK_COMPONENT_TYPE_SINT64_KHR:  return "s64";
+            case VK_COMPONENT_TYPE_UINT8_KHR:   return "u8";
+            case VK_COMPONENT_TYPE_UINT16_KHR:  return "u16";
+            case VK_COMPONENT_TYPE_UINT32_KHR:  return "u32";
+            case VK_COMPONENT_TYPE_UINT64_KHR:  return "u64";
+            default: return "?";
+        }
+    };
+    int used = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        const auto &p = props[i];
+        int wrote = snprintf(out + used, (size_t)(max - used),
+                             "%ux%ux%u  A %s  B %s  C %s  acc %s  scope %u\n",
+                             p.MSize, p.NSize, p.KSize, ty(p.AType), ty(p.BType),
+                             ty(p.CType), ty(p.ResultType), (unsigned)p.scope);
+        if (wrote <= 0 || used + wrote >= max) break;
+        used += wrote;
+    }
+    return (int)n;
+}
+
 uint32_t llamd_vk_subgroup_size() { return g.subgroup_size; }
 
 // Convenience wrapper for the standalone matvec validation and benchmark: one

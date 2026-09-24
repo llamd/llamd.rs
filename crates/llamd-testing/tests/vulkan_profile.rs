@@ -238,3 +238,92 @@ fn attention_rewrite_against_the_previous_kernel() {
     );
     assert_eq!(a, b, "the two attention kernels disagree on the next token");
 }
+
+/// The expert kernel is 50% of prefill and bound by neither bandwidth (19% of
+/// peak) nor arithmetic (15% of the dot ceiling). Shader stats say why: at ROWS 4
+/// x ACC 16 it compiles to 252 VGPRs, TWO waves per SIMD, so it cannot hide memory
+/// latency. ROWS and ACC trade against each other through the register file —
+/// accumulators are ROWS * ACC — and the best point is a measurement.
+#[test]
+#[ignore = "uploads 23 GiB to the device; needs a free GPU and the real model"]
+fn expert_tile_sweep() {
+    let Some(path) = oracle_model() else {
+        eprintln!("  SKIP expert_tile_sweep: no LLAMD_TEST_MODEL");
+        return;
+    };
+    if !llamd_vulkan::available() {
+        eprintln!("  SKIP expert_tile_sweep: no Vulkan");
+        return;
+    }
+    let model = Model::open(&path).expect("open");
+    let mut vk =
+        VulkanModel::load_with_slots(&model, 600, llamd_vulkan::MAX_TILE, 8).expect("load");
+    let vocab = llamd_tokenizer::Vocab::from_gguf(model.gguf()).expect("vocab");
+    let text = "Explain how a compiler turns source code into machine instructions,                 covering lexing, parsing, type checking, optimisation and code generation.";
+    let mut prompt = Vec::new();
+    while prompt.len() < 512 {
+        prompt.extend_from_slice(&vocab.encode(text, false));
+    }
+    prompt.truncate(512);
+    vk.prefill_tile = 512;
+
+    // The reference every arm must reproduce: a wrong tile shape still produces
+    // fluent text, so the token is checked, not eyeballed.
+    ops::set_expert_rt(false);
+    let want = vk.prefill(&prompt, 0).expect("untiled reference");
+
+    eprintln!("  512-token prompt, tile 512. accumulators = ROWS * ACC.");
+    eprintln!(
+        "  {:>6}{:>6}{:>8}{:>12}{:>10}{:>8}",
+        "ROWS", "ACC", "acc regs", "tok/s", "vs 4x16", "token"
+    );
+    let mut best = (0usize, 0usize, 0.0f64);
+    let mut baseline = 0.0f64;
+    for &(rows, acc) in &[
+        (1usize, 32usize),
+        (2, 8),
+        (2, 16),
+        (2, 32),
+        (4, 4),
+        (4, 8),
+        (4, 16),
+        (8, 4),
+        (8, 8),
+    ] {
+        ops::set_expert_rt(true);
+        ops::set_expert_tile(rows, acc);
+        let got = vk.prefill(&prompt, 0).expect("prefill");
+        let mut fastest = f64::MAX;
+        for _ in 0..2 {
+            let t = std::time::Instant::now();
+            let _ = vk.prefill(&prompt, 0).expect("prefill");
+            fastest = fastest.min(t.elapsed().as_secs_f64());
+        }
+        let tps = 512.0 / fastest;
+        if rows == 4 && acc == 16 {
+            baseline = tps;
+        }
+        if tps > best.2 {
+            best = (rows, acc, tps);
+        }
+        eprintln!(
+            "  {:>6}{:>6}{:>8}{:>12}{:>10}{:>8}",
+            rows,
+            acc,
+            rows * acc,
+            format!("{tps:.1}"),
+            if baseline > 0.0 {
+                format!("{:.3}x", tps / baseline)
+            } else {
+                "-".to_string()
+            },
+            if got == want { "ok" } else { "WRONG" }
+        );
+        assert_eq!(got, want, "ROWS {rows} ACC {acc} changed the emitted token");
+    }
+    ops::set_expert_tile(best.0, best.1);
+    eprintln!(
+        "  best: ROWS {} ACC {} at {:.1} tok/s",
+        best.0, best.1, best.2
+    );
+}

@@ -521,8 +521,8 @@ fn row_tiled_experts_equal_the_untiled_kernel() {
     assert!(wrong.is_empty(), "{} cases disagree", wrong.len());
     eprintln!(
         "  row-tiled experts == untiled across 45 (tile, length) cases, ROWS {} x ACC {}",
-        llamd_vulkan::ops::RT_ROWS,
-        llamd_vulkan::ops::RT_ACC
+        llamd_vulkan::ops::expert_tile().0,
+        llamd_vulkan::ops::expert_tile().1
     );
 }
 

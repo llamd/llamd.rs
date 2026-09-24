@@ -1,0 +1,40 @@
+#version 450
+//
+// The routed expert projections, expert-major AND row-tiled.
+//
+// WHY THIS EXISTS, and it is not the reason the first tiled GEMM was written.
+//
+// Widening the prefill tile from 32 to 512 cut expert WEIGHT traffic 13.8x and
+// bought nothing — 128, 256 and 512 all measured within 2% of 64 (benchmarks.md
+// §20). RADV shader stats ruled out the obvious explanations: 5 to 7 waves per
+// SIMD at chunk 32, zero spills, zero scratch. So the limit was neither DRAM
+// bandwidth nor occupancy, and it was invariant to tile width — which points at
+// the per-unit-work cost of the inner loop.
+//
+// COUNTING THAT LOOP EXPLAINS IT. With one row per subgroup, a lane handling one
+// K-group issues 8 weight loads and then, per token, 8 activation loads plus 2
+// group-sums plus 1 scale to feed 8 packed dots. At 32 tokens that is 360 loads
+// against 256 dots: roughly three MACs per load, and the activation loads
+// dominate. Crucially `qb[ab]` is indexed by (token, K) and NOT by row — so with
+// one row per subgroup every one of those loads feeds exactly ONE row's dots.
+//
+// SO THE REUSE THAT WAS MISSING IS ROWS, NOT TOKENS. Here the token loop sits
+// ABOVE a row loop: the activation for a token is loaded once and multiplied
+// against ROWS rows' weights. Loads per unit of work fall from 11.25 to 3.25 at
+// ROWS=4, ACC_N=16.
+//
+// THE COST IS REGISTERS, and it is why ACC_N must come down as ROWS goes up. The
+// accumulator is ROWS * ACC_N floats, and 64 of them is the cliff this card falls
+// off (192 VGPRs, 2 waves per SIMD). ROWS=4 with ACC_N=16 sits exactly at 64, the
+// same budget the 1x32 kernel already pays.
+//
+// ONE SHADER FOR GATE/UP AND FOR DOWN. They differ only in whether the activation
+// is indexed by the token or by the (token, slot) PAIR — the down projection
+// consumed each expert's own silu(gate)*up, and indexing it by token instead is
+// the bug that produces fluent nonsense. That is a push constant, not a second
+// file, because everything else about them is identical.
+
+
+// The ROWS=2 arm of the occupancy sweep. See expert_rt_body.glsl.
+#define ROWS 2
+#include "expert_rt_body.glsl"

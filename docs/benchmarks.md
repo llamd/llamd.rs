@@ -1996,3 +1996,95 @@ The summation order **did** change — four partial accumulators sum a 128-term 
 dot differently than one chain — so results differ at ~1e-7 relative. The two
 near-tied prompts have margins of 0.1196 and 0.1946, six orders of magnitude
 above that, and the agreement suite is what verifies it rather than an argument.
+
+---
+
+## 23. The expert kernel's occupancy, and the shape that changes everything
+
+§22 left the routed experts at 50% of prefill, running at 124 GB/s (19% of memory
+peak) and 4852 G MAC/s (15% of the dot-product ceiling) — bound by neither.
+
+### Why: two waves per SIMD
+
+`RADV_DEBUG=shaderstats` on the pipeline set: the row-tiled expert kernel at
+ROWS 4 × ACC 16 compiles to **252 VGPRs, two waves per SIMD**. Accumulators are
+`ROWS × ACC` and dominate the register file, so the reuse row-tiling bought in
+§20 was paid straight back in lost latency hiding. That is the whole reason it
+measured 1.03×.
+
+`ROWS` moved from a `#define` to three thin wrappers around
+`expert_rt_body.glsl`, so the trade is measurable rather than asserted:
+
+| ROWS | ACC | acc regs | tok/s |
+|---|---|---|---|
+| 1 | 32 | 32 | 1286.5 |
+| 2 | 8 | 16 | 1374.3 |
+| **2** | **16** | **32** | **1401.9** |
+| 2 | 32 | 64 | 1341.0 |
+| 4 | 4 | 16 | 1300.8 |
+| 4 | 8 | 32 | 1375.0 |
+| 4 | 16 | 64 | 1336.6 |
+| 8 | 4 | 32 | 1181.5 |
+| 8 | 8 | 64 | 1241.5 |
+
+**32 accumulators is the sweet spot, and 64 is the cliff** — every 64-accumulator
+arm loses to its 32-accumulator sibling. Every arm emits the same token, asserted
+rather than eyeballed. Default is now 2 × 16.
+
+| | before | after |
+|---|---|---|
+| expert kernel | 191.20 ms | **169.61 ms** |
+| its share | 50.0% | 46.6% |
+| pp512 | 1337 | **1402** |
+
++4.9%, which is honest and small. Occupancy was a real factor and not the main one.
+
+### Where the ceiling actually is
+
+| | pp512 | t/s | % of roofline |
+|---|---|---|---|
+| roofline (24.8 GB at 600 GB/s; 1.39 T MAC at the dot ceiling) | ~42 ms | ~12000 | 100% |
+| llama.cpp Vulkan + coopmat | 159 ms | 3214 | **26%** |
+| llama.cpp Vulkan, no coopmat | 279 ms | 1834 | 15% |
+| **llamd now** | **365 ms** | **1402** | **12%** |
+
+llama.cpp is not near the limit either. The gap is not exotic; it is a factor of
+two in efficiency on the matmul kernels, which are 77% of the pass.
+
+### And the instruction that closes it
+
+`vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR` on this part
+(`examples/coopmat.rs`) reports 12 shapes, all 16×16×16 at subgroup scope,
+including:
+
+```
+16x16x16  A u8   B u8   C u32  acc u32
+16x16x16  A s8   B s8   C s32  acc s32
+16x16x16  A f16  B f16  C f32  acc f32
+```
+
+**`u8 × u8 → u32` is the §V2 identity in hardware.** That identity is why this
+engine exists: Q6_K weights are unsigned 0..63, the Q8_K activations are already
+biased to unsigned by `q XOR 0x80`, and every correction term
+(`−128·Σw − 32·Σb + 32·128·16`) is an integer. So llamd can feed matrix cores
+**with no dequantisation to float at any point** — the planar repack of §V3 already
+produces the operand layout.
+
+llama.cpp's Vulkan backend reports `fp16: 1` and takes the f16 path, dequantising
+Q6_K to feed it. On RDNA4 int8 matrix throughput is typically twice f16.
+
+The arithmetic density: one 16×16×16 coopmat instruction is 4096 MACs per
+subgroup — **64 MACs per lane against 4 for `dotPacked4x8AccSatEXT`, 16×**. The
+matmul kernels (expert 46.6%, matvec 15.8%, x3 11.1%, router 3.4% = 77%) are 280 ms
+of the 365 ms pass:
+
+| matmuls speed up by | pp512 | t/s | vs llama.cpp |
+|---|---|---|---|
+| 2× | 225 ms | 2276 | 0.71× |
+| **4×** | **155 ms** | **3310** | **1.03×** |
+| 6× | 132 ms | 3888 | 1.21× |
+
+**4× on the matmuls passes llama.cpp**, and 4× is a quarter of the instruction
+density the shape provides. That is the target, and unlike §19's and §20's
+projections it rests on an enumerated hardware capability rather than a counting
+argument — though on this project's record, it is a hypothesis until measured.

@@ -43,6 +43,31 @@ pub const MAX_SEQ: usize = 64;
 /// expert outputs are allocated for this many tokens.
 pub const MAX_TILE: usize = 512;
 
+/// The cooperative-matrix shapes this device supports, one per line, or `None` if
+/// it does not expose the extension. See `llamd_vk_coopmat_report`.
+pub fn coopmat_report() -> Option<String> {
+    #[cfg(not(vulkan))]
+    {
+        None
+    }
+    #[cfg(vulkan)]
+    {
+        if init().is_err() {
+            return None;
+        }
+        let mut buf = vec![0u8; 16384];
+        #[allow(unsafe_code)]
+        let n = unsafe {
+            ffi::llamd_vk_coopmat_report(buf.as_mut_ptr() as *mut std::ffi::c_char, 16384)
+        };
+        if n < 0 {
+            return None;
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(0);
+        Some(String::from_utf8_lossy(&buf[..end]).into_owned())
+    }
+}
+
 pub mod ops;
 pub use ops::{Pipeline, Push, begin, end_and_wait, subgroup_size};
 
@@ -483,6 +508,7 @@ pub(crate) mod ffi {
             acc_n: c_int,
         ) -> c_int;
         pub fn llamd_vk_end_and_wait() -> c_int;
+        pub fn llamd_vk_coopmat_report(out: *mut c_char, max: c_int) -> c_int;
         pub fn llamd_vk_profile(on: c_int) -> c_int;
         pub fn llamd_vk_profile_read(pipes: *mut c_int, ms: *mut f64, max: c_int) -> c_int;
         pub fn llamd_vk_subgroup_size() -> u32;

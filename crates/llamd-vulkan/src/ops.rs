@@ -45,6 +45,8 @@ pub enum Pipeline {
     Q6kExpertMajorPa = 22,
     Q6kExpertRt = 23,
     AttentionScalar = 24,
+    Q6kExpertRt2 = 25,
+    Q6kExpertRt8 = 26,
 }
 
 impl Pipeline {
@@ -76,10 +78,12 @@ impl Pipeline {
             Pipeline::Q6kExpertMajorPa => "q6k_expert_major_pa",
             Pipeline::Q6kExpertRt => "q6k_expert_rt",
             Pipeline::AttentionScalar => "attention_scalar",
+            Pipeline::Q6kExpertRt2 => "q6k_expert_rt2",
+            Pipeline::Q6kExpertRt8 => "q6k_expert_rt8",
         }
     }
 
-    pub const ALL: [Pipeline; 25] = [
+    pub const ALL: [Pipeline; 27] = [
         Pipeline::Q6kMatvec,
         Pipeline::Q6kX3,
         Pipeline::Q6kGemm,
@@ -105,6 +109,8 @@ impl Pipeline {
         Pipeline::Q6kExpertMajorPa,
         Pipeline::Q6kExpertRt,
         Pipeline::AttentionScalar,
+        Pipeline::Q6kExpertRt2,
+        Pipeline::Q6kExpertRt8,
     ];
 }
 
@@ -364,14 +370,34 @@ pub fn attention_scalar() -> bool {
     ATTN_SCALAR.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Rows one lane of the row-tiled expert kernel accumulates. Must match `ROWS` in
-/// `shaders/q6k_expert_rt.comp`.
-pub const RT_ROWS: usize = 4;
+/// Rows one lane of the row-tiled expert kernel accumulates, and the tokens per
+/// chunk. Sweepable, because they trade against each other through the register
+/// file and the best point is a measurement.
+///
+/// `ROWS * ACC` is the accumulator count and the dominant register cost. At 4 x 16
+/// the kernel compiles to **252 VGPRs — two waves per SIMD**, which is why row
+/// tiling was worth only 3% (§20): what it saved in instructions it paid back in
+/// lost latency hiding, on a kernel that is at 19% of memory peak and 15% of the
+/// dot-product ceiling and therefore bound by neither.
+///
+/// `rows` of 1 means the untiled kernel; 2, 4 and 8 select the wrappers around
+/// `expert_rt_body.glsl`.
+/// 2 x 16 measured best (§23): 32 accumulators is the sweet spot on this part, and
+/// 64 loses more to occupancy than the extra reuse wins.
+static RT_ROWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2);
+static RT_ACC: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(16);
 
-/// Tokens per chunk in the row-tiled kernel. `RT_ROWS * RT_ACC` accumulators is
-/// the register budget, and 64 is where this card falls to 2 waves per SIMD, so
-/// raising one means lowering the other.
-pub const RT_ACC: usize = 16;
+pub fn set_expert_tile(rows: usize, acc: usize) {
+    RT_ROWS.store(rows, std::sync::atomic::Ordering::Relaxed);
+    RT_ACC.store(acc, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn expert_tile() -> (usize, usize) {
+    (
+        RT_ROWS.load(std::sync::atomic::Ordering::Relaxed),
+        RT_ACC.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
 
 /// On by default: measured faster at every tile width and bit-exact against the
 /// kernel it replaces (`row_tiled_experts_equal_the_untiled_kernel`). It is a
@@ -388,8 +414,8 @@ pub fn expert_rt_enabled() -> bool {
 }
 
 /// Workgroups to cover `rows` when each lane group owns `RT_ROWS` of them.
-fn groups_for_rows_tiled(rows: usize) -> u32 {
-    let per = rows_per_workgroup().max(1) * RT_ROWS;
+fn groups_for_rows_tiled(rows: usize, rt_rows: usize) -> u32 {
+    let per = rows_per_workgroup().max(1) * rt_rows.max(1);
     rows.div_ceil(per) as u32
 }
 
@@ -1184,6 +1210,21 @@ pub fn expert_row_tiled(
     by_slot: bool,
 ) -> Result<()> {
     need(out, rows * n_used * nseq, "expert_row_tiled out")?;
+    let (rt_rows, rt_acc) = expert_tile();
+    // One row per lane group IS the untiled kernel; there is no point compiling a
+    // fourth wrapper that duplicates it.
+    if rt_rows <= 1 {
+        return if by_slot {
+            expert_major_per_act(w, qb, sb, ad, out, g, rows, n_used, nseq, n_expert)
+        } else {
+            expert_major(w, qb, sb, ad, out, g, rows, n_used, nseq, n_expert)
+        };
+    }
+    let pipe = match rt_rows {
+        2 => Pipeline::Q6kExpertRt2,
+        8 => Pipeline::Q6kExpertRt8,
+        _ => Pipeline::Q6kExpertRt,
+    };
     let p = planes(w)
         .u(4, w.blocks())
         .u(5, rows)
@@ -1191,13 +1232,13 @@ pub fn expert_row_tiled(
         .u(7, nseq)
         .u(8, usize::from(by_slot));
     dispatch_acc(
-        Pipeline::Q6kExpertRt,
+        pipe,
         &[w.buf(), qb, sb, ad, out, g.0, g.1, g.2, g.3],
         p,
-        groups_for_rows_tiled(rows),
+        groups_for_rows_tiled(rows, rt_rows),
         n_expert as u32,
         // The shader's ACC_N is its token chunk, and the register budget is
-        // RT_ROWS * ACC_N — so this asks for RT_ACC, never the tile width.
-        nseq.min(RT_ACC),
+        // ROWS * ACC_N — so this asks for the chunk, never the tile width.
+        nseq.min(rt_acc),
     )
 }
