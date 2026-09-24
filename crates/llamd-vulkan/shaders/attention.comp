@@ -1,11 +1,21 @@
 #version 450
 layout(local_size_x = 256) in;
-layout(std430, binding = 0) readonly  buffer Q  { float q[];     };
-layout(std430, binding = 1) readonly  buffer KC { float kc[];    };
-layout(std430, binding = 2) readonly  buffer VC { float vc[];    };
-layout(std430, binding = 3) writeonly buffer O  { float outv[];  };
-layout(std430, binding = 4) buffer SC           { float scores[]; };
-layout(std430, binding = 5) readonly  buffer M  { int   meta[];  };
+
+// VEC4 VIEWS OF THE SAME BUFFERS. A storage binding carries bytes; the shader's
+// declared type decides how they are read. `head_dim` is a multiple of 4 — the
+// host refuses the model otherwise rather than reading it wrong — so every base
+// here divides exactly: kv_dim = n_head_kv * hd, j * kv_dim, kvh * hd and
+// (s * n_head + h) * hd are all multiples of 4.
+//
+// This is the single biggest change: one 16-byte request per lane instead of four
+// 4-byte ones, so a 64-byte cache line is consumed in 4 iterations rather than 16,
+// and there are 4x fewer load instructions to issue.
+layout(std430, binding = 0) readonly  buffer Q  { vec4  q4[];     };
+layout(std430, binding = 1) readonly  buffer KC { vec4  kc4[];    };
+layout(std430, binding = 2) readonly  buffer VC { vec4  vc4[];    };
+layout(std430, binding = 3) writeonly buffer O  { vec4  o4[];     };
+layout(std430, binding = 4) buffer SC            { float scores[]; };
+layout(std430, binding = 5) readonly  buffer M  { int   meta[];   };
 layout(push_constant) uniform P {
     uint n_head; uint n_head_kv; uint hd; uint max_kv;
     uint nseq; uint ratio;
@@ -13,22 +23,48 @@ layout(push_constant) uniform P {
     // sequences. See k_norm_rope_store.comp.
     uint kv_stride;
 } pc;
+
 shared float sh[256];
+// The query, staged ONCE. It was being re-read from global memory 128 times per
+// thread — 128 floats, read 256 * 128 times per workgroup. Every thread then reads
+// the same element on the same cycle, which is an LDS broadcast, not a conflict.
+shared vec4 sq[128];
+// Partial AV sums: one per (key partition, output vec4). Sized so 256 threads all
+// have work when hd4 divides 256, which it does at head_dim 128 (hd4 32, 8 parts).
+shared vec4 spart[256];
 
 // One workgroup per (slot, query head). Mirrors llamd_runtime::attend:
 // scale 1/sqrt(head_dim), GQA by integer division, softmax shifted by the max,
 // then the weighted sum of V. Each sequence attends only to its own cache slice.
 //
-// Each thread computes whole dot products for a subset of positions, so the
-// scores need no cross-thread reduction — only the max and the sum do. Scores
-// live in a global scratch because n_kv grows with the sequence and would
-// overflow shared memory.
+// WHY THIS WAS REWRITTEN. Profiling a real 48-layer pass put this kernel at 61% of
+// prefill time, running at 112 G MAC/s against the Q/K/V projection's 6127 — 55x
+// slower per MAC and about 1.4% of this part's fp32 rate (benchmarks.md §21). It
+// was decode-shaped: written when a pass held one token, where none of the
+// following mattered. Four defects, each making it latency-bound rather than
+// bandwidth- or ALU-bound, and each addressed here:
 //
-// CAUSALITY IS NOT A MASK HERE. n_kv comes from this slot's own position, so
-// token i reads exactly positions 0..pos_i and never sees a later one. In
-// prefill every slot writes its K and V before this dispatch runs — the barrier
-// between them guarantees it — so the entries token i reads are the earlier
-// tokens of the same pass.
+//   1. the QK dot was a 128-deep DEPENDENT FMA chain on one accumulator. Now four
+//      independent vec4 accumulators, so four FMAs are in flight per lane.
+//   2. the K reads were 4 bytes per lane. Now 16, via the vec4 view above.
+//   3. the query was re-read from global per dim per thread. Now staged in LDS.
+//   4. the AV pass idled HALF the workgroup — `for (d = t; d < hd; d += 256)` with
+//      head_dim 128 — and walked every key in another single-accumulator chain.
+//      Now every thread owns an (output vec4, key partition) pair, so all 256 work
+//      and the key loop carries `parts`-way parallelism across threads plus two
+//      accumulators within each.
+//
+// CAUSALITY IS NOT A MASK HERE. n_kv comes from this slot's own position, so token
+// i reads exactly positions 0..pos_i and never sees a later one. In prefill every
+// slot writes its K and V before this dispatch runs — the barrier between them
+// guarantees it — so the entries token i reads are the earlier tokens of the same
+// pass.
+//
+// THE SUMMATION ORDER CHANGED, and that is a deliberate, bounded accuracy change.
+// Four partial accumulators sum a 128-term f32 dot in a different order than one
+// chain did, so results differ in the last bits (relative error ~1e-7). The two
+// near-tied prompts in the agreement suite have margins of 0.1196 and 0.1946, six
+// orders of magnitude above that, and the suite is what verifies it.
 void main() {
     uint s = gl_WorkGroupID.x / pc.n_head;
     uint h = gl_WorkGroupID.x - s * pc.n_head;
@@ -39,16 +75,29 @@ void main() {
     float scale = inversesqrt(float(pc.hd));
     uint t = gl_LocalInvocationID.x;
 
-    uint qb = (s * pc.n_head + h) * pc.hd;
+    uint hd4 = pc.hd >> 2u;
+    uint qb4 = ((s * pc.n_head + h) * pc.hd) >> 2u;
     uint kbase = s * pc.kv_stride;
     uint sbase = (s * pc.n_head + h) * pc.max_kv;
 
+    for (uint i = t; i < hd4; i += 256u) sq[i] = q4[qb4 + i];
+    barrier();
+
+    // ---- scores, and their max ----
     float lmax = -1.0 / 0.0;
     for (uint j = t; j < n_kv; j += 256u) {
-        uint ko = kbase + j * kv_dim + kvh * pc.hd;
-        float dot = 0.0;
-        for (uint d = 0u; d < pc.hd; ++d) dot += q[qb + d] * kc[ko + d];
-        float sv = dot * scale;
+        uint ko4 = (kbase + j * kv_dim + kvh * pc.hd) >> 2u;
+        vec4 a0 = vec4(0.0), a1 = vec4(0.0), a2 = vec4(0.0), a3 = vec4(0.0);
+        uint i = 0u;
+        for (; i + 4u <= hd4; i += 4u) {
+            a0 += sq[i + 0u] * kc4[ko4 + i + 0u];
+            a1 += sq[i + 1u] * kc4[ko4 + i + 1u];
+            a2 += sq[i + 2u] * kc4[ko4 + i + 2u];
+            a3 += sq[i + 3u] * kc4[ko4 + i + 3u];
+        }
+        for (; i < hd4; ++i) a0 += sq[i] * kc4[ko4 + i];
+        vec4 v = (a0 + a1) + (a2 + a3);
+        float sv = (v.x + v.y + v.z + v.w) * scale;
         scores[sbase + j] = sv;
         lmax = max(lmax, sv);
     }
@@ -58,6 +107,7 @@ void main() {
     float mx = sh[0];
     barrier();
 
+    // ---- exponentiate, and sum ----
     float lsum = 0.0;
     for (uint j = t; j < n_kv; j += 256u) {
         float e = exp(scores[sbase + j] - mx);
@@ -70,10 +120,31 @@ void main() {
     float inv = 1.0 / sh[0];
     barrier();
 
-    for (uint d = t; d < pc.hd; d += 256u) {
-        float a = 0.0;
-        for (uint j = 0u; j < n_kv; ++j)
-            a += scores[sbase + j] * vc[kbase + j * kv_dim + kvh * pc.hd + d];
-        outv[(s * pc.n_head + h) * pc.hd + d] = a * inv;
+    // ---- the weighted sum of V, across every thread ----
+    // Thread t owns output vec4 `dslot` and key partition `part`. At head_dim 128
+    // that is 32 slots x 8 partitions = exactly 256, so nothing idles.
+    uint parts = max(1u, 256u / hd4);
+    uint dslot = t % hd4;
+    uint part = t / hd4;
+    if (part < parts) {
+        vec4 b0 = vec4(0.0), b1 = vec4(0.0);
+        uint j = part;
+        for (; j + parts < n_kv; j += 2u * parts) {
+            uint v0 = (kbase + j * kv_dim + kvh * pc.hd) >> 2u;
+            uint v1 = (kbase + (j + parts) * kv_dim + kvh * pc.hd) >> 2u;
+            b0 += scores[sbase + j] * vc4[v0 + dslot];
+            b1 += scores[sbase + j + parts] * vc4[v1 + dslot];
+        }
+        for (; j < n_kv; j += parts) {
+            uint v0 = (kbase + j * kv_dim + kvh * pc.hd) >> 2u;
+            b0 += scores[sbase + j] * vc4[v0 + dslot];
+        }
+        spart[part * hd4 + dslot] = b0 + b1;
+    }
+    barrier();
+    if (t < hd4) {
+        vec4 sum = vec4(0.0);
+        for (uint p = 0u; p < parts; ++p) sum += spart[p * hd4 + t];
+        o4[qb4 + t] = sum * inv;
     }
 }

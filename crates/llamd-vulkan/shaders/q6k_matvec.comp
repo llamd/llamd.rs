@@ -84,6 +84,36 @@ void main() {
     // `base` and `live` derive only from pc.nseq and ACC_N, both uniform, so every
     // lane of the subgroup runs the same number of iterations and the subgroupAdd
     // below is not reached divergently.
+    // THE SINGLE-CHUNK FAST PATH, and it is not a micro-optimisation.
+    //
+    // With only the chunked loop below, the activation bases are `base * ...`
+    // rather than the literal `0u` they used to be, so the compiler can no longer
+    // fold them out of the inner loop — it must compute an offset per access. That
+    // cost decode about 4% at batch 2 to 8, where this shader and q6k_x3 are 16% of
+    // the time and every pass fits in ONE chunk. Profiled, not guessed: attention
+    // was 2.5% of decode, so the attention rewrite could not have been the cause.
+    //
+    // So the common case — one chunk, which is every decode pass and any tile no
+    // wider than ACC_N — is written out separately with literal zero bases AND a
+    // compile-time live count. Passing `pc.nseq` there instead would reintroduce a
+    // runtime `break` into the unrolled inner loop, which is what the original
+    // shader deliberately did not have: it accumulated all ACC_N slots and filtered
+    // on the WRITE. Slots past pc.nseq then hold arithmetic on unused activation
+    // rows, which is harmless — they are never written out, and the reads are in
+    // bounds because the buffers are sized for max_seq, which is at least ACC_N.
+    if (pc.nseq <= uint(ACC_N)) {
+        float acc[ACC_N];
+        for (int i = 0; i < ACC_N; ++i) acc[i] = 0.0;
+        Q6K_ACC(w, pc.ql_u, pc.qh_u, pc.sc_u, pc.d_u, row * pc.blocks,
+                0u, 0u, 0u, ACC_N, ACC_N, acc)
+        for (int s = 0; s < ACC_N; ++s) {
+            if (uint(s) >= pc.nseq) break;
+            float t = subgroupAdd(acc[s]);
+            if (subgroupElect()) outv[uint(s) * pc.rows + row] = t;
+        }
+        return;
+    }
+
     for (uint base = 0u; base < pc.nseq; base += uint(ACC_N)) {
         uint live = min(uint(ACC_N), pc.nseq - base);
         float acc[ACC_N];

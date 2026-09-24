@@ -336,11 +336,11 @@ impl VulkanModel {
             s,
             weight_bytes,
             expert_major_min_tokens: 16,
-            // The tile is no longer bounded by the accumulator width — the shaders
-            // chunk the token dimension — so this is now a free measurement rather
-            // than a register limit. 64 measured best and the surface is flat from
-            // 64 to 512, which is itself the finding: see benchmarks.md §20.
-            prefill_tile: max_seq.min(64),
+            // The widest tile wins, now that attention is no longer 61% of the pass
+            // (§21, §22). The sweep is monotonic to 512 — which is what §20's
+            // traffic model predicted all along; it was masked by a kernel that
+            // dominated the time and did not care about the tile.
+            prefill_tile: max_seq.min(llamd_vulkan::MAX_TILE),
             fuse_qkv: true,
         })
     }

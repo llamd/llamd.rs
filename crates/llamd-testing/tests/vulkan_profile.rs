@@ -99,4 +99,38 @@ fn where_prefill_time_goes() {
             100.0 * (1.0 - expert / total)
         );
     }
+
+    // And decode, because the attention rewrite cost batched decode ~3.7% and the
+    // point of having a profiler is not to guess why.
+    for &batch in &[1usize, 8] {
+        let toks: Vec<u32> = std::iter::repeat_n(toks[0], batch).collect();
+        let pos: Vec<usize> = (0..batch).map(|_| 64).collect();
+        let _ = vk.forward_batch(&toks, &pos).expect("warm");
+        ops::profile(true).expect("timestamps");
+        let _ = vk.forward_batch(&toks, &pos).expect("decode");
+        let last = ops::profile_read();
+        ops::profile(false).expect("off");
+
+        let mut by: HashMap<&'static str, (f64, usize)> = HashMap::new();
+        let mut total = 0.0;
+        for (p, ms) in &last {
+            let e = by.entry(p.shader_name()).or_insert((0.0, 0));
+            e.0 += ms;
+            e.1 += 1;
+            total += ms;
+        }
+        let mut rows: Vec<_> = by.into_iter().collect();
+        rows.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
+        eprintln!();
+        eprintln!("  ===== decode batch {batch}, 64 tokens of context: {total:.2} ms on the GPU");
+        for (name, (ms, n)) in rows.iter().take(6) {
+            eprintln!(
+                "  {:<24}{:>8}{:>11}{:>10}",
+                name,
+                n,
+                format!("{ms:.2}"),
+                format!("{:.1}%", 100.0 * ms / total)
+            );
+        }
+    }
 }

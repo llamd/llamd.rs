@@ -765,6 +765,20 @@ pub fn attention(
             format!("{n_head} query heads do not divide into {n_head_kv} kv heads"),
         ));
     }
+    // The shader reads Q, K, V and the output through a vec4 view of the same
+    // buffers — four times fewer load instructions and a 16-byte request per lane,
+    // which is most of why it is no longer 61% of prefill. That requires every base
+    // it computes to divide by 4, and they all reduce to head_dim. An indivisible
+    // head_dim is REFUSED rather than read wrong: the alternative is a shader that
+    // silently reads across element boundaries and returns plausible nonsense.
+    //
+    // 512 is the `shared vec4 sq[128]` staging bound.
+    if hd % 4 != 0 || hd == 0 || hd > 512 {
+        return Err(Error::unsupported(
+            "attention",
+            format!("head_dim {hd} must be a non-zero multiple of 4 and at most 512"),
+        ));
+    }
     let p = Push::new()
         .u(0, n_head)
         .u(1, n_head_kv)

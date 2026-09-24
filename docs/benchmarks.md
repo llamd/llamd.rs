@@ -1849,3 +1849,115 @@ Three sections of kernel work went into the expert path on the strength of a
 traffic argument: experts are 96.5% of prefill's weight traffic and 67% of its
 arithmetic. Both figures are true. Neither is a share of TIME. A profiler was
 available the whole time and would have said `attention 61%` in one run.
+
+---
+
+## 22. The attention rewrite: prefill 680 → 1337 tok/s
+
+§21 said attention was 61% of prefill and named four defects. This fixes them. It
+is the largest single change in the engine's history, and it also vindicates §20,
+whose traffic model turned out to be right and merely masked.
+
+### What changed in `attention.comp`
+
+| defect | fix |
+|---|---|
+| QK dot was a 128-deep **dependent** FMA chain on one accumulator | four independent `vec4` accumulators |
+| K/V read 4 bytes per lane | `vec4` views of the same bindings — 16 bytes per request, 4× fewer instructions, a 64-byte line consumed in 4 iterations instead of 16 |
+| the query re-read from global 128× per thread | staged once in LDS (`shared vec4 sq[128]`), read as a broadcast |
+| AV pass idled **half** the workgroup and walked every key in one chain | every thread owns an (output `vec4`, key partition) pair — 32 × 8 = exactly 256 at head_dim 128 — plus two accumulators each |
+
+The `vec4` view requires `head_dim % 4 == 0`, so the host now **refuses** a model
+where it isn't rather than reading across element boundaries and returning
+plausible nonsense.
+
+### The kernel
+
+| | before | after |
+|---|---|---|
+| `attention`, per 512-token pass | 460.38 ms | **68.49 ms** |
+| share of prefill | 60.5% | **17.9%** |
+| rate | 112 G MAC/s | **753 G MAC/s** |
+
+**6.7× on the kernel.**
+
+### The engine
+
+| prefill tile | §20 | now |
+|---|---|---|
+| 32 | 659.5 | 843.0 |
+| 64 | 681.9 | 1062.6 |
+| 128 | 676.4 | 1215.4 |
+| 256 | 669.1 | 1291.9 |
+| **512** | 670.8 | **1337.1** |
+
+**The sweep is now monotonic to 512, and 512 is the best tile.** That is §20's
+traffic model being correct after all: widening the tile does cut expert weight
+traffic 13.8×, and it was worth nothing only because a kernel that dominated the
+time and ignored the tile stood in front of it. The default is now `MAX_TILE`.
+
+| prompt | §20 | now | vs one-at-a-time |
+|---|---|---|---|
+| 64 | 1079.6 | 1127.6 | 9.7× |
+| 128 | 1033.2 | 1349.8 | 11.7× |
+| 256 | 880.6 | **1425.4** | 12.3× |
+| 512 | 680.3 | **1337.1** | 11.8× |
+
+**pp512 1.98×.** A 512-token prompt: 0.753 s → **0.383 s**.
+
+Long-context decode improved too, as a side effect: one-at-a-time ingestion of 512
+tokens — which is decode with a growing cache — went 88.2 → 113.7 tok/s, **+29%**,
+because attention is the part of decode that grows with context.
+
+### The new profile
+
+| kernel | tile 512 |
+|---|---|
+| `q6k_expert_rt` | **50.0%** |
+| `attention` | 17.9% |
+| `q6k_matvec` | 14.8% |
+| `q6k_x3` | 10.6% |
+| `matvec_f32` | 3.2% |
+
+The routed experts are now the top cost, which is where the traffic argument said
+they were all along. At tile 512 they move 23.8 GB in 191 ms — 124 GB/s, 19% of
+peak — and run at 4852 G MAC/s against a ~32800 ceiling, so there is headroom.
+
+### Where llamd stands
+
+| | llamd | llama.cpp Vulkan |
+|---|---|---|
+| decode, 1 stream | **112 – 117** | 94.4 – 95.6 |
+| decode, batch 8 | **398 – 402** | 290.9 |
+| **prefill pp512** | **1337** | 3214 (1834 without coopmat) |
+
+Prefill is **2.40× behind**, from 4.9×. Against llama.cpp's non-coopmat path it is
+**0.73×**, from 0.37×.
+
+### Three things measured and NOT concluded
+
+Decode at batch 4–8 read ~3% below a single-run baseline of 276.59/411.30. Best of
+four gives 267.7/398.1. It is **not** reported as a regression, because:
+
+1. The profiler shows attention is **2.5%** of decode at batch 8 — it cannot
+   account for 3%.
+2. A single-chunk fast path with literal-zero bases in `q6k_matvec`/`q6k_x3`,
+   restoring the exact pre-chunking inner loop, changed nothing.
+3. Removing the macro's runtime `break` entirely changed nothing (190.07 vs 189.93
+   at batch 2, 400.02 vs 398.08 at batch 8) — a third counting model refuted.
+
+And the run-to-run spread at batch 1 across four runs was 98.82, 111.55, 112.20,
+117.18 — 19%. A single-run baseline sits anywhere in that. Deciding this needs an
+in-process A/B, which a shader change cannot have. The fast path was kept anyway:
+it is the correct shape, and it costs nothing.
+
+### Correctness
+
+All five prompts still token-for-token equal to llama.cpp. Prefill equals
+sequential decode across 100 (tile, length) cases. Row-tiled experts exact across
+45. 131 passed, 0 failed, 22 ignored.
+
+The summation order **did** change — four partial accumulators sum a 128-term f32
+dot differently than one chain — so results differ at ~1e-7 relative. The two
+near-tied prompts have margins of 0.1196 and 0.1946, six orders of magnitude
+above that, and the agreement suite is what verifies it rather than an argument.

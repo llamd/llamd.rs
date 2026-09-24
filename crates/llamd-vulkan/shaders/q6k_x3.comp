@@ -66,6 +66,20 @@ void main() {
     // Token-chunked exactly as q6k_matvec is, so a wide prefill tile costs
     // registers per CHUNK rather than per tile. See that shader for why.
     if (grow < pc.rows0) {
+        if (pc.nseq <= uint(ACC_N)) {
+            // One chunk: literal zero bases, so the offsets fold away. See
+            // q6k_matvec.comp for why that is worth writing twice.
+            float acc[ACC_N];
+            for (int i = 0; i < ACC_N; ++i) acc[i] = 0.0;
+            Q6K_ACC(w0, pc.q_ql, pc.q_qh, pc.q_sc, pc.q_d, grow * pc.blocks,
+                    0u, 0u, 0u, ACC_N, ACC_N, acc)
+            for (int s = 0; s < ACC_N; ++s) {
+                if (uint(s) >= pc.nseq) break;
+                float t = subgroupAdd(acc[s]);
+                if (subgroupElect()) o0[uint(s) * pc.rows0 + grow] = t;
+            }
+            return;
+        }
         for (uint base = 0u; base < pc.nseq; base += uint(ACC_N)) {
             uint live = min(uint(ACC_N), pc.nseq - base);
             float acc[ACC_N];
@@ -81,6 +95,20 @@ void main() {
         }
     } else if (grow < pc.rows0 + pc.rows1) {
         uint row = grow - pc.rows0;
+        if (pc.nseq <= uint(ACC_N)) {
+            // One chunk: literal zero bases, so the offsets fold away. See
+            // q6k_matvec.comp for why that is worth writing twice.
+            float acc[ACC_N];
+            for (int i = 0; i < ACC_N; ++i) acc[i] = 0.0;
+            Q6K_ACC(w1, pc.k_ql, pc.k_qh, pc.k_sc, pc.k_d, row * pc.blocks,
+                    0u, 0u, 0u, ACC_N, ACC_N, acc)
+            for (int s = 0; s < ACC_N; ++s) {
+                if (uint(s) >= pc.nseq) break;
+                float t = subgroupAdd(acc[s]);
+                if (subgroupElect()) o1[uint(s) * pc.rows1 + row] = t;
+            }
+            return;
+        }
         for (uint base = 0u; base < pc.nseq; base += uint(ACC_N)) {
             uint live = min(uint(ACC_N), pc.nseq - base);
             float acc[ACC_N];
@@ -96,6 +124,20 @@ void main() {
         }
     } else {
         uint row = grow - pc.rows0 - pc.rows1;
+        if (pc.nseq <= uint(ACC_N)) {
+            // One chunk: literal zero bases, so the offsets fold away. See
+            // q6k_matvec.comp for why that is worth writing twice.
+            float acc[ACC_N];
+            for (int i = 0; i < ACC_N; ++i) acc[i] = 0.0;
+            Q6K_ACC(w2, pc.v_ql, pc.v_qh, pc.v_sc, pc.v_d, row * pc.blocks,
+                    0u, 0u, 0u, ACC_N, ACC_N, acc)
+            for (int s = 0; s < ACC_N; ++s) {
+                if (uint(s) >= pc.nseq) break;
+                float t = subgroupAdd(acc[s]);
+                if (subgroupElect()) o2[uint(s) * pc.rows2 + row] = t;
+            }
+            return;
+        }
         for (uint base = 0u; base < pc.nseq; base += uint(ACC_N)) {
             uint live = min(uint(ACC_N), pc.nseq - base);
             float acc[ACC_N];
