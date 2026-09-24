@@ -38,9 +38,9 @@ const int MAX_SEQ = 8;
 
 // The whole planar weight tensor, addressed as uints. Plane offsets arrive as
 // push constants already divided by 4.
-layout(std430, binding = 0) readonly buffer W  { uint  w[];  };
+layout(std430, binding = 0) readonly buffer W { uvec4 w[]; };
 // Activation, biased to unsigned and packed 4 bytes per uint.
-layout(std430, binding = 1) readonly buffer QB { uint  qb[]; };
+layout(std430, binding = 1) readonly buffer QB { uvec4 qb[]; };
 // Per-16 group sums of the biased activation.
 layout(std430, binding = 2) readonly buffer SB { int   sb[]; };
 // Per-block activation scale.

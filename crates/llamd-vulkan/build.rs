@@ -42,6 +42,7 @@ const SHADERS: &[&str] = &[
     "q6k_expert_rt8",
     "coopmat_probe",
     "q6k_expert_cm",
+    "matvec_ablate",
 ];
 
 fn main() {

@@ -266,3 +266,130 @@ fn coopmat_experts_against_the_dot_kernel() {
         best.0, best.1
     );
 }
+
+/// Where the matvec kernels' time goes, by ablation on the real weights.
+///
+/// RADV exposes no VK_KHR_performance_query and its SQTT needs AMD's RGP to read, so
+/// the counters come from removing one class of work at a time and reading the
+/// deltas. Mode 3 is the control that separates waiting from working: if dropping
+/// the weight LOADS collapses the time while dropping the dot products does not,
+/// the kernel is stalled on memory rather than busy.
+#[test]
+#[ignore = "uploads a real tensor; needs a free GPU and the real model"]
+fn where_the_matvec_time_goes() {
+    let Some(path) = oracle_model() else {
+        eprintln!("  SKIP where_the_matvec_time_goes: no LLAMD_TEST_MODEL");
+        return;
+    };
+    if !llamd_vulkan::available() {
+        return;
+    }
+    let model = Model::open(&path).expect("open");
+    // Two shapes, because they behave differently and the engine spends most of
+    // prefill in the second: the attention output projection that q6k_matvec runs 48
+    // times, and ONE EXPERT's gate projection — the shape the expert kernel runs
+    // 128 x 3 x 48 times and that four separate optimisations have failed to move.
+    // Same arithmetic, same harness, so the difference is the shape.
+    for &(name, label) in &[
+        ("blk.0.attn_output.weight", "attn_output 4096->2048"),
+        ("blk.0.ffn_gate_exps.weight", "ONE expert gate 2048->768"),
+    ] {
+        run_one(&model, name, label);
+    }
+}
+
+fn run_one(model: &Model, name: &str, label: &str) {
+    let info = model.info(name).expect("info");
+    let k = info.dims[0] as usize;
+    // For the expert tensor this takes the FIRST expert's slice: the ablation is
+    // about the shape and the access pattern, not about routing.
+    let rows = if name.contains("exps") {
+        768
+    } else {
+        info.elems() as usize / k
+    };
+    let blocks = k / 256;
+    let raw = model.gguf().tensor_data(info).expect("bytes");
+    let w = llamd_vulkan::PlanarWeights::upload(raw, rows, blocks).expect("upload");
+    let nseq = 32usize;
+
+    let qb = VkBuf::from_bytes(&vec![0x40u8; nseq * blocks * 256]).expect("qb");
+    let sb = VkBuf::from_i32(&vec![16i32; nseq * blocks * 16]).expect("sb");
+    let ad = VkBuf::from_f32(&vec![0.01f32; nseq * blocks]).expect("ad");
+    let out = VkBuf::new(rows * nseq * 4).expect("out");
+
+    // MACs one dispatch performs: every row, every K, every sequence.
+    let macs = rows as f64 * (blocks * 256) as f64 * nseq as f64;
+    let reps = 64usize;
+
+    let run = |mode: usize| -> f64 {
+        ops::begin().expect("begin");
+        for _ in 0..4 {
+            ops::matvec_ablate(&w, &qb, &sb, &ad, &out, rows, nseq, mode).expect("ablate");
+        }
+        ops::end_and_wait().expect("wait");
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            ops::begin().expect("begin");
+            for _ in 0..reps {
+                ops::matvec_ablate(&w, &qb, &sb, &ad, &out, rows, nseq, mode).expect("ablate");
+            }
+            ops::end_and_wait().expect("wait");
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        best / reps as f64 * 1e3
+    };
+
+    let names = [
+        "0 full kernel",
+        "1 no dot products",
+        "2 no Q6_K unpack",
+        "3 no WEIGHT loads",
+        "4 no activation loads",
+        "5 FULL, vec4 loads",
+    ];
+    let mut ms = [0.0f64; 6];
+    eprintln!();
+    eprintln!(
+        "  {label}, {nseq} sequences, {:.2} G MAC per dispatch",
+        macs / 1e9
+    );
+    eprintln!(
+        "  {:<24}{:>10}{:>12}{:>11}",
+        "arm", "ms", "G MAC/s", "time saved"
+    );
+    for mode in 0..6 {
+        ms[mode] = run(mode);
+        eprintln!(
+            "  {:<24}{:>10}{:>12}{:>11}",
+            names[mode],
+            format!("{:.3}", ms[mode]),
+            format!("{:.0}", macs / (ms[mode] / 1e3) / 1e9),
+            if mode == 0 {
+                "-".to_string()
+            } else {
+                format!("{:.0}%", 100.0 * (1.0 - ms[mode] / ms[0]))
+            }
+        );
+    }
+    eprintln!();
+    eprintln!(
+        "  the dot products are   {:>5.0}% of the kernel",
+        100.0 * (1.0 - ms[1] / ms[0])
+    );
+    eprintln!(
+        "  the Q6_K unpack is     {:>5.0}%",
+        100.0 * (1.0 - ms[2] / ms[0])
+    );
+    eprintln!(
+        "  the weight traffic is  {:>5.0}%",
+        100.0 * (1.0 - ms[3] / ms[0])
+    );
+    eprintln!(
+        "  the activation reads   {:>5.0}%",
+        100.0 * (1.0 - ms[4] / ms[0])
+    );
+    eprintln!();
+    eprintln!("  VECTORISING THE LOADS: {:.3}x", ms[0] / ms[5]);
+}

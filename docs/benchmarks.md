@@ -2261,3 +2261,95 @@ until the unpack itself gets cheaper.
 The kernel is kept and defaulted OFF: correct, measured, 0.987×, and the right
 shape for a workload this benchmark does not contain. Parity is not a reason to put
 more machinery on the hot path.
+
+---
+
+## 26. Hardware counters by ablation, and the reduction nobody was looking at
+
+Four optimisations had by now failed on the matmul kernels (§19, §20, §24, and a
+re-sweep of the token chunk that returned the existing default). Every one reasoned
+from op counts. This section stops reasoning and gets the counters.
+
+### There are no counters, so they were measured instead
+
+RADV exposes **no `VK_KHR_performance_query`**. It does support SQTT with
+`RADV_THREAD_TRACE_CACHE_COUNTERS` and `RADV_THREAD_TRACE_INSTRUCTION_TIMING`, and
+`MESA_VK_TRACE_TRIGGER` even allows a capture without a swapchain — but the `.rgp`
+needs AMD's GUI to read, and `rocprofv3` only reaches HIP/HSA, not Vulkan.
+
+So: run the real kernel over a real tensor and **remove one class of work at a
+time**. `matvec_ablate.comp`, five arms plus a vectorised sixth, every arm consuming
+what it computes so nothing is eliminated.
+
+### What it says
+
+| arm | attn_output 4096→2048 | one expert gate 2048→768 |
+|---|---|---|
+| full kernel | 2397 G MAC/s | 1842 G MAC/s |
+| dot products | **31%** | **13%** |
+| activation reads | **40%** | 28% |
+| weight traffic | 3% | 3% |
+| Q6_K unpack | ~0% | ~0% |
+| **unaccounted** | **28%** | **57%** |
+
+Two things nobody had measured:
+
+**The weights are not the problem — the activations are.** Removing the weight
+traffic saves 3%; removing the activation reads saves 28–40%. The inner loop issues
+**11 activation loads per (K-group, sequence)** — eight `qb` uints, two `sb`, one
+`ad` — against **eight weight loads per K-group**. At 32 sequences that is 352 to 8,
+a ratio of 44:1. Three sections of this document optimised weight traffic.
+
+**And 57% of the expert kernel is none of its work at all.**
+
+### The vectorisation that follows from it
+
+The eight `qb` uints are four-consecutive, twice. Every index the kernel forms for a
+run of four is 4-aligned, so both buffers become `uvec4` views and one 16-byte load
+replaces four. On the isolated kernel: **1.21×**.
+
+In the engine — `q6k.glsl` serves `q6k_matvec`, `q6k_x3` and both decode grouped
+kernels:
+
+| | before | after |
+|---|---|---|
+| decode, one-at-a-time | 113.7 | **127.5 t/s** (+12%) |
+| pp128 | 1349.8 | **1414.3** |
+| pp256 | 1425.4 | **1521.7** |
+| pp512 | 1396 | 1391 (flat) |
+
+Vectorising the **expert** kernel too was **1.5% slower** (1370.7 against 1391.4,
+consistent over three runs each) — `uvec4` temporaries widen a kernel §23 already
+showed to be register-bound. Reverted. The same change helps one kernel and hurts
+another, which is only knowable by measuring both.
+
+### The 57%, explained by geometry
+
+The expert gate is K = 2048, so `n_u4 = blocks * 8 = 64` — and the subgroup is **64
+lanes wide**. Each lane runs **exactly one iteration** of the K loop. Then it pays
+the epilogue: a `subgroupAdd` per accumulator, 32 of them, each ~6 DPP steps on
+wave64. That is roughly **192 reduction operations against 256 dot instructions of
+actual work.**
+
+**The expert kernel spends more time reducing across lanes than multiplying.** The
+one-subgroup-per-output-row decomposition — which measured best three times in §16,
+on shapes with a long K — is pathological when K is short enough that the loop
+disappears.
+
+None of the four failed optimisations touched this. Wide tiles, row tiling,
+cooperative matrix and chunk width all changed what happened *inside* the loop.
+
+### What follows, stated as a hypothesis this time
+
+The fix that removes the reduction entirely is **one lane per output row** instead of
+one subgroup per row: a lane accumulates a whole row's K, so there is nothing to
+reduce. Its cost is that lanes then read different rows, so weight loads go
+uncoalesced — and the ablation says weight traffic is **3%**, which is what makes
+this affordable here and would not have been on a shape where weights dominated.
+Activations become a broadcast across lanes, which is the cheapest access there is.
+
+If the reduction is 43% of the expert kernel and a quarter of the matvec kernels,
+that is ~97 ms of a 371 ms pass, or about **1870 tok/s**. Against llama.cpp's 3214
+that is still behind, and this is the fifth projection in this document — the
+difference from the previous four is that it rests on a measured 57% with a
+mechanical explanation rather than on an op count.

@@ -1,0 +1,174 @@
+#version 450
+//
+// WHERE THE MATVEC KERNELS' TIME ACTUALLY GOES, by ablation.
+//
+// RADV does not expose VK_KHR_performance_query, and its SQTT captures need AMD's
+// RGP to read. So the counters are obtained the other way: run the REAL kernel over
+// the REAL weights, remove one class of work at a time, and read the deltas. That is
+// a measurement on the code in question rather than a model of it, which is what
+// four failed projections (§19, §20, §24, and the chunk re-sweep) argue for.
+//
+//   0  full            the production kernel's arithmetic, unmodified
+//   5  vec4 loads      the same, with the 4-consecutive-uint loads vectorised
+//   1  no dot          loads and unpack stay; the packed dot products go
+//   2  no unpack       loads stay; the nibble/qh assembly goes
+//   3  no weight load  unpack and dot stay, fed from a constant
+//   4  no act load     weights stay; the activation reads go
+//
+// Every mode keeps the output write and consumes everything it computes, so nothing
+// is eliminated. What the deltas cannot tell apart is latency from bandwidth — for
+// that, mode 3 is the control: if removing the weight LOADS collapses the time while
+// removing the dot products does not, the kernel is waiting on memory, not working.
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256) in;
+
+// uvec4 VIEWS. Every index this kernel forms for a run of four uints is 4-aligned —
+// ql is ri*32 + u*4, qh is b*16 + h*8 + {0,4}, and the activation is
+// s*blocks*64 + b*64 + h*32 + {0,4,8,12} — so one 16-byte load replaces four, and
+// scalar reads become a component select. THE ABLATION SAID THIS IS THE KERNEL: the
+// activation reads are 46% of it and the weight traffic 11%, because the inner loop
+// issues 11 activation loads per (K-group, sequence) against 8 weight loads per
+// K-group. At 32 sequences that is 352 against 8.
+layout(std430, binding = 0) readonly buffer W  { uvec4 w4[];   };
+layout(std430, binding = 1) readonly buffer QB { uvec4 qb4[];  };
+#define w(i)  (w4[(i) >> 2u][(i) & 3u])
+layout(std430, binding = 2) readonly buffer SB { int   sb[];   };
+layout(std430, binding = 3) readonly buffer AD { float ad[];   };
+layout(std430, binding = 4) buffer          O  { float outv[]; };
+
+layout(push_constant) uniform Push {
+    uint ql_u; uint qh_u; uint sc_u; uint d_u;
+    uint blocks; uint rows; uint nseq; uint mode;
+} pc;
+#include "common.glsl"
+
+layout(constant_id = 0) const int ACC_N = 32;
+
+void main() {
+    uint row = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
+    if (row >= pc.rows) return;
+    uint m = pc.mode;
+
+    float acc[ACC_N];
+    for (int i = 0; i < ACC_N; ++i) acc[i] = 0.0;
+
+    uint ri = row * pc.blocks;
+    uint qlr = pc.ql_u + ri * 32u;
+    uint qhr = pc.qh_u + ri * 16u;
+    uint scr = pc.sc_u + ri * 4u;
+    uint n_u4 = pc.blocks * 8u;
+
+    for (uint u = gl_SubgroupInvocationID; u < n_u4; u += gl_SubgroupSize) {
+        uint b = u >> 3u, jb0 = (u & 7u) << 4u;
+        uint h = jb0 >> 6u, m0 = jb0 & 63u;
+        uint shl = (m0 >= 32u) ? 2u : 0u, s4 = shl + 4u;
+
+        uint q0, q1, q2, q3, h0, h1, h2, h3;
+        if (m == 5u) {
+            uvec4 qv = w4[(qlr + u * 4u) >> 2u];
+            q0 = qv.x; q1 = qv.y; q2 = qv.z; q3 = qv.w;
+            uint hb = qhr + b * 16u + h * 8u + ((m0 & 31u) >> 2u);
+            uvec4 hv = w4[hb >> 2u];
+            h0 = hv.x; h1 = hv.y; h2 = hv.z; h3 = hv.w;
+        } else if (m == 3u) {
+            // Fed from a constant: the unpack and the dots still run, the weight
+            // traffic does not. This is the control that separates waiting from work.
+            q0 = 0x3C3C3C3Cu; q1 = q0; q2 = q0; q3 = q0;
+            h0 = 0x55555555u; h1 = h0; h2 = h0; h3 = h0;
+        } else {
+            q0 = w(qlr + u * 4u + 0u); q1 = w(qlr + u * 4u + 1u);
+            q2 = w(qlr + u * 4u + 2u); q3 = w(qlr + u * 4u + 3u);
+            uint hb = qhr + b * 16u + h * 8u + ((m0 & 31u) >> 2u);
+            h0 = w(hb + 0u); h1 = w(hb + 1u); h2 = w(hb + 2u); h3 = w(hb + 3u);
+        }
+
+        uint l0, l1, l2, l3, i0, i1, i2, i3;
+        if (m == 2u) {
+            // The loaded words used AS IF unpacked: the traffic stays, the nibble
+            // and 2-bit assembly goes.
+            l0 = q0; l1 = q1; l2 = q2; l3 = q3;
+            i0 = h0; i1 = h1; i2 = h2; i3 = h3;
+        } else {
+            l0 = (q0 & 0x0F0F0F0Fu) | (((h0 >> shl) & 0x03030303u) << 4u);
+            l1 = (q1 & 0x0F0F0F0Fu) | (((h1 >> shl) & 0x03030303u) << 4u);
+            l2 = (q2 & 0x0F0F0F0Fu) | (((h2 >> shl) & 0x03030303u) << 4u);
+            l3 = (q3 & 0x0F0F0F0Fu) | (((h3 >> shl) & 0x03030303u) << 4u);
+            i0 = ((q0 >> 4u) & 0x0F0F0F0Fu) | (((h0 >> s4) & 0x03030303u) << 4u);
+            i1 = ((q1 >> 4u) & 0x0F0F0F0Fu) | (((h1 >> s4) & 0x03030303u) << 4u);
+            i2 = ((q2 >> 4u) & 0x0F0F0F0Fu) | (((h2 >> s4) & 0x03030303u) << 4u);
+            i3 = ((q3 >> 4u) & 0x0F0F0F0Fu) | (((h3 >> s4) & 0x03030303u) << 4u);
+        }
+
+        uint swl = dotPacked4x8AccSatEXT(l0, 0x01010101u, 0u);
+        swl = dotPacked4x8AccSatEXT(l1, 0x01010101u, swl);
+        swl = dotPacked4x8AccSatEXT(l2, 0x01010101u, swl);
+        swl = dotPacked4x8AccSatEXT(l3, 0x01010101u, swl);
+        uint swh = dotPacked4x8AccSatEXT(i0, 0x01010101u, 0u);
+        swh = dotPacked4x8AccSatEXT(i1, 0x01010101u, swh);
+        swh = dotPacked4x8AccSatEXT(i2, 0x01010101u, swh);
+        swh = dotPacked4x8AccSatEXT(i3, 0x01010101u, swh);
+        int cl = -128 * int(swl) + 32 * 128 * 16;
+        int ch = -128 * int(swh) + 32 * 128 * 16;
+
+        uint si = b * 16u + h * 8u + (m0 >> 4u);
+        int scl = bitfieldExtract(int(w(scr + (si >> 2u))), int(8u * (si & 3u)), 8);
+        uint sj = si + 4u;
+        int sch = bitfieldExtract(int(w(scr + (sj >> 2u))), int(8u * (sj & 3u)), 8);
+        uint di = pc.d_u + ((ri + b) >> 1u);
+        vec2 dp = unpackHalf2x16(w(di));
+        float dw = (((ri + b) & 1u) == 0u) ? dp.x : dp.y;
+
+        uint bu = b * 64u + h * 32u + (m0 >> 2u);
+        uint g16 = b * 16u + h * 8u + (m0 >> 4u);
+
+        for (int s = 0; s < ACC_N; ++s) {
+            uint ab = uint(s) * pc.blocks * 64u + bu;
+            uint a0, a1, a2, a3, a4, a5, a6, a7;
+            int sbl, sbh;
+            float as;
+            if (m == 4u) {
+                a0 = 0x40404040u; a1 = a0; a2 = a0; a3 = a0;
+                a4 = a0; a5 = a0; a6 = a0; a7 = a0;
+                sbl = 16; sbh = 16; as = 1.0;
+            } else {
+                // ONE 16-byte load each instead of four 4-byte ones.
+                uvec4 av = qb4[ab >> 2u];
+                a0 = av.x; a1 = av.y; a2 = av.z; a3 = av.w;
+                uvec4 bv = qb4[(ab + 16u) >> 2u];
+                a4 = bv.x; a5 = bv.y; a6 = bv.z; a7 = bv.w;
+                sbl = sb[uint(s) * pc.blocks * 16u + g16];
+                sbh = sb[uint(s) * pc.blocks * 16u + g16 + 4u];
+                as = ad[uint(s) * pc.blocks + b];
+            }
+            if (m == 1u) {
+                // No dot products. Everything loaded and unpacked is still consumed,
+                // so nothing above can be eliminated.
+                acc[s] += as * float(int(l0 ^ l1 ^ l2 ^ l3) + int(i0 ^ i1 ^ i2 ^ i3)
+                                     + int(a0 ^ a4) + sbl + sbh + cl + ch + scl + sch);
+            } else {
+                uint wl = dotPacked4x8AccSatEXT(l0, a0, 0u);
+                wl = dotPacked4x8AccSatEXT(l1, a1, wl);
+                wl = dotPacked4x8AccSatEXT(l2, a2, wl);
+                wl = dotPacked4x8AccSatEXT(l3, a3, wl);
+                uint wh = dotPacked4x8AccSatEXT(i0, a4, 0u);
+                wh = dotPacked4x8AccSatEXT(i1, a5, wh);
+                wh = dotPacked4x8AccSatEXT(i2, a6, wh);
+                wh = dotPacked4x8AccSatEXT(i3, a7, wh);
+                int il = scl * (int(wl) + cl - 32 * sbl);
+                int ih = sch * (int(wh) + ch - 32 * sbh);
+                acc[s] += dw * as * float(il + ih);
+            }
+        }
+    }
+
+    for (int s = 0; s < ACC_N; ++s) {
+        if (uint(s) >= pc.nseq) break;
+        float t = subgroupAdd(acc[s]);
+        if (subgroupElect()) outv[uint(s) * pc.rows + row] = t;
+    }
+}

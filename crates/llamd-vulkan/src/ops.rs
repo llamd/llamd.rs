@@ -49,6 +49,7 @@ pub enum Pipeline {
     Q6kExpertRt8 = 26,
     CoopmatProbe = 27,
     Q6kExpertCm = 28,
+    MatvecAblate = 29,
 }
 
 impl Pipeline {
@@ -84,10 +85,11 @@ impl Pipeline {
             Pipeline::Q6kExpertRt8 => "q6k_expert_rt8",
             Pipeline::CoopmatProbe => "coopmat_probe",
             Pipeline::Q6kExpertCm => "q6k_expert_cm",
+            Pipeline::MatvecAblate => "matvec_ablate",
         }
     }
 
-    pub const ALL: [Pipeline; 29] = [
+    pub const ALL: [Pipeline; 30] = [
         Pipeline::Q6kMatvec,
         Pipeline::Q6kX3,
         Pipeline::Q6kGemm,
@@ -117,6 +119,7 @@ impl Pipeline {
         Pipeline::Q6kExpertRt8,
         Pipeline::CoopmatProbe,
         Pipeline::Q6kExpertCm,
+        Pipeline::MatvecAblate,
     ];
 }
 
@@ -444,6 +447,31 @@ pub fn expert_coopmat(
         p,
         (rows / CM_ROWS_PER_WG) as u32,
         n_expert as u32,
+    )
+}
+
+/// The ablation matvec: the production arithmetic with one class of work removed.
+/// `mode` 0 full, 1 no dot, 2 no unpack, 3 no weight load, 4 no activation load.
+/// See `shaders/matvec_ablate.comp`.
+#[allow(clippy::too_many_arguments)]
+pub fn matvec_ablate(
+    w: &PlanarWeights,
+    qb: &VkBuf,
+    sb: &VkBuf,
+    ad: &VkBuf,
+    out: &VkBuf,
+    rows: usize,
+    nseq: usize,
+    mode: usize,
+) -> Result<()> {
+    let p = planes(w).u(4, w.blocks()).u(5, rows).u(6, nseq).u(7, mode);
+    dispatch_acc(
+        Pipeline::MatvecAblate,
+        &[w.buf(), qb, sb, ad, out],
+        p,
+        groups_for_rows(rows),
+        1,
+        32,
     )
 }
 

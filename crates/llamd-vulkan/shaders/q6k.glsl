@@ -14,7 +14,13 @@
 // hand in four shaders — which is four places for a divergence that would flip
 // a near-tied expert and change the emitted token.
 //
-// WB   the weight buffer (uint[])
+// WB   the weight buffer, as uvec4[]. ABLATION SAID THIS IS THE KERNEL: removing the
+//      activation reads saved 40% of a real matvec while removing the weight traffic
+//      saved 3%, because the inner loop issues 11 activation loads per (K-group,
+//      sequence) against 8 weight loads per K-group — 352 to 8 at 32 sequences. Every
+//      index formed for a run of four uints here is 4-aligned, so one 16-byte load
+//      replaces four and scalar reads become a component select. Measured 1.25x on
+//      the kernel; see benchmarks.md §26.
 // QLU/QHU/SCU/DU  that buffer's four plane offsets, in uints
 // RI   the row's flat block index, i.e. row*blocks (or expert_row*blocks)
 // AQ   activation base, in uints
@@ -60,13 +66,11 @@
         uint _h = _j >> 6u;                                                    \
         uint _m = _j & 63u;                                                    \
         uint _sh = (_m >= 32u) ? 2u : 0u;                                       \
-        uint _q0 = WB[_qlr + _u * 4u + 0u];                                     \
-        uint _q1 = WB[_qlr + _u * 4u + 1u];                                     \
-        uint _q2 = WB[_qlr + _u * 4u + 2u];                                     \
-        uint _q3 = WB[_qlr + _u * 4u + 3u];                                     \
+        uvec4 _qv = WB[(_qlr + _u * 4u) >> 2u];                                  \
+        uint _q0 = _qv.x, _q1 = _qv.y, _q2 = _qv.z, _q3 = _qv.w;                 \
         uint _hb = _qhr + _b * 16u + _h * 8u + ((_m & 31u) >> 2u);               \
-        uint _h0 = WB[_hb + 0u], _h1 = WB[_hb + 1u];                            \
-        uint _h2 = WB[_hb + 2u], _h3 = WB[_hb + 3u];                            \
+        uvec4 _hv = WB[_hb >> 2u];                                               \
+        uint _h0 = _hv.x, _h1 = _hv.y, _h2 = _hv.z, _h3 = _hv.w;                 \
         /* Whole-word unpack: the packed word already holds four weights in the \
            order the dot product wants, so one mask-and-shift does all four. */ \
         uint _l0 = (_q0 & 0x0F0F0F0Fu) | (((_h0 >> _sh) & 0x03030303u) << 4u);   \
@@ -91,28 +95,29 @@
         uint _bu = _b * 64u + _h * 32u + (_m >> 2u);                             \
         uint _g  = _b * 16u + _h * 8u + (_m >> 4u);                              \
         uint _si = _b * 16u + _h * 8u + (_m >> 4u);                              \
-        int _scl = bitfieldExtract(int(WB[_scr + (_si >> 2u)]),                  \
+        int _scl = bitfieldExtract(int(WB[(_scr + (_si >> 2u)) >> 2u][(_scr + (_si >> 2u)) & 3u]),                  \
                                    int(8u * (_si & 3u)), 8);                     \
         uint _sj = _si + 4u;                                                     \
-        int _sch = bitfieldExtract(int(WB[_scr + (_sj >> 2u)]),                  \
+        int _sch = bitfieldExtract(int(WB[(_scr + (_sj >> 2u)) >> 2u][(_scr + (_sj >> 2u)) & 3u]),                  \
                                    int(8u * (_sj & 3u)), 8);                     \
         uint _di = (DU) + (((RI) + _b) >> 1u);                                   \
-        vec2 _dp = unpackHalf2x16(WB[_di]);                                      \
+        vec2 _dp = unpackHalf2x16(WB[_di >> 2u][_di & 3u]);                                      \
         float _dw = ((((RI) + _b) & 1u) == 0u) ? _dp.x : _dp.y;                  \
         int _cl = -128 * int(_swl) + 32 * 128 * 16;                              \
         int _ch = -128 * int(_swh) + 32 * 128 * 16;                              \
         for (uint _s = 0u; _s < uint(NS); ++_s) {                                 \
             if (_s >= uint(NLIVE)) break;                                        \
             uint _ab = (AQ) + _s * pc.blocks * 64u + _bu;                        \
-            uint _wl = dotPacked4x8AccSatEXT(_l0, qb[_ab + 0u], 0u);             \
-            _wl = dotPacked4x8AccSatEXT(_l1, qb[_ab + 1u], _wl);                 \
-            _wl = dotPacked4x8AccSatEXT(_l2, qb[_ab + 2u], _wl);                 \
-            _wl = dotPacked4x8AccSatEXT(_l3, qb[_ab + 3u], _wl);                 \
-            uint _ah = _ab + 16u;                                                \
-            uint _wh = dotPacked4x8AccSatEXT(_i0, qb[_ah + 0u], 0u);             \
-            _wh = dotPacked4x8AccSatEXT(_i1, qb[_ah + 1u], _wh);                 \
-            _wh = dotPacked4x8AccSatEXT(_i2, qb[_ah + 2u], _wh);                 \
-            _wh = dotPacked4x8AccSatEXT(_i3, qb[_ah + 3u], _wh);                 \
+            uvec4 _av = qb[_ab >> 2u];                                           \
+            uvec4 _bv = qb[(_ab + 16u) >> 2u];                                    \
+            uint _wl = dotPacked4x8AccSatEXT(_l0, _av.x, 0u);                     \
+            _wl = dotPacked4x8AccSatEXT(_l1, _av.y, _wl);                         \
+            _wl = dotPacked4x8AccSatEXT(_l2, _av.z, _wl);                         \
+            _wl = dotPacked4x8AccSatEXT(_l3, _av.w, _wl);                         \
+            uint _wh = dotPacked4x8AccSatEXT(_i0, _bv.x, 0u);                     \
+            _wh = dotPacked4x8AccSatEXT(_i1, _bv.y, _wh);                         \
+            _wh = dotPacked4x8AccSatEXT(_i2, _bv.z, _wh);                         \
+            _wh = dotPacked4x8AccSatEXT(_i3, _bv.w, _wh);                         \
             int _sl = sb[(AS) + _s * pc.blocks * 16u + _g];                       \
             int _sx = sb[(AS) + _s * pc.blocks * 16u + _g + 4u];                  \
             int _il = _scl * (int(_wl) + _cl - 32 * _sl);                         \

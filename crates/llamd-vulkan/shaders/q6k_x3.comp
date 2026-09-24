@@ -26,10 +26,10 @@
 
 layout(local_size_x = 256) in;
 
-layout(std430, binding = 0)  readonly  buffer W0 { uint  w0[]; };
-layout(std430, binding = 1)  readonly  buffer W1 { uint  w1[]; };
-layout(std430, binding = 2)  readonly  buffer W2 { uint  w2[]; };
-layout(std430, binding = 3)  readonly  buffer QB { uint  qb[]; };
+layout(std430, binding = 0)  readonly  buffer W0 { uvec4 w0[]; };
+layout(std430, binding = 1)  readonly  buffer W1 { uvec4 w1[]; };
+layout(std430, binding = 2)  readonly  buffer W2 { uvec4 w2[]; };
+layout(std430, binding = 3)  readonly  buffer QB { uvec4 qb[]; };
 layout(std430, binding = 4)  readonly  buffer SB { int   sb[]; };
 layout(std430, binding = 5)  readonly  buffer AD { float ad[]; };
 layout(std430, binding = 6)  writeonly buffer O0 { float o0[]; };
