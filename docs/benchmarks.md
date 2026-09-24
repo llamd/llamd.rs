@@ -2186,3 +2186,78 @@ kernel. What remains is the unglamorous part: unpacking planar Q6_K into s8 tile
 LDS, staging activations transposed, and driving 128 groups per row-block. A kernel
 realises less than its instruction ceiling, always, and how much less is the next
 measurement rather than the next paragraph.
+
+---
+
+## 25. The coopmat expert kernel: correct, at parity, and the reason why
+
+§24 measured the instruction at 21651 G MAC/s with the fold, 4.46× the expert
+kernel's arithmetic, and said "a kernel realises less than its instruction ceiling,
+always, and how much less is the next measurement rather than the next paragraph."
+This is that measurement. It realises **24%** of it, which is parity.
+
+### The kernel
+
+`q6k_expert_cm.comp`, signed 8-bit, and simpler than the kernel it replaces:
+
+    out[r][t] = d[r][b] · sc[r][g] · Σ_j (w[r][j] − 32) · a[t][j]
+
+No `Σw`, no `Σb`, no `+65536`, no XOR bias — the corrections exist only because
+gfx1201's HIP lacks `sdot4`, and the matrix cores do not. The product is computed
+**transposed** so the per-weight-row scale is a per-column broadcast from a stride-0
+row-major load, and the activation's block scale a per-row broadcast from a stride-0
+column-major load. The accumulator never leaves the matrix domain.
+
+**24 of 24 (tile, length) cases emit the same token as the dot kernel**, across
+token counts either side of TT·16 = 32 and tiles either side of the row blocking.
+
+### Three things it was slow for, each found by measuring
+
+| | pp512 | vs dot |
+|---|---|---|
+| first working version | 690.6 | 0.266× |
+| 8 scale groups per barrier pair | 1253.6 | 0.90× |
+| weights row-major, B loaded column-major | **1372.0** | **0.987×** |
+
+1. **Barriers.** One scale group per barrier pair means a 128-group K loop costs 256
+   workgroup barriers per output tile — and a barrier costs more than the 16-deep
+   matrix multiply it protects. Staging 8 groups per pair: **1.8×**.
+2. **16 groups per pair was worse** (906.4), not better: LDS went to 34 KiB and took
+   occupancy with it. 8 is the measured point.
+3. **Byte-scattered LDS stores.** Stored K-major, a lane unpacking four consecutive
+   K of one row writes four bytes *sixteen apart*, and sub-dword scattered shared
+   stores are read-modify-write. Storing row-major and loading the B operand
+   **column-major** makes them contiguous — the layout argument is free. **1.09×**.
+
+### Why parity is the ceiling here
+
+| kernel | ms per 512-token pass | G MAC/s |
+|---|---|---|
+| `q6k_expert_rt2` (dot) | 169.61 | 5466 |
+| `q6k_expert_cm` (matrix) | 178.96 | 5180 |
+
+The same 927 G MACs. §24's fold arm would run them in **43 ms**; the kernel takes
+179. So **136 ms of it — 76% — is not matrix arithmetic**: it is unpacking Q6_K into
+s8 tiles, staging activations, and the barriers between. The matrix units accelerate
+the quarter that was arithmetic and cannot touch the rest.
+
+This is consistent with everything measured before it. §23 found the dot kernel at
+19% of memory peak and 15% of the dot ceiling — **bound by neither**, therefore
+bound by what sits between them. Replacing the arithmetic engine does not move a
+kernel whose arithmetic was never the constraint. §24's 4.46× was a property of the
+instruction, not of the problem, and the projection was the fourth in this document
+to survive every check available and still be wrong.
+
+### What this actually implies for beating llama.cpp
+
+Not more matrix work on this path. **Dequantisation is the cost, so the lever is
+reuse per unpack.** A weight tile unpacked once currently feeds TT·16 = 32 tokens,
+which is exactly what an expert sees at a 512-token tile — so at pp512 the
+amortisation is already maximal and there is nothing to win. It becomes the right
+kernel when an expert sees more tokens, which needs a tile wider than 512, which
+needs prompts longer than 512. For pp512 specifically, **the expert path is done**
+until the unpack itself gets cheaper.
+
+The kernel is kept and defaulted OFF: correct, measured, 0.987×, and the right
+shape for a workload this benchmark does not contain. Parity is not a reason to put
+more machinery on the hot path.

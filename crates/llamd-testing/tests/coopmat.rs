@@ -13,6 +13,9 @@
 //! Three projections in this project have predicted large gains and returned ~0.
 //! This one gets measured first.
 
+use llamd_models::Model;
+use llamd_runtime::VulkanModel;
+use llamd_testing::oracle_model;
 use llamd_vulkan::{VkBuf, ops};
 
 fn ok() -> bool {
@@ -136,5 +139,130 @@ fn what_the_u8_matrix_is_worth() {
     eprintln!(
         "  the matrix fold keeps:         {:.0}% of the ceiling",
         100.0 * rate[3] / rate[0]
+    );
+}
+
+/// The cooperative-matrix expert kernel against the kernel it replaces.
+///
+/// It cannot be bit-exact and is not asked to be: an MMA sums 16 products in
+/// hardware order and the scale is applied as one f32 multiply per group, where the
+/// dot path sums two 16-groups as integers and converts once. Both lose the same
+/// kind of precision at ~1e-7 relative. The bar is the one that matters — the same
+/// emitted token — across shapes that straddle the kernel's tiling: token counts
+/// either side of TT*16 = 32, and prefill tiles either side of the row blocking.
+#[test]
+#[ignore = "uploads 23 GiB to the device; needs a free GPU and the real model"]
+fn coopmat_experts_agree_with_the_dot_kernel() {
+    if !ok() {
+        eprintln!("  SKIP coopmat_experts_agree: no coopmat");
+        return;
+    }
+    let Some(path) = oracle_model() else {
+        eprintln!("  SKIP coopmat_experts_agree: no LLAMD_TEST_MODEL");
+        return;
+    };
+    let model = Model::open(&path).expect("open");
+    let mut vk =
+        VulkanModel::load_with_slots(&model, 600, llamd_vulkan::MAX_TILE, 8).expect("load");
+    let vocab = llamd_tokenizer::Vocab::from_gguf(model.gguf()).expect("vocab");
+    let text = "Explain how a compiler turns source code into machine instructions,                 covering lexing, parsing, type checking, optimisation and code generation.";
+    let mut all = Vec::new();
+    while all.len() < 300 {
+        all.extend_from_slice(&vocab.encode(text, false));
+    }
+    all.truncate(300);
+
+    let mut wrong = Vec::new();
+    let mut cases = 0;
+    for &tile in &[32usize, 64, 128, 256] {
+        for &n in &[17usize, 33, 64, 65, 129, 300] {
+            if n > all.len() {
+                continue;
+            }
+            vk.prefill_tile = tile;
+            let toks = &all[..n];
+            ops::set_expert_coopmat(false);
+            let want = vk.prefill(toks, 0).expect("dot kernel");
+            ops::set_expert_coopmat(true);
+            let got = vk.prefill(toks, 0).expect("coopmat kernel");
+            cases += 1;
+            if got != want {
+                wrong.push(format!(
+                    "tile {tile}, {n} tokens: dot {want} {:?}, coopmat {got} {:?}",
+                    vocab.text_of(want).unwrap_or("?"),
+                    vocab.text_of(got).unwrap_or("?")
+                ));
+            }
+        }
+    }
+    ops::set_expert_coopmat(false);
+    for w in &wrong {
+        eprintln!("  MISMATCH {w}");
+    }
+    eprintln!("  {} of {cases} cases agree", cases - wrong.len());
+    assert!(
+        wrong.is_empty(),
+        "{} of {cases} cases disagree",
+        wrong.len()
+    );
+}
+
+/// And what it is worth, both arms alternating in one process.
+#[test]
+#[ignore = "uploads 23 GiB to the device; needs a free GPU and the real model"]
+fn coopmat_experts_against_the_dot_kernel() {
+    if !ok() {
+        eprintln!("  SKIP coopmat_experts_perf: no coopmat");
+        return;
+    }
+    let Some(path) = oracle_model() else {
+        return;
+    };
+    let model = Model::open(&path).expect("open");
+    let mut vk =
+        VulkanModel::load_with_slots(&model, 600, llamd_vulkan::MAX_TILE, 8).expect("load");
+    let vocab = llamd_tokenizer::Vocab::from_gguf(model.gguf()).expect("vocab");
+    let text = "Explain how a compiler turns source code into machine instructions,                 covering lexing, parsing, type checking, optimisation and code generation.";
+    let mut prompt = Vec::new();
+    while prompt.len() < 512 {
+        prompt.extend_from_slice(&vocab.encode(text, false));
+    }
+    prompt.truncate(512);
+
+    let run = |vk: &mut VulkanModel, cm: bool| -> f64 {
+        ops::set_expert_coopmat(cm);
+        let _ = vk.prefill(&prompt, 0).expect("warm");
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let _ = vk.prefill(&prompt, 0).expect("prefill");
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        512.0 / best
+    };
+
+    eprintln!(
+        "  {:>6}{:>12}{:>12}{:>10}",
+        "tile", "coopmat", "dot", "speedup"
+    );
+    let mut best = (0usize, 0.0f64);
+    for tile in [64usize, 128, 256, 512] {
+        vk.prefill_tile = tile;
+        let dot = run(&mut vk, false);
+        let cm = run(&mut vk, true);
+        if cm > best.1 {
+            best = (tile, cm);
+        }
+        eprintln!(
+            "  {tile:>6}{:>12}{:>12}{:>10}",
+            format!("{cm:.1}"),
+            format!("{dot:.1}"),
+            format!("{:.3}x", cm / dot)
+        );
+    }
+    ops::set_expert_coopmat(false);
+    eprintln!(
+        "  best coopmat: tile {} at {:.1} tok/s   (llama.cpp Vulkan pp512 3213.6)",
+        best.0, best.1
     );
 }

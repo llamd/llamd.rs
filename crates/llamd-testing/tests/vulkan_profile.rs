@@ -38,7 +38,8 @@ fn where_prefill_time_goes() {
     }
     toks.truncate(512);
 
-    for &tile in &[64usize, 512] {
+    for &(tile, cm) in &[(64usize, false), (512usize, false), (512usize, true)] {
+        ops::set_expert_coopmat(cm);
         vk.prefill_tile = tile;
         // Warm, unprofiled, so pipeline creation and first-touch are not charged.
         let _ = vk.prefill(&toks, 0).expect("warm");
@@ -67,8 +68,9 @@ fn where_prefill_time_goes() {
 
         eprintln!();
         eprintln!(
-            "  ===== tile {tile}: {} dispatches in the last of {tiles} tiles, {:.1} ms on the GPU \
-             ({:.0} ms wall for the whole 512-token prompt)",
+            "  ===== tile {tile}{}: {} dispatches in the last of {tiles} tiles, \
+             {:.1} ms on the GPU ({:.0} ms wall for the whole prompt)",
+            if cm { " COOPMAT" } else { "" },
             last.len(),
             total,
             wall

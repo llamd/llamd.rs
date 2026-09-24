@@ -1,0 +1,241 @@
+#version 450
+//
+// The routed expert projections on the cooperative-matrix units.
+//
+// WHAT MAKES THIS SIMPLER THAN THE KERNEL IT REPLACES, which is not how this
+// usually goes. The dot-product kernels compute a SIGNED product with UNSIGNED
+// instructions, because gfx1201's HIP has no sdot4: they rewrite
+// `sum sc*(w-32)*a` over unsigned operands and carry three correction terms
+// (`-128*Sw - 32*Sb + 32*128*16`), an XOR bias on every activation byte, and a
+// per-group sum of the weights. The matrix cores DO have signed int8 — the device
+// reports 16x16x16 A s8 B s8 C s32 — so this computes
+//
+//     out[r][t] = d[r][b] * sc[r][g] * SUM_j (w[r][j] - 32) * a[t][j]
+//
+// directly. Every correction disappears. `w-32` is -32..31 and fits s8, and the
+// Q8_K activation is already int8 once the stored unsigned bias is undone.
+//
+// WHY THE PRODUCT IS TRANSPOSED — tokens down, weight rows across. Q6_K carries an
+// int8 scale per 16 weights and the MMA's K is ALSO 16, so one MMA is exactly one
+// scale group and must be scaled per weight row before the next joins it. The scale
+// cannot go into the operand (0..63 times int8 overflows s8). Extracting the 16x16
+// accumulator to scale it element by element costs 256 scalar operations per
+// 4096-MAC instruction and keeps only 16% of the instruction's ceiling — measured,
+// in benchmarks.md §24.
+//
+// Transposed, the per-weight-row scale becomes a per-COLUMN quantity, and a
+// stride-0 row-major load turns a 16-element array into that broadcast:
+// element [r][c] reads mem[r*0 + c] = mem[c]. The activation's per-block scale is
+// per-ROW and comes from a stride-0 COLUMN-major load. So the accumulator never
+// leaves the matrix domain, at 16 shared writes per group instead of 256
+// extractions — 2.31x, and 37% of the ceiling.
+//
+// THE REMAINING COST IS DEQUANTISATION, and it is why this is not 12x. With the
+// arithmetic nearly free, unpacking Q6_K into s8 tiles dominates. It is amortised
+// by holding TT token tiles at once: one unpack of a weight tile feeds TT matrix
+// multiplies. TT = 2 covers the ~32 tokens an expert sees at a 512-token prefill
+// tile (§19), which is the shape this kernel exists for.
+//
+// AND THE FIRST VERSION WAS 2x SLOWER THAN THE DOT KERNEL BECAUSE OF BARRIERS.
+// Staging one scale group per barrier pair means 128 groups cost 256 workgroup
+// barriers per output tile, each serialising four subgroups — and a barrier costs
+// more than the 16-deep matrix multiply it protects. GPS groups are staged per
+// barrier pair instead, so the count falls by that factor. It is the same mistake
+// §20 made in a different costume: optimising the arithmetic while something that
+// was not arithmetic set the pace.
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer W   { uint  w[];      };
+layout(std430, binding = 1) readonly buffer QB  { uint  qb[];     };
+layout(std430, binding = 2) readonly buffer AD  { float ad[];     };
+layout(std430, binding = 3) buffer          O   { float outv[];   };
+layout(std430, binding = 4) readonly buffer GS  { int   gstart[]; };
+layout(std430, binding = 5) readonly buffer GC  { int   gcount[]; };
+layout(std430, binding = 6) readonly buffer PT  { int   ptoken[]; };
+layout(std430, binding = 7) readonly buffer PS  { int   pslot[];  };
+
+layout(push_constant) uniform Push {
+    uint ql_u; uint qh_u; uint sc_u; uint d_u;
+    uint blocks; uint rows; uint n_used; uint nseq;
+    uint by_slot;
+} pc;
+#include "common.glsl"
+
+// One 16x16 output tile per subgroup, four subgroups, so a workgroup covers 64
+// weight rows. The host refuses a row count that is not a multiple of 64: a
+// subgroup that returned early would desert the barriers the staging needs.
+#define SGS 4
+#define TT  2
+#define TOKS (TT * 16)
+// Scale groups staged per barrier pair. LDS cost is (TT + SGS) * GPS * 256 bytes
+// for the operands plus (SGS + TT) * GPS * 16 floats for the broadcasts — 19 KiB at
+// 8, against the 64 KiB the device has.
+#define GPS 8
+
+shared int8_t s_a[TT * GPS * 256];   // activations, token-major: [tile][g][tok*16 + k]
+// Weights ROW-major: [sg][g][row*16 + k]. The B operand wants [k][row], so it is
+// loaded COLUMN-major instead of transposing here — because the transpose is not
+// free in LDS. Stored K-major, a lane unpacking four consecutive K values of one row
+// writes four bytes SIXTEEN apart, and byte-granular scattered shared stores are
+// read-modify-write. Row-major, the same four bytes are contiguous and the compiler
+// merges them into one dword. The layout argument to coopMatLoad costs nothing.
+shared int8_t s_w[SGS * GPS * 256];
+shared float  s_col[SGS * GPS * 16]; // d * sc per weight row — the column broadcast
+shared float  s_row[TT * GPS * 16];  // the activation block scale — row broadcast
+shared float  s_o[SGS * 256];        // the f32 result, on its way out
+
+#define MAT_A coopmat<int8_t,  gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define MAT_B coopmat<int8_t,  gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+#define MAT_I coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define MAT_F coopmat<float,   gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+
+void main() {
+    uint expert = gl_WorkGroupID.y;
+    int count = gcount[expert];
+    if (count <= 0) return;                 // whole workgroup, so barriers are safe
+    int start = gstart[expert];
+
+    uint t = gl_LocalInvocationID.x;
+    uint sg = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint row_base = (gl_WorkGroupID.x * uint(SGS) + sg) * 16u;
+    uint n_groups = pc.blocks * 16u;        // one scale group per 16 of K
+
+    // Which weight this lane unpacks: 16 rows x 4 uints of 4 values each.
+    uint u_row = lane >> 2u;                // 0..15
+    uint u_q = lane & 3u;                   // which of the row's four uints
+
+    for (uint tok_base = 0u; tok_base < uint(count); tok_base += uint(TOKS)) {
+        MAT_F facc[TT];
+        for (int i = 0; i < TT; ++i) facc[i] = MAT_F(0.0);
+
+        for (uint gbase = 0u; gbase < n_groups; gbase += uint(GPS)) {
+            uint ng = min(uint(GPS), n_groups - gbase);
+
+            // ---- stage GPS groups of everything, under ONE barrier pair ----
+            // Four values at a time: they are four contiguous activation bytes, so
+            // ONE uint load supplies them and four contiguous shared stores take
+            // them, instead of four separate loads and four scattered stores.
+            for (uint c4 = t; c4 < uint(TT) * uint(GPS) * 64u; c4 += 256u) {
+                uint at4 = c4 * 4u;
+                uint tt = at4 / (uint(GPS) * 256u);
+                uint gsl = (at4 / 256u) % uint(GPS);
+                uint tl = (at4 % 256u) >> 4u;
+                uint k0 = at4 & 15u;
+                uint word = 0u;
+                bool live = false;
+                uint tok = tok_base + tt * 16u + tl;
+                if (gsl < ng && tok < uint(count)) {
+                    int pr = start + int(tok);
+                    uint a = pc.by_slot != 0u ? uint(pslot[pr]) : uint(ptoken[pr]);
+                    uint byte_k = (gbase + gsl) * 16u + k0;
+                    word = qb[a * pc.blocks * 64u + (byte_k >> 2u)];
+                    live = true;
+                }
+                for (uint j = 0u; j < 4u; ++j) {
+                    // Stored biased to unsigned for the dot-product path; XOR 0x80
+                    // is exactly its inverse and recovers the int8 the MMA wants.
+                    s_a[at4 + j] = live
+                        ? int8_t(int((word >> (8u * j)) & 0xFFu) ^ 0x80)
+                        : int8_t(0);
+                }
+            }
+            for (uint idx = t; idx < uint(TT) * uint(GPS) * 16u; idx += 256u) {
+                uint gsl = (idx >> 4u) % uint(GPS);
+                uint tt = (idx >> 4u) / uint(GPS);
+                uint tl = idx & 15u;
+                uint tok = tok_base + tt * 16u + tl;
+                float sc = 0.0;
+                if (gsl < ng && tok < uint(count)) {
+                    int pr = start + int(tok);
+                    uint a = pc.by_slot != 0u ? uint(pslot[pr]) : uint(ptoken[pr]);
+                    sc = ad[a * pc.blocks + ((gbase + gsl) >> 4u)];
+                }
+                s_row[idx] = sc;
+            }
+            for (uint g = 0u; g < uint(GPS); ++g) {
+                uint gidx = gbase + g;
+                if (g >= ng) {
+                    continue;
+                }
+                uint b = gidx >> 4u;
+                uint gi = gidx & 15u;
+                uint h = gi >> 3u;
+                uint rr = gi & 7u;
+                uint p = rr >> 2u;
+                uint q = rr & 3u;
+                uint uu = b * 8u + h * 4u + q;
+                uint shl = (q >= 2u) ? 2u : 0u;
+                uint hoff = ((q & 1u) != 0u) ? 4u : 0u;
+                uint nib = shl + 4u * p;
+
+                uint row = row_base + u_row;
+                uint ri = (expert * pc.rows + row) * pc.blocks;
+                uint q0 = w[pc.ql_u + ri * 32u + uu * 4u + u_q];
+                uint h0 = w[pc.qh_u + ri * 16u + b * 16u + h * 8u + hoff + u_q];
+                uint wbase = (sg * uint(GPS) + g) * 256u + u_row * 16u + u_q * 4u;
+                for (uint j = 0u; j < 4u; ++j) {
+                    uint lo = (q0 >> (8u * j + 4u * p)) & 0x0Fu;
+                    uint hi = (h0 >> (8u * j + nib)) & 0x03u;
+                    s_w[wbase + j] = int8_t(int(lo | (hi << 4u)) - 32);
+                }
+                if (lane < 16u) {
+                    uint rw = row_base + lane;
+                    uint rri = (expert * pc.rows + rw) * pc.blocks;
+                    uint si = b * 16u + gi;
+                    int scq = bitfieldExtract(int(w[pc.sc_u + rri * 4u + (si >> 2u)]),
+                                              int(8u * (si & 3u)), 8);
+                    vec2 dp = unpackHalf2x16(w[pc.d_u + ((rri + b) >> 1u)]);
+                    float dw = (((rri + b) & 1u) == 0u) ? dp.x : dp.y;
+                    s_col[(sg * uint(GPS) + g) * 16u + lane] = dw * float(scq);
+                }
+            }
+            barrier();
+
+            for (uint g = 0u; g < ng; ++g) {
+                MAT_B mb;
+                coopMatLoad(mb, s_w, (sg * uint(GPS) + g) * 256u, 16,
+                            gl_CooperativeMatrixLayoutColumnMajor);
+                MAT_F mcol;
+                coopMatLoad(mcol, s_col, (sg * uint(GPS) + g) * 16u, 0,
+                            gl_CooperativeMatrixLayoutRowMajor);
+                for (int tt = 0; tt < TT; ++tt) {
+                    MAT_A ma;
+                    coopMatLoad(ma, s_a, (uint(tt) * uint(GPS) + g) * 256u, 16,
+                                gl_CooperativeMatrixLayoutRowMajor);
+                    MAT_I mi = coopMatMulAdd(ma, mb, MAT_I(0));
+                    MAT_F mrow;
+                    coopMatLoad(mrow, s_row, (uint(tt) * uint(GPS) + g) * 16u, 0,
+                                gl_CooperativeMatrixLayoutColumnMajor);
+                    facc[tt] += mrow * mcol * MAT_F(mi);
+                }
+            }
+            barrier();
+        }
+
+        // ---- out, scattered by the pair index each token carries ----
+        for (int tt = 0; tt < TT; ++tt) {
+            coopMatStore(facc[tt], s_o, sg * 256u, 16,
+                         gl_CooperativeMatrixLayoutRowMajor);
+            barrier();
+            for (uint i = lane; i < 256u; i += gl_SubgroupSize) {
+                uint tl = i >> 4u;
+                uint r = i & 15u;
+                uint tok = tok_base + uint(tt) * 16u + tl;
+                if (tok < uint(count)) {
+                    outv[uint(pslot[start + int(tok)]) * pc.rows + row_base + r] =
+                        s_o[sg * 256u + i];
+                }
+            }
+            barrier();
+        }
+    }
+}

@@ -48,6 +48,7 @@ pub enum Pipeline {
     Q6kExpertRt2 = 25,
     Q6kExpertRt8 = 26,
     CoopmatProbe = 27,
+    Q6kExpertCm = 28,
 }
 
 impl Pipeline {
@@ -82,10 +83,11 @@ impl Pipeline {
             Pipeline::Q6kExpertRt2 => "q6k_expert_rt2",
             Pipeline::Q6kExpertRt8 => "q6k_expert_rt8",
             Pipeline::CoopmatProbe => "coopmat_probe",
+            Pipeline::Q6kExpertCm => "q6k_expert_cm",
         }
     }
 
-    pub const ALL: [Pipeline; 28] = [
+    pub const ALL: [Pipeline; 29] = [
         Pipeline::Q6kMatvec,
         Pipeline::Q6kX3,
         Pipeline::Q6kGemm,
@@ -114,6 +116,7 @@ impl Pipeline {
         Pipeline::Q6kExpertRt2,
         Pipeline::Q6kExpertRt8,
         Pipeline::CoopmatProbe,
+        Pipeline::Q6kExpertCm,
     ];
 }
 
@@ -371,6 +374,77 @@ pub fn set_attention_scalar(on: bool) {
 
 pub fn attention_scalar() -> bool {
     ATTN_SCALAR.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Weight rows one workgroup of the cooperative-matrix expert kernel covers: four
+/// subgroups, one 16-row matrix tile each. Must match SGS * 16 in
+/// `shaders/q6k_expert_cm.comp`.
+pub const CM_ROWS_PER_WG: usize = 64;
+
+static EXPERT_CM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Use the cooperative-matrix expert kernel.
+///
+/// OFF by default, and §25 is why: it reaches parity with the dot kernel (0.987x)
+/// and no more, because the expert path is dequantisation-bound rather than
+/// arithmetic-bound. Matrix units accelerate the ~25% of that kernel which is
+/// arithmetic. Kept because it is correct, measured, and the right kernel the moment
+/// the unpack is amortised over more tokens per expert than a 512-token tile gives.
+///
+/// Ignored where the device has no `VK_KHR_cooperative_matrix` — the pipeline does
+/// not exist there.
+pub fn set_expert_coopmat(on: bool) {
+    EXPERT_CM.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Is it both requested and usable for this shape?
+///
+/// The row count must be a multiple of [`CM_ROWS_PER_WG`]: a subgroup with no rows
+/// would have to return early, and it cannot — the staging barriers need every
+/// invocation in the workgroup. Both expert shapes here qualify (768 and 2048), and
+/// one that does not falls back to the dot-product kernel rather than being refused.
+pub fn expert_coopmat_for(rows: usize) -> bool {
+    EXPERT_CM.load(std::sync::atomic::Ordering::Relaxed)
+        && crate::has_coopmat()
+        && rows % CM_ROWS_PER_WG == 0
+}
+
+/// The routed expert projections on the matrix units. `by_slot` picks the
+/// activation index, as in [`expert_row_tiled`]. Note it does NOT take the
+/// group-sum buffer: the signed shape needs no correction terms.
+#[allow(clippy::too_many_arguments)]
+pub fn expert_coopmat(
+    w: &PlanarWeights,
+    qb: &VkBuf,
+    ad: &VkBuf,
+    out: &VkBuf,
+    g: (&VkBuf, &VkBuf, &VkBuf, &VkBuf),
+    rows: usize,
+    n_used: usize,
+    nseq: usize,
+    n_expert: usize,
+    by_slot: bool,
+) -> Result<()> {
+    need(out, rows * n_used * nseq, "expert_coopmat out")?;
+    if rows % CM_ROWS_PER_WG != 0 {
+        return Err(Error::malformed(
+            "expert_coopmat",
+            format!("{rows} rows is not a multiple of {CM_ROWS_PER_WG}"),
+        ));
+    }
+    let p = planes(w)
+        .u(4, w.blocks())
+        .u(5, rows)
+        .u(6, n_used)
+        .u(7, nseq)
+        .u(8, usize::from(by_slot));
+    dispatch(
+        Pipeline::Q6kExpertCm,
+        &[w.buf(), qb, ad, out, g.0, g.1, g.2, g.3],
+        p,
+        (rows / CM_ROWS_PER_WG) as u32,
+        n_expert as u32,
+    )
 }
 
 /// The cooperative-matrix microbenchmark. `mode` 0 is MMA with no fold, 1 is MMA
