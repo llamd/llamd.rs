@@ -1760,3 +1760,92 @@ available at the time. The thing neither could see is where 82% of the time goes
 That needs RGP or RADV performance counters against the real 48-layer pass, and
 until it exists any further projection about prefill should be treated as what the
 last two turned out to be.
+
+---
+
+## 21. The profile: attention is 61% of prefill
+
+§19 and §20 each built a counting model, predicted a large prefill gain, and got
+nothing. This is the measurement that should have come first.
+
+### Method
+
+`vkCmdWriteTimestamp` around every dispatch, read back after the pass, aggregated
+by pipeline. **It is exact, not sampled**: every dispatch in this engine is already
+followed by a full memory barrier, so nothing overlaps and the intervals sum to the
+pass. That is also why the ~960 extra commands per token perturb almost nothing.
+`ops::profile(true)` then `ops::profile_read()`; the test is
+`vulkan_profile.rs::where_prefill_time_goes`.
+
+### One 48-layer pass, 512-token prompt
+
+| kernel | calls | tile 64 | tile 512 |
+|---|---|---|---|
+| **`attention`** | 48 | **61.7%** | **60.5%** |
+| `q6k_expert_rt` | 144 | 23.6% | 23.6% |
+| `q6k_matvec` | 49 | 6.6% | 7.2% |
+| `q6k_x3` | 48 | 4.6% | 5.5% |
+| `matvec_f32` (router) | 48 | 1.3% | 1.5% |
+| the other 14 kernels | 580 | 2.2% | 1.7% |
+
+**Attention is 61% of prefill and it does not move with the tile.** That is the
+whole explanation of §20's flat surface: the thing being optimised was 23.6% of the
+time, and the thing that dominates is invariant to tile width. The algebraic
+estimate in §20 put the expert matmuls at 18%; measured, they are 23.6%.
+
+### How far off attention is
+
+Converting each kernel's real MAC count against its measured time:
+
+| kernel | G MAC/s |
+|---|---|
+| `q6k_expert_rt` | 15473 |
+| `q6k_x3` | 6127 |
+| **`attention`** | **112** |
+
+**55× slower per MAC than the Q/K/V projection**, and about 1.4% of this part's
+fp32 FMA rate. It is not a tuning gap; the kernel is the wrong shape.
+
+### Why, from the source
+
+`attention.comp` is decode-shaped — written when a pass held one token, where none
+of this mattered. Four defects, all of which make it latency-bound:
+
+1. **The QK inner loop is a 128-deep dependent FMA chain.**
+   `for (d) dot += q[qb+d] * kc[ko+d]` — one accumulator, so ~4 cycles per MAC
+   with no instruction-level parallelism, ~512 cycles to do 128 MACs.
+2. **The K reads are fully uncoalesced.** Lanes are mapped to KEYS, and
+   consecutive keys are `kv_dim` = 512 floats apart, so one load instruction
+   across 64 lanes touches 64 different cache lines.
+3. **The query is re-read from global memory 128 times per thread.** It is 128
+   floats and never staged in LDS or registers.
+4. **The AV pass uses half the workgroup and is serial in keys.**
+   `for (d = t; d < hd; d += 256)` with `hd` = 128 leaves 128 of 256 threads
+   idle, and each surviving thread walks all `n_kv` keys in another single-
+   accumulator dependent chain.
+
+### What fixing it is worth
+
+At tile 512 the pass is 761 ms of GPU time: 460 attention, 301 everything else.
+Attention at even 2000 G MAC/s — still under a quarter of fp32 peak, and the
+projections already reach 6127 — makes it 26 ms:
+
+| | now | attention fixed |
+|---|---|---|
+| pp512 | 680 t/s | **≈1550 t/s** |
+| vs llama.cpp Vulkan, no coopmat (1834) | 0.37× | ≈0.85× |
+| vs llama.cpp Vulkan, coopmat (3214) | 0.21× | ≈0.48× |
+
+So: **~2.3× on prefill from one kernel**, which is more than every prefill change
+in §15 through §20 combined. It does not close the gap alone, and the remaining
+factor is the coopmat one §19 measured at 1.75×.
+
+Decode is barely affected — at one token `n_kv` is the context length and attention
+is a small share — so this is a prefill and long-context fix, not a decode one.
+
+### The lesson, stated plainly
+
+Three sections of kernel work went into the expert path on the strength of a
+traffic argument: experts are 96.5% of prefill's weight traffic and 67% of its
+arithmetic. Both figures are true. Neither is a share of TIME. A profiler was
+available the whole time and would have said `attention 61%` in one run.

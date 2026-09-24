@@ -64,7 +64,27 @@ struct Ctx {
     // one matters for the same reason it did on the ROCm side: per-call
     // allocation dominated everything.
     Buf staging;
+
+    // PER-DISPATCH GPU TIMING.
+    //
+    // Every dispatch here is followed by a full memory barrier, so nothing
+    // overlaps and the sum of the intervals IS the pass. That is what makes a
+    // timestamp per dispatch an exact attribution rather than a sampling
+    // estimate, and it is why this is worth more than an external profiler for
+    // this particular question.
+    //
+    // Off unless asked for: a timestamp write per dispatch is ~960 extra commands
+    // per token.
+    VkQueryPool tsq = VK_NULL_HANDLE;
+    bool profiling = false;
+    uint32_t ts_n = 0;                  // timestamps written this pass
+    float ts_period = 0.0f;             // nanoseconds per tick
+    std::vector<int> ts_pipe;           // pipeline id per interval
+    std::vector<double> ts_ms;          // milliseconds per interval, after readback
 };
+
+// Enough for one pass: about 20 dispatches per layer over 48 layers.
+static const uint32_t TS_CAP = 4096;
 
 Ctx g;
 
@@ -229,6 +249,7 @@ int llamd_vk_init() {
     vkGetPhysicalDeviceProperties2(g.phys, &p2);
     snprintf(g.name, sizeof(g.name), "%s", p2.properties.deviceName);
     g.subgroup_size = sg.subgroupSize;
+    g.ts_period = p2.properties.limits.timestampPeriod;
 
     VkPhysicalDeviceDriverProperties dp{};
     dp.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
@@ -468,7 +489,42 @@ int llamd_vk_begin() {
     if (!g.ok || g.recording) return -1;
     if (!begin_cmd()) return -1;
     g.recording = true;
+    if (g.profiling && g.tsq != VK_NULL_HANDLE) {
+        vkCmdResetQueryPool(g.cmd, g.tsq, 0, TS_CAP);
+        g.ts_n = 0;
+        g.ts_pipe.clear();
+        g.ts_ms.clear();
+        vkCmdWriteTimestamp(g.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.tsq, g.ts_n++);
+    }
     return 0;
+}
+
+/// Turn per-dispatch timing on or off. Creating the pool is deferred to here so a
+/// run that never profiles pays nothing.
+int llamd_vk_profile(int on) {
+    if (!g.ok || g.recording) return -1;
+    if (on && g.tsq == VK_NULL_HANDLE) {
+        if (g.ts_period <= 0.0f) return -1;      // device cannot timestamp
+        VkQueryPoolCreateInfo qi{};
+        qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qi.queryCount = TS_CAP;
+        if (vkCreateQueryPool(g.dev, &qi, nullptr, &g.tsq) != VK_SUCCESS) return -1;
+    }
+    g.profiling = on != 0;
+    return 0;
+}
+
+/// Intervals from the LAST pass: `pipes[i]` ran for `ms[i]` milliseconds, in
+/// submission order. Returns how many were written.
+int llamd_vk_profile_read(int *pipes, double *ms, int max) {
+    int n = (int)g.ts_ms.size();
+    if (n > max) n = max;
+    for (int i = 0; i < n; ++i) {
+        pipes[i] = g.ts_pipe[(size_t)i];
+        ms[i] = g.ts_ms[(size_t)i];
+    }
+    return n;
 }
 
 // `acc_n` is the accumulator width the caller needs; the nearest variant at or
@@ -515,6 +571,12 @@ int llamd_vk_dispatch(int pipe, void *const *bufs, int nbuf,
     vkCmdPipelineBarrier(g.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr,
                          0, nullptr);
+    // After the barrier on purpose: the stall it causes belongs to the dispatch
+    // that made the writes, not to whatever runs next.
+    if (g.profiling && g.tsq != VK_NULL_HANDLE && g.ts_n < TS_CAP) {
+        g.ts_pipe.push_back(pipe);
+        vkCmdWriteTimestamp(g.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.tsq, g.ts_n++);
+    }
     return 0;
 }
 
@@ -522,7 +584,22 @@ int llamd_vk_end_and_wait() {
     if (!g.ok || !g.recording) return -1;
     g.recording = false;
     if (vkEndCommandBuffer(g.cmd) != VK_SUCCESS) return -1;
-    return submit_and_wait() ? 0 : -1;
+    if (!submit_and_wait()) return -1;
+    if (g.profiling && g.tsq != VK_NULL_HANDLE && g.ts_n >= 2) {
+        std::vector<uint64_t> raw(g.ts_n, 0);
+        if (vkGetQueryPoolResults(g.dev, g.tsq, 0, g.ts_n,
+                                  raw.size() * sizeof(uint64_t), raw.data(),
+                                  sizeof(uint64_t),
+                                  VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT)
+            == VK_SUCCESS) {
+            g.ts_ms.resize(g.ts_pipe.size());
+            for (size_t i = 0; i < g.ts_pipe.size(); ++i) {
+                uint64_t d = raw[i + 1] - raw[i];
+                g.ts_ms[i] = (double)d * (double)g.ts_period / 1.0e6;
+            }
+        }
+    }
+    return 0;
 }
 
 uint32_t llamd_vk_subgroup_size() { return g.subgroup_size; }

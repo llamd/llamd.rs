@@ -291,6 +291,61 @@ pub fn token_chunk() -> usize {
     TOKEN_CHUNK.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Per-dispatch GPU timing.
+///
+/// WHY THIS AND NOT AN EXTERNAL PROFILER. Every dispatch in this engine is
+/// followed by a full memory barrier, so nothing overlaps: the sum of the
+/// per-dispatch intervals IS the pass. A timestamp per dispatch is therefore an
+/// exact attribution, not a sampling estimate — and it answers the one question
+/// two counting models failed to answer, which is where the time actually goes.
+///
+/// It must be enabled outside a recording, and reports the LAST pass only.
+pub fn profile(on: bool) -> Result<()> {
+    init()?;
+    #[cfg(not(vulkan))]
+    {
+        let _ = on;
+        Err(Error::unsupported("vulkan profile", "built without Vulkan"))
+    }
+    #[cfg(vulkan)]
+    {
+        #[allow(unsafe_code)]
+        let rc = unsafe { crate::ffi::llamd_vk_profile(i32::from(on)) };
+        if rc != 0 {
+            return Err(Error::other("vulkan profile: device cannot timestamp"));
+        }
+        Ok(())
+    }
+}
+
+/// `(pipeline, milliseconds)` for every dispatch of the last pass, in order.
+pub fn profile_read() -> Vec<(Pipeline, f64)> {
+    #[cfg(not(vulkan))]
+    {
+        Vec::new()
+    }
+    #[cfg(vulkan)]
+    {
+        const CAP: usize = 4096;
+        let mut pipes = vec![0i32; CAP];
+        let mut ms = vec![0f64; CAP];
+        #[allow(unsafe_code)]
+        let n = unsafe {
+            crate::ffi::llamd_vk_profile_read(pipes.as_mut_ptr(), ms.as_mut_ptr(), CAP as i32)
+        };
+        let n = n.max(0) as usize;
+        (0..n)
+            .filter_map(|i| {
+                Pipeline::ALL
+                    .iter()
+                    .copied()
+                    .find(|p| *p as i32 == pipes[i])
+                    .map(|p| (p, ms[i]))
+            })
+            .collect()
+    }
+}
+
 /// Rows one lane of the row-tiled expert kernel accumulates. Must match `ROWS` in
 /// `shaders/q6k_expert_rt.comp`.
 pub const RT_ROWS: usize = 4;

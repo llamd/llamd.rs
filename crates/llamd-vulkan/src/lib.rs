@@ -483,6 +483,8 @@ pub(crate) mod ffi {
             acc_n: c_int,
         ) -> c_int;
         pub fn llamd_vk_end_and_wait() -> c_int;
+        pub fn llamd_vk_profile(on: c_int) -> c_int;
+        pub fn llamd_vk_profile_read(pipes: *mut c_int, ms: *mut f64, max: c_int) -> c_int;
         pub fn llamd_vk_subgroup_size() -> u32;
         pub fn llamd_vk_free(h: *mut c_void);
         pub fn llamd_vk_upload(h: *mut c_void, src: *const c_void, bytes: u64) -> c_int;
