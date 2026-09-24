@@ -1,0 +1,132 @@
+#version 450
+//
+// What a u8 cooperative matrix is actually worth HERE, measured before a kernel is
+// built on it.
+//
+// THE STRUCTURAL PROBLEM THIS EXISTS TO PRICE. Q6_K carries an int8 scale per 16
+// weights and an f16 super-scale per 256. The cooperative-matrix shape this device
+// offers is 16x16x16 — so ONE MMA consumes exactly ONE scale group, and its 16x16
+// u32 result must be scaled per row and corrected before the next group can be
+// added to it. The scale cannot be folded into the operand: weights are 0..63 and
+// the scale is int8, so their product overflows u8.
+//
+// That fold is 256 scalar operations per 4096-MAC MMA. Whether it eats the entire
+// density advantage is the question, and it is an empirical one:
+//
+//   mode 0  MMA only, no fold            the ceiling this instruction can reach
+//   mode 1  MMA + the per-group fold     what a Q6_K kernel could actually get
+//   mode 2  dotPacked4x8, same MAC count the kernel we already have, same harness
+//   mode 3  MMA + the fold done IN THE MATRIX DOMAIN, which is the real design
+//
+// Same dispatch, same buffers, same occupancy, so the three are comparable to each
+// other — which is the only comparison that means anything on this card.
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer A  { uint8_t av[]; };
+layout(std430, binding = 1) readonly buffer B  { uint8_t bv[]; };
+layout(std430, binding = 2) readonly buffer A4 { uint    a4[]; };
+layout(std430, binding = 3) readonly buffer B4 { uint    b4[]; };
+layout(std430, binding = 4) buffer          O  { float   ov[]; };
+
+layout(push_constant) uniform P { uint iters; uint mode; } pc;
+
+shared uint  s_c[256];      // the MMA result, for the naive fold
+shared float s_f[256];      // the f32 accumulator, for the matrix-domain fold
+shared float s_scale[16];   // one int8 weight scale per row, as the kernel has
+shared float s_bcast[16];   // the same, for a stride-0 broadcast load
+
+#define MAT_A coopmat<uint8_t,  gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define MAT_B coopmat<uint8_t,  gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+#define MAT_C coopmat<uint32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define MAT_F coopmat<float,    gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    if (t < 16u) {
+        s_scale[t] = 1.0 + float(t) * 0.00390625;
+        // 1.0, so mode 3's value check has the same expected answer as mode 0's and
+        // the comparison is of speed, not of two different sums.
+        s_bcast[t] = 1.0;
+    }
+    barrier();
+
+    float sink = 0.0;
+
+    if (pc.mode == 2u) {
+        // The dot-product kernel's arithmetic, matched MAC for MAC: one MMA is
+        // 4096 MACs, which over 64 lanes is 64 per lane, which is 16 packed dots.
+        uint acc = 0u;
+        for (uint it = 0u; it < pc.iters; ++it) {
+            for (uint k = 0u; k < 16u; ++k) {
+                acc = dotPacked4x8AccSatEXT(a4[(t * 16u + k) & 1023u],
+                                            b4[(t * 16u + k) & 1023u], acc);
+            }
+        }
+        sink = float(acc);
+    } else {
+        MAT_A ma;
+        MAT_B mb;
+        coopMatLoad(ma, av, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(mb, bv, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+        MAT_C mc = MAT_C(0u);
+
+        for (uint it = 0u; it < pc.iters; ++it) {
+            mc = coopMatMulAdd(ma, mb, mc);
+            if (pc.mode == 1u) {
+                // THE FOLD. Out of the matrix, scaled per row, into f32, and the
+                // accumulator reset because the next group carries a different
+                // scale. This is what Q6_K forces and what mode 0 does not pay.
+                coopMatStore(mc, s_c, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+                barrier();
+                for (uint k = t; k < 256u; k += 64u) {
+                    sink += s_scale[k >> 4u] * float(s_c[k]);
+                }
+                barrier();
+                mc = MAT_C(0u);
+            }
+        }
+        if (pc.mode == 0u) {
+            coopMatStore(mc, s_c, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+            barrier();
+            for (uint k = t; k < 256u; k += 64u) sink += float(s_c[k]);
+        }
+    }
+
+    if (pc.mode == 3u) {
+        // THE FOLD, IN THE MATRIX DOMAIN.
+        //
+        // The scale is per row of the weight tile, so it is CONSTANT along the token
+        // axis — which a stride-0 load expresses directly: loaded row-major with
+        // stride 0, element [r][c] comes from mem[r*0 + c] = mem[c]. So the product
+        // is computed transposed, tokens down and weight rows across, and the scale
+        // becomes a per-COLUMN broadcast that one 16-element array supplies.
+        //
+        // That is 16 shared writes per group instead of 256 element extractions, and
+        // the accumulator never leaves the matrix domain until the very end.
+        MAT_A ma;
+        MAT_B mb;
+        coopMatLoad(ma, av, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(mb, bv, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+        MAT_F facc = MAT_F(0.0);
+        for (uint it = 0u; it < pc.iters; ++it) {
+            MAT_C mc = coopMatMulAdd(ma, mb, MAT_C(0u));
+            MAT_F ms;
+            coopMatLoad(ms, s_bcast, 0, 0, gl_CooperativeMatrixLayoutRowMajor);
+            facc += ms * MAT_F(mc);
+        }
+        coopMatStore(facc, s_f, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+        barrier();
+        for (uint k = t; k < 256u; k += 64u) sink += s_f[k];
+    }
+
+    // Written so nothing above can be eliminated.
+    if (t == 0u) ov[gl_WorkGroupID.x] = sink;
+}

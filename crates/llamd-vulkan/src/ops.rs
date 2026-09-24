@@ -47,6 +47,7 @@ pub enum Pipeline {
     AttentionScalar = 24,
     Q6kExpertRt2 = 25,
     Q6kExpertRt8 = 26,
+    CoopmatProbe = 27,
 }
 
 impl Pipeline {
@@ -80,10 +81,11 @@ impl Pipeline {
             Pipeline::AttentionScalar => "attention_scalar",
             Pipeline::Q6kExpertRt2 => "q6k_expert_rt2",
             Pipeline::Q6kExpertRt8 => "q6k_expert_rt8",
+            Pipeline::CoopmatProbe => "coopmat_probe",
         }
     }
 
-    pub const ALL: [Pipeline; 27] = [
+    pub const ALL: [Pipeline; 28] = [
         Pipeline::Q6kMatvec,
         Pipeline::Q6kX3,
         Pipeline::Q6kGemm,
@@ -111,6 +113,7 @@ impl Pipeline {
         Pipeline::AttentionScalar,
         Pipeline::Q6kExpertRt2,
         Pipeline::Q6kExpertRt8,
+        Pipeline::CoopmatProbe,
     ];
 }
 
@@ -368,6 +371,24 @@ pub fn set_attention_scalar(on: bool) {
 
 pub fn attention_scalar() -> bool {
     ATTN_SCALAR.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The cooperative-matrix microbenchmark. `mode` 0 is MMA with no fold, 1 is MMA
+/// plus the per-group fold Q6_K forces, 2 is the same MAC count through
+/// `dotPacked4x8AccSatEXT`. See `shaders/coopmat_probe.comp`.
+#[allow(clippy::too_many_arguments)]
+pub fn coopmat_probe(
+    a: &VkBuf,
+    b: &VkBuf,
+    a4: &VkBuf,
+    b4: &VkBuf,
+    out: &VkBuf,
+    groups: u32,
+    iters: usize,
+    mode: usize,
+) -> Result<()> {
+    let p = Push::new().u(0, iters).u(1, mode);
+    dispatch(Pipeline::CoopmatProbe, &[a, b, a4, b4, out], p, groups, 1)
 }
 
 /// Rows one lane of the row-tiled expert kernel accumulates, and the tokens per

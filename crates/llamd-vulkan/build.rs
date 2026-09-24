@@ -40,6 +40,7 @@ const SHADERS: &[&str] = &[
     "attention_scalar",
     "q6k_expert_rt2",
     "q6k_expert_rt8",
+    "coopmat_probe",
 ];
 
 fn main() {

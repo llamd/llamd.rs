@@ -43,6 +43,25 @@ pub const MAX_SEQ: usize = 64;
 /// expert outputs are allocated for this many tokens.
 pub const MAX_TILE: usize = 512;
 
+/// Was `VK_KHR_cooperative_matrix` enabled? A shader that uses it must not be
+/// created otherwise — pipeline creation would fail at load, for every pipeline.
+pub fn has_coopmat() -> bool {
+    #[cfg(not(vulkan))]
+    {
+        false
+    }
+    #[cfg(vulkan)]
+    {
+        if init().is_err() {
+            return false;
+        }
+        #[allow(unsafe_code)]
+        unsafe {
+            ffi::llamd_vk_has_coopmat() != 0
+        }
+    }
+}
+
 /// The cooperative-matrix shapes this device supports, one per line, or `None` if
 /// it does not expose the extension. See `llamd_vk_coopmat_report`.
 pub fn coopmat_report() -> Option<String> {
@@ -509,6 +528,7 @@ pub(crate) mod ffi {
         ) -> c_int;
         pub fn llamd_vk_end_and_wait() -> c_int;
         pub fn llamd_vk_coopmat_report(out: *mut c_char, max: c_int) -> c_int;
+        pub fn llamd_vk_has_coopmat() -> c_int;
         pub fn llamd_vk_profile(on: c_int) -> c_int;
         pub fn llamd_vk_profile_read(pipes: *mut c_int, ms: *mut f64, max: c_int) -> c_int;
         pub fn llamd_vk_subgroup_size() -> u32;

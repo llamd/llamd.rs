@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <vector>
+#include <cstring>
 
 namespace {
 
@@ -59,6 +60,7 @@ struct Ctx {
     char name[256] = {0};
     char driver[256] = {0};
     uint32_t subgroup_size = 0;
+    bool coopmat = false;
     uint64_t heap_bytes = 0;
     // Staging buffer for host<->device copies, grown on demand. A persistent
     // one matters for the same reason it did on the ROCm side: per-call
@@ -297,11 +299,42 @@ int llamd_vk_init() {
     VkPhysicalDeviceShaderIntegerDotProductFeatures dot{};
     dot.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES;
     dot.shaderIntegerDotProduct = VK_TRUE;
+    // COOPERATIVE MATRIX, and it is OPTIONAL rather than required.
+    //
+    // The device reports 16x16x16 with A u8 / B u8 / C u32 at subgroup scope
+    // (examples/coopmat.rs), which is the §V2 identity in hardware. But a device
+    // without it must still run — the dot-product kernels are the fallback and
+    // remain the correctness reference — so this is probed and enabled if present,
+    // not demanded. `g.coopmat` records what happened, so a shader that needs it is
+    // never created on a device that cannot run it.
+    bool have_cm = false;
+    {
+        uint32_t n = 0;
+        vkEnumerateDeviceExtensionProperties(g.phys, nullptr, &n, nullptr);
+        std::vector<VkExtensionProperties> props(n);
+        vkEnumerateDeviceExtensionProperties(g.phys, nullptr, &n, props.data());
+        for (const auto &e : props) {
+            if (strcmp(e.extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) == 0) {
+                have_cm = true;
+            }
+        }
+    }
+    VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm{};
+    cm.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
+    cm.cooperativeMatrix = VK_TRUE;
+    cm.pNext = &dot;
+
     VkPhysicalDeviceVulkan12Features v12{};
     v12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
     v12.shaderInt8 = VK_TRUE;
     v12.storageBuffer8BitAccess = VK_TRUE;
-    v12.pNext = &dot;
+    // GL_KHR_memory_scope_semantics, which the cooperative-matrix GLSL extension
+    // requires for its load and store scopes.
+    if (have_cm) {
+        v12.vulkanMemoryModel = VK_TRUE;
+        v12.vulkanMemoryModelDeviceScope = VK_TRUE;
+    }
+    v12.pNext = have_cm ? (void *)&cm : (void *)&dot;
     VkPhysicalDeviceFeatures2 f2{};
     f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     f2.pNext = &v12;
@@ -309,15 +342,17 @@ int llamd_vk_init() {
     const char *exts[] = {
         VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME,
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
+        VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
     };
     VkDeviceCreateInfo dci{};
     dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     dci.pNext = &f2;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = 2;
+    dci.enabledExtensionCount = have_cm ? 3 : 2;
     dci.ppEnabledExtensionNames = exts;
     if (vkCreateDevice(g.phys, &dci, nullptr, &g.dev) != VK_SUCCESS) return -1;
+    g.coopmat = have_cm;
     vkGetDeviceQueue(g.dev, g.qfam, 0, &g.queue);
 
     VkCommandPoolCreateInfo cpi{};
@@ -380,6 +415,13 @@ int llamd_vk_init() {
     g.pipes.assign(n_pipes, {});
     for (size_t i = 0; i < n_pipes; ++i) {
         g.pipes[i].resize(N_ACC, VK_NULL_HANDLE);
+        // A shader that uses cooperative matrix cannot even be CREATED on a device
+        // without the extension — pipeline creation fails at load. Left null, and
+        // llamd_vk_dispatch refuses it, so the dot-product path stays the fallback
+        // rather than the whole init failing.
+        if (!g.coopmat && strstr(SPV_TABLE[i].name, "coopmat") != nullptr) {
+            continue;
+        }
         for (int v = 0; v < N_ACC; ++v) {
             g.pipes[i][v] = make_pipeline(SPV_TABLE[i].code, SPV_TABLE[i].words,
                                           ACC_VARIANTS[v]);
@@ -558,7 +600,9 @@ int llamd_vk_dispatch(int pipe, void *const *bufs, int nbuf,
         wr[i].pBufferInfo = &bi[i];
     }
 
-    vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pipes[(size_t)pipe][(size_t)v]);
+    VkPipeline chosen = g.pipes[(size_t)pipe][(size_t)v];
+    if (chosen == VK_NULL_HANDLE) return -1;   // not built on this device
+    vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, chosen);
     g.push_desc(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.playout, 0, (uint32_t)nbuf, wr);
     vkCmdPushConstants(g.cmd, g.playout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        32 * sizeof(uint32_t), push);
@@ -657,6 +701,9 @@ int llamd_vk_coopmat_report(char *out, int max) {
 }
 
 uint32_t llamd_vk_subgroup_size() { return g.subgroup_size; }
+
+/// Was VK_KHR_cooperative_matrix enabled on this device?
+int llamd_vk_has_coopmat() { return g.coopmat ? 1 : 0; }
 
 // Convenience wrapper for the standalone matvec validation and benchmark: one
 // begin / N dispatches / one wait.

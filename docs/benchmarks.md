@@ -2088,3 +2088,101 @@ of the 365 ms pass:
 density the shape provides. That is the target, and unlike §19's and §20's
 projections it rests on an enumerated hardware capability rather than a counting
 argument — though on this project's record, it is a hypothesis until measured.
+
+---
+
+## 24. Cooperative matrix: enabled, measured, and the fold solved
+
+§23 named the shape. This enables it, prices it, and settles the kernel design
+before a kernel is written — because three projections in this document have
+predicted large prefill gains and returned ~0, and the pattern in all three was
+reasoning where a measurement was available.
+
+### Enabled, and optional
+
+`VK_KHR_cooperative_matrix` plus `cooperativeMatrix`, `vulkanMemoryModel` and
+`vulkanMemoryModelDeviceScope` are now requested — **if the device has them**. A
+device without is not broken: the shader table skips any shader whose name contains
+`coopmat`, `llamd_vk_dispatch` refuses a null pipeline, and the dot-product kernels
+remain the fallback and the correctness reference. A coopmat shader cannot merely
+fail at dispatch — pipeline creation fails at load, for the whole table — so this
+had to be a build-time skip rather than a runtime branch.
+
+`shaderInt8` and `storageBuffer8BitAccess` were already on, and the toolchain
+(glslang 16.1.0, shaderc 2026.1) compiles `GL_KHR_cooperative_matrix` against the
+existing `--target-env=vulkan1.3`.
+
+### The problem the shape creates
+
+Q6_K carries an **int8 scale per 16 weights** and an f16 super-scale per 256. The
+MMA's K dimension is **also 16**. So one MMA consumes exactly one scale group, and
+its 16×16 result must be scaled per row before the next group can join it. The scale
+cannot be folded into the operand: weights are 0..63 and an int8 scale multiplied by
+them overflows u8.
+
+Done naively — store the accumulator to LDS, read it back, scale each element —
+that is **256 scalar operations per 4096-MAC instruction**.
+
+### Measured, same harness, same occupancy
+
+| arm | G MAC/s | vs dot | % of ceiling |
+|---|---|---|---|
+| MMA, no fold | **59307** | 33.2× | 100% |
+| MMA + naive fold | 9381 | 5.3× | 16% |
+| **MMA + matrix-domain fold** | **21651** | **12.1×** | **37%** |
+| `dotPacked4x8AccSatEXT` | 1786 | 1× | 3% |
+
+The naive fold keeps 16% of the instruction's ceiling. **The fear was justified and
+the fix works.**
+
+### The fix: fold without leaving the matrix domain
+
+The weight scale is per row, therefore **constant along the token axis**. A
+stride-0 load expresses exactly that: loaded row-major with stride 0, element
+`[r][c]` comes from `mem[r*0 + c] = mem[c]`. So compute the product **transposed** —
+tokens down, weight rows across — and the per-row scale becomes a per-**column**
+broadcast that a 16-element array supplies:
+
+```glsl
+MAT_C mc = coopMatMulAdd(ma, mb, MAT_C(0u));
+MAT_F ms;
+coopMatLoad(ms, s_bcast, 0, 0, gl_CooperativeMatrixLayoutRowMajor);  // stride 0
+facc += ms * MAT_F(mc);                                              // elementwise
+```
+
+16 shared writes per group instead of 256 extractions, and the accumulator never
+leaves the matrix domain until the end. **2.31× over the naive fold**, and both
+arms return the same verified value (512 for all-ones operands over 8 iterations),
+which is what proves the stride-0 load means what the design relies on.
+
+### And the simplification measuring it exposed
+
+The device reports **all eight** signed/unsigned 8-bit combinations, including:
+
+```
+16x16x16  A s8  B s8  C s32  acc s32
+```
+
+The §V2 unsigned identity — `Σ sc·(w−32)·a` rewritten over unsigned operands with
+`−128·Σw − 32·Σb + 32·128·16` corrections — exists because **gfx1201's HIP lacks
+`sdot4`**. The matrix cores do not lack signed int8. So the coopmat kernel computes
+
+    out[r][t] = d[r] · sc[r][g] · Σ_j (w[r][j] − 32) · a[t][j]
+
+directly: `w−32` is −32..31 and fits s8, the Q8_K activation is already int8, and
+**every correction term disappears** — no `Σw`, no `Σb`, no `+65536`, and no XOR
+bias. The coopmat path is *simpler* than the dot path it replaces, which is not how
+this usually goes.
+
+### What this predicts, and the standing caveat
+
+21651 G MAC/s against the expert kernel's measured 4852 is **4.46×** on its
+arithmetic. §23's arithmetic said 4× on the matmuls reaches 3310 tok/s, past
+llama.cpp's 3214.
+
+That is now a measured instruction rate and a verified fold, not a counting
+argument — which is better footing than §19, §20 or §23 had. It is still not a
+kernel. What remains is the unglamorous part: unpacking planar Q6_K into s8 tiles in
+LDS, staging activations transposed, and driving 128 groups per row-block. A kernel
+realises less than its instruction ceiling, always, and how much less is the next
+measurement rather than the next paragraph.
