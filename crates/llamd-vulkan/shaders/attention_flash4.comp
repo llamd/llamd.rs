@@ -1,0 +1,160 @@
+#version 450
+//
+// Attention as FOUR INDEPENDENT flash streams — no barrier inside the key loop.
+//
+// §35 built a one-pass online softmax and got 1.025x at pp512 rising to 1.069x at pp2048.
+// It left something on the table and said what: its softmax reduction is ONE subgroup over
+// one 64-key block, so the other three subgroups wait at a barrier three times per block —
+// about 96 barriers per workgroup at n_kv 2048.
+//
+// Here each of the four subgroups runs a COMPLETE flash attention over its own slice of
+// the keys, carrying its own running (output, max, sum) entirely in registers and reducing
+// only through subgroup operations. There is ONE barrier in the whole kernel, at the end,
+// to combine the four partials with the standard flash rescale:
+//
+//     M = max_sg m_sg,   L = sum_sg l_sg e^(m_sg - M),   O = sum_sg o_sg e^(m_sg - M)
+//
+// THE LANE MAPPING, which is what makes it barrier-free. Lane l handles key l/4 and the
+// head-dimension slice l%4, so:
+//   - the query slice it needs is 8 vec4, loaded ONCE into registers before the loop;
+//   - the K and V reads of a key's four lanes are contiguous, 512 bytes between them;
+//   - the per-key dot closes with subgroupClusteredAdd over 4 lanes, which broadcasts the
+//     result to all four, so every lane can compute the same probability without a shuffle;
+//   - the block max and sum are plain subgroupMax / subgroupAdd over the 16 keys;
+//   - the output accumulator, 8 vec4 per lane, is reduced across the sixteen lanes that
+//     share a dimension slice by four subgroupShuffleXor butterfly steps at strides
+//     4, 8, 16 and 32 — once, after the loop.
+//
+// §33 established that registers and LDS are the same occupancy currency on this part, so
+// the cost is stated plainly: 8 vec4 of query plus 8 vec4 of accumulator is 64 floats of
+// live state per lane. Whether that is cheaper than the barriers it removes is measured,
+// not assumed — four of this session's changes spent registers and lost.
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly  buffer Q  { vec4  q4[];     };
+layout(std430, binding = 1) readonly  buffer KC { vec4  kc4[];    };
+layout(std430, binding = 2) readonly  buffer VC { vec4  vc4[];    };
+layout(std430, binding = 3) writeonly buffer O  { vec4  o4[];     };
+layout(std430, binding = 4) buffer            SC { float scores[]; };  // unused, kept so the
+layout(std430, binding = 5) readonly  buffer M  { int   meta[];   };   // descriptor set is one
+layout(push_constant) uniform P {
+    uint n_head; uint n_head_kv; uint hd; uint max_kv;
+    uint nseq; uint ratio; uint kv_stride;
+} pc;
+
+#define LPK 4      // lanes per key
+#define KPB 16     // keys per block: 64 lanes / LPK
+#define PL  8      // vec4 per lane: hd4 / LPK, so head_dim 128. The host enforces it.
+
+shared vec4  s_o[4 * 32];   // each subgroup's output partial, 32 vec4 of it
+shared float s_m[4];        // and its running max
+shared float s_l[4];        // and its running sum
+
+void main() {
+    uint s = gl_WorkGroupID.x / pc.n_head;
+    uint h = gl_WorkGroupID.x - s * pc.n_head;
+    if (s >= pc.nseq) return;
+    uint n_kv = uint(meta[2 * int(s) + 1]) + 1u;
+    uint kvh = h / pc.ratio;
+    uint kv_dim = pc.n_head_kv * pc.hd;
+    float scale = inversesqrt(float(pc.hd));
+
+    uint sg = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint hd4 = pc.hd >> 2u;
+    uint qb4 = ((s * pc.n_head + h) * pc.hd) >> 2u;
+    uint kbase = s * pc.kv_stride;
+
+    uint k_in_blk = lane / uint(LPK);       // 0..15, which key of the block
+    uint dpart = lane % uint(LPK);          // 0..3, which quarter of the head dimension
+    uint d0 = dpart * uint(PL);             // this lane's first vec4 of the head dimension
+
+    // The query slice, in registers, read once for the whole kernel.
+    vec4 q[PL];
+    for (uint i = 0u; i < uint(PL); ++i) q[i] = q4[qb4 + d0 + i];
+
+    vec4 acc[PL];
+    for (uint i = 0u; i < uint(PL); ++i) acc[i] = vec4(0.0);
+    float m_run = -1.0 / 0.0;
+    float l_run = 0.0;
+
+    // Blocks are dealt round-robin to the four subgroups, so the work splits evenly and a
+    // subgroup that gets none simply keeps m = -inf and contributes nothing to the combine.
+    uint nblocks = (n_kv + uint(KPB) - 1u) / uint(KPB);
+    for (uint b = sg; b < nblocks; b += 4u) {
+        uint j = b * uint(KPB) + k_in_blk;
+        bool live = j < n_kv;
+
+        // ---- this key's score: four lanes, contiguous reads, clustered close ----
+        vec4 a0 = vec4(0.0), a1 = vec4(0.0);
+        if (live) {
+            uint ko4 = (kbase + j * kv_dim + kvh * pc.hd) >> 2u;
+            for (uint i = 0u; i + 2u <= uint(PL); i += 2u) {
+                a0 += q[i] * kc4[ko4 + d0 + i];
+                a1 += q[i + 1u] * kc4[ko4 + d0 + i + 1u];
+            }
+        }
+        vec4 vv = a0 + a1;
+        float partial = vv.x + vv.y + vv.z + vv.w;
+        // Broadcasts the sum to all four lanes of the key, so each can form the same
+        // probability without a shuffle.
+        float dot = subgroupClusteredAdd(partial, LPK);
+        float sc = live ? dot * scale : -1.0 / 0.0;
+
+        // ---- online softmax, entirely in subgroup ops ----
+        float bm = subgroupMax(sc);
+        float m_new = max(m_run, bm);
+        float alpha = exp(m_run - m_new);   // 0 on the first block, which is correct
+        float p = live ? exp(sc - m_new) : 0.0;
+        // Each key's p is held by four lanes; count it once.
+        float bl = subgroupAdd((dpart == 0u) ? p : 0.0);
+        l_run = l_run * alpha + bl;
+        m_run = m_new;
+
+        // ---- rescale, then accumulate this block's weighted V ----
+        for (uint i = 0u; i < uint(PL); ++i) acc[i] *= alpha;
+        if (live) {
+            uint vo4 = (kbase + j * kv_dim + kvh * pc.hd) >> 2u;
+            for (uint i = 0u; i < uint(PL); ++i) acc[i] += p * vc4[vo4 + d0 + i];
+        }
+    }
+
+    // ---- reduce across the sixteen lanes that share a dimension slice ----
+    // They sit at stride LPK, so an XOR butterfly over bits 2..5 sums exactly them.
+    for (uint mask = uint(LPK); mask < 64u; mask <<= 1u) {
+        for (uint i = 0u; i < uint(PL); ++i) {
+            acc[i] += subgroupShuffleXor(acc[i], mask);
+        }
+    }
+
+    if (lane < uint(LPK)) {
+        for (uint i = 0u; i < uint(PL); ++i) s_o[sg * 32u + d0 + i] = acc[i];
+    }
+    if (lane == 0u) {
+        s_m[sg] = m_run;
+        s_l[sg] = l_run;
+    }
+    barrier();   // THE ONLY BARRIER IN THE KERNEL
+
+    // ---- combine the four streams ----
+    if (gl_LocalInvocationID.x < hd4) {
+        uint slot = gl_LocalInvocationID.x;
+        float M = max(max(s_m[0], s_m[1]), max(s_m[2], s_m[3]));
+        float L = 0.0;
+        vec4 O = vec4(0.0);
+        for (uint g = 0u; g < 4u; ++g) {
+            float w = exp(s_m[g] - M);      // 0 for a subgroup that saw no keys
+            L += s_l[g] * w;
+            O += s_o[g * 32u + slot] * w;
+        }
+        o4[qb4 + slot] = O / L;
+    }
+}

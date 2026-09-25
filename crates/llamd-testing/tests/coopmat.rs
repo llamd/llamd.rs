@@ -910,20 +910,22 @@ fn flash_attention() {
         for &n in &[1usize, 63, 64, 65, 129, 300, 512, 1024] {
             vk.prefill_tile = tile;
             let toks = &all[..n];
-            ops::set_attention_flash(false);
+            ops::set_attention_flash(0);
             let want = vk.prefill(toks, 0).expect("three-pass");
-            ops::set_attention_flash(true);
-            let got = vk.prefill(toks, 0).expect("flash");
-            cases += 1;
-            if got != want {
-                wrong += 1;
-                if wrong <= 6 {
-                    eprintln!("  MISMATCH tile {tile}, {n} tokens: {want} vs {got}");
+            for m in [1usize, 2] {
+                ops::set_attention_flash(m);
+                let got = vk.prefill(toks, 0).expect("flash");
+                cases += 1;
+                if got != want {
+                    wrong += 1;
+                    if wrong <= 6 {
+                        eprintln!("  MISMATCH mode {m} tile {tile}, {n} tokens: {want} vs {got}");
+                    }
                 }
             }
         }
     }
-    ops::set_attention_flash(false);
+    ops::set_attention_flash(0);
     eprintln!("  {} of {cases} cases agree", cases - wrong);
     assert_eq!(
         wrong, 0,
@@ -931,7 +933,7 @@ fn flash_attention() {
     );
 
     // Then the number, alternating arms in one process.
-    let run = |vk: &mut VulkanModel, n: usize, on: bool| -> f64 {
+    let run = |vk: &mut VulkanModel, n: usize, on: usize| -> f64 {
         ops::set_attention_flash(on);
         let toks = &all[..n];
         let _ = vk.prefill(toks, 0).expect("warm");
@@ -949,8 +951,8 @@ fn flash_attention() {
         "prompt", "flash", "three-pass", "speedup"
     );
     for n in [512usize, 1024, 1536, 2048] {
-        let old = run(&mut vk, n, false);
-        let new = run(&mut vk, n, true);
+        let old = run(&mut vk, n, 1);
+        let new = run(&mut vk, n, 2);
         eprintln!(
             "  {n:>8}{:>14}{:>14}{:>10}",
             format!("{new:.1}"),
@@ -958,7 +960,7 @@ fn flash_attention() {
             format!("{:.3}x", new / old)
         );
     }
-    ops::set_attention_flash(false);
+    ops::set_attention_flash(0);
 }
 
 /// Flash attention at DECODE, where n_kv is the context and attention is a small share —
@@ -977,7 +979,7 @@ fn flash_attention_decode() {
         VulkanModel::load_with_slots(&model, 600, llamd_vulkan::MAX_TILE, 8).expect("load");
     let vocab = llamd_tokenizer::Vocab::from_gguf(model.gguf()).expect("vocab");
     let tok = vocab.encode("The", false)[0];
-    let run = |vk: &mut VulkanModel, batch: usize, on: bool| -> f64 {
+    let run = |vk: &mut VulkanModel, batch: usize, on: usize| -> f64 {
         ops::set_attention_flash(on);
         let toks: Vec<u32> = std::iter::repeat_n(tok, batch).collect();
         let pos: Vec<usize> = (0..batch).map(|_| 256).collect();
@@ -998,8 +1000,8 @@ fn flash_attention_decode() {
         "batch", "flash", "three-pass", "ratio"
     );
     for b in [1usize, 4, 8] {
-        let off = run(&mut vk, b, false);
-        let on = run(&mut vk, b, true);
+        let off = run(&mut vk, b, 1);
+        let on = run(&mut vk, b, 2);
         eprintln!(
             "  {b:>7}{:>12}{:>14}{:>10}",
             format!("{on:.1}"),
@@ -1007,5 +1009,132 @@ fn flash_attention_decode() {
             format!("{:.3}x", on / off)
         );
     }
-    ops::set_attention_flash(false);
+    ops::set_attention_flash(0);
+}
+
+/// The merge, checked on the LOGITS — per kernel, per length, with real metrics.
+///
+/// Token equality is not sufficient and this test exists because it was not: the
+/// four-stream kernel passed 48 of 48 token-equality cases while deviating by 8% of the
+/// logit range. If the reference says 12.81347 / 11.92731 and we say 12.81291 / 11.92802,
+/// the same token wins and numerical error has still been introduced.
+///
+/// Recorded against the three-pass kernel, which is the long-standing reference that
+/// agrees with llama.cpp token for token:
+///   E_abs  = max |L_i - R_i|
+///   MAE    = mean |L_i - R_i|
+///   E_rel  = max |L_i - R_i| / max(|R_i|, eps)
+///   top-10 and top-20 set agreement
+///
+/// The lengths are every structural transition, because that is where ownership of blocks
+/// between the four streams changes: n_kv 1..3 leaves three streams EMPTY, 63/64/65 is the
+/// first full round, and 127/128/129, 255/256/257, 511/512/513, 1023/1024/1025,
+/// 2047/2048/2049 are the later ones.
+#[test]
+#[ignore = "uploads 23 GiB and a 2100-token cache; needs a free GPU and the real model"]
+fn flash_merge_logits_agree() {
+    let Some(path) = oracle_model() else {
+        return;
+    };
+    if !llamd_vulkan::available() {
+        return;
+    }
+    let model = Model::open(&path).expect("open");
+    let nv = model.hparams.n_vocab;
+    let mut vk =
+        VulkanModel::load_with_slots(&model, 2100, llamd_vulkan::MAX_TILE, 8).expect("load");
+    let vocab = llamd_tokenizer::Vocab::from_gguf(model.gguf()).expect("vocab");
+    let text = "Explain how a compiler turns source code into machine instructions, \
+                covering lexing, parsing, type checking, optimisation and code generation.";
+    let mut all = Vec::new();
+    while all.len() < 2060 {
+        all.extend_from_slice(&vocab.encode(text, false));
+    }
+    all.truncate(2060);
+
+    fn topk(v: &[f32], k: usize) -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..v.len()).collect();
+        idx.sort_unstable_by(|&a, &b| v[b].partial_cmp(&v[a]).unwrap());
+        idx.truncate(k);
+        idx
+    }
+    let overlap =
+        |a: &[usize], b: &[usize]| -> usize { a.iter().filter(|i| b.contains(i)).count() };
+
+    const EPS: f32 = 1e-3;
+    // Every structural transition, because that is where block ownership between the four
+    // streams changes.
+    let lengths = [
+        1usize, 2, 3, 4, 63, 64, 65, 127, 128, 129, 255, 256, 257, 511, 512, 513, 1023, 1024, 1025,
+        2047, 2048, 2049,
+    ];
+    eprintln!(
+        "  {:>6}{:>6}{:>12}{:>12}{:>12}{:>9}{:>9}{:>12}",
+        "n_kv", "mode", "E_abs", "MAE", "E_rel", "top10", "top20", "vs mode1"
+    );
+    eprintln!("  (E_* are against mode 0; the last column is against mode 1)");
+    let mut worst: Vec<(f32, usize, usize)> = Vec::new();
+    for &n in &lengths {
+        if n > all.len() {
+            continue;
+        }
+        vk.prefill_tile = 512;
+        let toks = &all[..n];
+        // prefill() only asks for logits on the FINAL tile, so the buffer holds that
+        // tile's tokens — not the whole prompt.
+        let last_tile = if n % 512 == 0 { 512 } else { n % 512 };
+        let tail = |v: Vec<f32>| v[(last_tile - 1) * nv..last_tile * nv].to_vec();
+        ops::set_attention_flash(0);
+        let _ = vk.prefill(toks, 0).expect("three-pass");
+        let r = tail(vk.logits(last_tile).expect("logits"));
+        let r10 = topk(&r, 10);
+        let r20 = topk(&r, 20);
+        // Mode 0 against itself is the determinism control; it comes out exactly zero,
+        // so any deviation below is real. Mode 1 against mode 2 is the OTHER control: two
+        // independently written flash kernels. If they agree with each other far more
+        // closely than either agrees with mode 0, the difference is the softmax SUMMATION
+        // ORDER amplified through 48 layers rather than a bug in either.
+        ops::set_attention_flash(1);
+        let _ = vk.prefill(toks, 0).expect("one-pass");
+        let ref1 = tail(vk.logits(last_tile).expect("logits"));
+        for m in [0usize, 1, 2] {
+            ops::set_attention_flash(m);
+            let _ = vk.prefill(toks, 0).expect("flash");
+            let g = tail(vk.logits(last_tile).expect("logits"));
+            let mut eabs = 0.0f32;
+            let mut sum = 0.0f64;
+            let mut erel = 0.0f32;
+            for (a, b) in r.iter().zip(&g) {
+                let d = (a - b).abs();
+                eabs = eabs.max(d);
+                sum += d as f64;
+                erel = erel.max(d / a.abs().max(EPS));
+            }
+            let mae = (sum / r.len() as f64) as f32;
+            let t10 = overlap(&r10, &topk(&g, 10));
+            let t20 = overlap(&r20, &topk(&g, 20));
+            // and how far this kernel is from the OTHER flash kernel
+            let v1 = ref1
+                .iter()
+                .zip(&g)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            eprintln!(
+                "  {n:>6}{m:>6}{:>12}{:>12}{:>12}{:>9}{:>9}{:>12}",
+                format!("{eabs:.3e}"),
+                format!("{mae:.3e}"),
+                format!("{erel:.3e}"),
+                format!("{t10}/10"),
+                format!("{t20}/20"),
+                format!("{v1:.3e}")
+            );
+            worst.push((eabs, n, m));
+        }
+    }
+    ops::set_attention_flash(2);
+    worst.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    eprintln!(
+        "  worst E_abs: {:.3e} at n_kv {} mode {}",
+        worst[0].0, worst[0].1, worst[0].2
+    );
 }

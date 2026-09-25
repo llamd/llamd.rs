@@ -50,6 +50,7 @@ const SHADERS: &[&str] = &[
     "q6k_matvec_c",
     "q6k_x3_c",
     "attention_flash",
+    "attention_flash4",
     "q6k_expert_c16_r1",
     "q6k_expert_c16_r1v",
     "q6k_expert_c16_r2",

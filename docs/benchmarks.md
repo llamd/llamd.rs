@@ -2968,3 +2968,80 @@ the keys, combined once at the very end. That removes every per-block barrier.
 
 That is the next change, and it follows the same rule the two other wins followed: it
 removes work that buys nothing rather than trading one scarce resource for another.
+
+---
+
+## 36. Token equality is not numerical correctness — §35 is withdrawn
+
+§35 made the one-pass flash kernel the default on the strength of **24 of 24 token-equality
+cases** plus the five-prompt llama.cpp agreement and the 100-case prefill equivalence. All
+of those passed. The kernel was still numerically wrong.
+
+### The test that caught it
+
+Comparing the **whole logit vector** of the last prompt token against the three-pass kernel,
+with `E_abs = max|L−R|`, `MAE`, `E_rel = max|L−R|/max(|R|,ε)` and top-10/top-20 set
+agreement, across every structural boundary: 1, 2, 3, 4, 63/64/65, 127/128/129, 255/256/257,
+511/512/513, 1023/1024/1025, 2047/2048/2049.
+
+Two controls make it interpretable, and the first version of the test had neither:
+
+- **mode 0 against itself** is exactly `0.000e0` at every length, so the engine is
+  deterministic and any deviation is real. (`moe_group.comp` scatters an expert's pairs with
+  a shared `atomicAdd` and its comment says the order is unspecified — that would have made
+  every number here meaningless. It does not, measurably.)
+- **mode 1 against mode 2** — two independently written flash kernels. If both merely
+  reordered the softmax they would differ from mode 0 *and from each other* at rounding
+  scale.
+
+### What it says
+
+| n_kv | mode 1 | mode 2 | mode 2 vs mode 1 |
+|---|---|---|---|
+| 1 | 0 | 0 | 0 |
+| **2** | **6.613e-1** | **5.245e-6** | 6.613e-1 |
+| 3 | 5.528e-1 | 5.706e-1 | 5.691e-1 |
+| 127 | 1.066e1 | 1.058e1 | 5.754e0 |
+| 512 | 1.276e0 | 1.235e0 | 8.723e-1 |
+| 2048 | 1.359e0 | 3.234e0 | 3.179e0 |
+
+**At n_kv = 2 there is one key block and therefore no softmax reordering to blame.** Mode 2
+agrees to 5.2e-6, which is f32 reassociation. Mode 1 deviates by 6.6e-1, which is a defect.
+That alone condemns the kernel §35 shipped as the default.
+
+From n_kv = 3 up **both** kernels deviate by ~0.5 to 10.7, and they disagree with each other
+by the same order. So both carry a defect, and it needs at least three keys to appear.
+
+Top-k agreement shows exactly why token equality missed it: **top-10 is 8–10 of 10 nearly
+everywhere**, and the argmax — the only thing a token comparison sees — survives almost all
+of it. At n_kv 127 the four-stream kernel keeps only **6 of 10** and **9 of 20**, and still
+emitted the same token.
+
+### What was done
+
+- **The default is back to mode 0**, the three-pass kernel, which is the reference that
+  agrees with llama.cpp token for token. Re-verified after reverting: five prompts equal,
+  prefill equals sequential decode across 100 cases, 132 passed, 0 failed.
+- **Both flash kernels stay behind `set_attention_flash`,** because the architecture is
+  worth fixing rather than deleting — a gain that grows with prompt length is the only such
+  gain in this document.
+- **§35's performance numbers are withdrawn.** 1.025×–1.069× for one-pass and 1.041×–1.121×
+  for four-stream were measured against a kernel that is not computing the same thing. They
+  will be re-measured, if at all, after the logits suite clears at rounding scale.
+- The valid baseline is mode 0: **pp512 1573.0 t/s**, decode 112.4 / 189.8 / 265.5 / 395.0.
+
+### The engineering lesson, which outlasts the lost speedup
+
+**Token equality validated behaviour, not numerical correctness.** A kernel can perturb a
+large fraction of the logit vector, lose a quarter of the top-10 ordering, and still leave
+the argmax unchanged across dozens of prompts — because the argmax only moves on a near tie,
+and this document had been treating "same token" as proof of "same computation" since §V5.
+
+Every correctness gate in this project that compares *tokens* is therefore a behavioural
+test, not a numerical one. The numerical gate is `flash_merge_logits_agree`, and anything
+touching attention or the softmax has to pass it before it can be a default.
+
+The next step is not another performance measurement: it is to instrument stage by stage —
+QK scores, then each stream's (m, l, o), then the merged attention output, then the layer
+output — and find the first stage at which the flash path diverges. Debugging a 48-layer
+amplification through final logits is what produced two wrong kernels in a row.

@@ -57,15 +57,16 @@ pub enum Pipeline {
     Q6kMatvecC = 34,
     Q6kX3C = 35,
     AttentionFlash = 36,
-    Q6kExpertC16R1 = 37,
-    Q6kExpertC16R1v = 38,
-    Q6kExpertC16R2 = 39,
-    Q6kExpertC16R2v = 40,
-    Q6kExpertC16R4 = 41,
-    Q6kExpertC16R4v = 42,
-    Q6kExpertC16R2a = 43,
-    Q6kExpertC16R2b = 44,
-    Q6kExpertC16R2p = 45,
+    AttentionFlash4 = 37,
+    Q6kExpertC16R1 = 38,
+    Q6kExpertC16R1v = 39,
+    Q6kExpertC16R2 = 40,
+    Q6kExpertC16R2v = 41,
+    Q6kExpertC16R4 = 42,
+    Q6kExpertC16R4v = 43,
+    Q6kExpertC16R2a = 44,
+    Q6kExpertC16R2b = 45,
+    Q6kExpertC16R2p = 46,
 }
 
 impl Pipeline {
@@ -109,6 +110,7 @@ impl Pipeline {
             Pipeline::Q6kMatvecC => "q6k_matvec_c",
             Pipeline::Q6kX3C => "q6k_x3_c",
             Pipeline::AttentionFlash => "attention_flash",
+            Pipeline::AttentionFlash4 => "attention_flash4",
             Pipeline::Q6kExpertC16R1 => "q6k_expert_c16_r1",
             Pipeline::Q6kExpertC16R1v => "q6k_expert_c16_r1v",
             Pipeline::Q6kExpertC16R2 => "q6k_expert_c16_r2",
@@ -121,7 +123,7 @@ impl Pipeline {
         }
     }
 
-    pub const ALL: [Pipeline; 46] = [
+    pub const ALL: [Pipeline; 47] = [
         Pipeline::Q6kMatvec,
         Pipeline::Q6kX3,
         Pipeline::Q6kGemm,
@@ -159,6 +161,7 @@ impl Pipeline {
         Pipeline::Q6kMatvecC,
         Pipeline::Q6kX3C,
         Pipeline::AttentionFlash,
+        Pipeline::AttentionFlash4,
         Pipeline::Q6kExpertC16R1,
         Pipeline::Q6kExpertC16R1v,
         Pipeline::Q6kExpertC16R2,
@@ -412,10 +415,20 @@ pub fn profile_read() -> Vec<(Pipeline, f64)> {
     }
 }
 
-/// ON by default (§35): 1.025x at pp512 growing to 1.069x at pp2048, because attention's
-/// share grows as T^2; neutral at decode, where it is ~2.5% of the pass. Correct across 24
-/// (tile, length) cases against the kernel it replaces.
-static ATTN_FLASH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// OFF by default, and §36 is why.
+///
+/// §35 made mode 1 the default on the strength of 24 of 24 token-equality cases. A
+/// logits-level comparison then showed it deviating from the three-pass reference by 6.6e-1
+/// at n_kv = 2 — where there is ONE key block and therefore no softmax reordering to blame,
+/// so it is a defect and not accumulated rounding. Mode 2 agrees to 5.2e-6 in that same
+/// case, which is pure f32 reordering, but deviates by ~0.5 from n_kv = 3 up and is
+/// therefore not yet cleared either.
+///
+/// Both stay available behind this switch because the performance is real — mode 2 is
+/// 1.041x at pp512 rising to 1.121x at pp2048, and a gain that GROWS with the workload is
+/// worth getting right. Neither becomes the default again until
+/// `flash_merge_logits_agree` shows deviations at rounding scale.
+static ATTN_FLASH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Use the one-pass online-softmax attention kernel.
 ///
@@ -427,12 +440,24 @@ static ATTN_FLASH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 ///
 /// Its softmax reduction is one subgroup over one 64-key block, so it needs a 64-wide
 /// subgroup; where that does not hold the three-pass kernel is used instead.
-pub fn set_attention_flash(on: bool) {
-    ATTN_FLASH.store(on, std::sync::atomic::Ordering::Relaxed);
+/// 0 the three-pass kernel, 1 the one-pass online softmax (§35), 2 FOUR INDEPENDENT flash
+/// streams with a single barrier (§36).
+pub fn set_attention_flash(mode: usize) {
+    ATTN_FLASH.store(mode, std::sync::atomic::Ordering::Relaxed);
 }
 
-pub fn attention_flash() -> bool {
-    ATTN_FLASH.load(std::sync::atomic::Ordering::Relaxed) && subgroup_size() == 64
+/// Both flash kernels reduce within a subgroup and assume it is 64 wide; mode 2 also fixes
+/// eight vec4 per lane, which means head_dim 128 exactly. Anything else falls back rather
+/// than reducing over the wrong lanes or reading past the slice.
+pub fn attention_flash(hd: usize) -> usize {
+    let m = ATTN_FLASH.load(std::sync::atomic::Ordering::Relaxed);
+    if subgroup_size() != 64 {
+        return 0;
+    }
+    if m == 2 && hd != 128 {
+        return 1;
+    }
+    m
 }
 
 static ATTN_SCALAR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1166,10 +1191,12 @@ pub fn attention(
     dispatch(
         if attention_scalar() {
             Pipeline::AttentionScalar
-        } else if attention_flash() {
-            Pipeline::AttentionFlash
         } else {
-            Pipeline::Attention
+            match attention_flash(hd) {
+                2 => Pipeline::AttentionFlash4,
+                1 => Pipeline::AttentionFlash,
+                _ => Pipeline::Attention,
+            }
         },
         &[q, kc, vc, out, scores, meta],
         p,
