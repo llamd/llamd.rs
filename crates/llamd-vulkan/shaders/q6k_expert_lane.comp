@@ -1,0 +1,174 @@
+#version 450
+//
+// The routed expert projections with ONE LANE PER OUTPUT ROW — no cross-lane
+// reduction at all.
+//
+// WHY. Ablation (§26) attributed the expert kernel's time: dot products 13%,
+// activation reads 28%, weight traffic 3%, Q6_K unpack ~0% — and 57% UNACCOUNTED.
+// The geometry explains it. The expert gate is K = 2048, so n_u4 = blocks * 8 = 64,
+// and the subgroup is 64 lanes wide: with one subgroup per output row and the lanes
+// splitting K, each lane runs EXACTLY ONE iteration of the K loop and then pays a
+// subgroupAdd per accumulator — 32 of them, ~6 DPP steps each on wave64. The kernel
+// spends more time reducing across lanes than multiplying.
+//
+// One-subgroup-per-row measured best three times in §16, on shapes where K is long
+// enough that the loop amortises the epilogue. It is pathological when the loop
+// disappears. So here a lane owns a row and walks the WHOLE K itself: the partial
+// sums never leave its registers, and there is no epilogue.
+//
+// WHAT IT COSTS, and why the ablation is what makes it affordable. Consecutive lanes
+// now own rows LROWS apart, so their weight streams are far apart and the loads are
+// uncoalesced. That would be fatal on a kernel where weight traffic mattered — and
+// the ablation measured it at 3%. The activations move the other way: at any step
+// every lane wants the SAME (token, K) bytes, which is the cheapest access pattern
+// there is.
+//
+// LROWS ROWS PER LANE IS KEPT, because the reduction is not the only thing worth
+// fixing: the activation is loaded once and multiplied against LROWS rows, which is
+// the 28% the ablation found. LROWS * ACC_N accumulators is the register budget, and
+// §23 measured 32 as this part's sweet spot and 64 as its cliff.
+//
+// NO BARRIERS AND NO SHARED MEMORY, which is also why a row-count that does not
+// divide the workgroup is fine here: a lane with no rows simply returns.
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_integer_dot_product : require
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer W   { uint  w[];      };
+layout(std430, binding = 1) readonly buffer QB  { uint  qb[];     };
+layout(std430, binding = 2) readonly buffer SB  { int   sb[];     };
+layout(std430, binding = 3) readonly buffer AD  { float ad[];     };
+layout(std430, binding = 4) buffer          O   { float outv[];   };
+layout(std430, binding = 5) readonly buffer GS  { int   gstart[]; };
+layout(std430, binding = 6) readonly buffer GC  { int   gcount[]; };
+layout(std430, binding = 7) readonly buffer PT  { int   ptoken[]; };
+layout(std430, binding = 8) readonly buffer PS  { int   pslot[];  };
+
+layout(push_constant) uniform Push {
+    uint ql_u; uint qh_u; uint sc_u; uint d_u;
+    uint blocks; uint rows; uint n_used; uint nseq;
+    uint by_slot;
+} pc;
+#include "common.glsl"
+
+layout(constant_id = 0) const int ACC_N = 16;
+#define LROWS 2
+
+void main() {
+    uint expert = gl_WorkGroupID.y;
+    int count = gcount[expert];
+    if (count <= 0) return;
+    int start = gstart[expert];
+
+    uint row0 = gl_GlobalInvocationID.x * uint(LROWS);
+    if (row0 >= pc.rows) return;
+    uint live_rows = min(uint(LROWS), pc.rows - row0);
+    bool by_slot = pc.by_slot != 0u;
+
+    uint n_u4 = pc.blocks * 8u;
+
+    for (int base = 0; base < count; base += ACC_N) {
+        int live = min(ACC_N, count - base);
+
+        float acc[LROWS][ACC_N];
+        for (int r = 0; r < LROWS; ++r) {
+            for (int i = 0; i < ACC_N; ++i) acc[r][i] = 0.0;
+        }
+
+        // THE WHOLE K, in this lane. No stride by subgroup, so no reduction after.
+        for (uint u = 0u; u < n_u4; ++u) {
+            uint b = u >> 3u, jb0 = (u & 7u) << 4u;
+            uint h = jb0 >> 6u, m0 = jb0 & 63u;
+            uint shl = (m0 >= 32u) ? 2u : 0u, s4 = shl + 4u;
+            uint si = b * 16u + h * 8u + (m0 >> 4u);
+            uint sj = si + 4u;
+            uint bu = b * 64u + h * 32u + (m0 >> 2u);
+            uint g16 = b * 16u + h * 8u + (m0 >> 4u);
+
+            uint l0[LROWS], l1[LROWS], l2[LROWS], l3[LROWS];
+            uint i0[LROWS], i1[LROWS], i2[LROWS], i3[LROWS];
+            int  cl[LROWS], ch[LROWS], scl[LROWS], sch[LROWS];
+            float dw[LROWS];
+
+            for (int r = 0; r < LROWS; ++r) {
+                uint ri = (expert * pc.rows + row0 + uint(r)) * pc.blocks;
+                uint qlr = pc.ql_u + ri * 32u;
+                uint qhr = pc.qh_u + ri * 16u;
+                uint scr = pc.sc_u + ri * 4u;
+
+                uint q0 = w[qlr + u * 4u + 0u], q1 = w[qlr + u * 4u + 1u];
+                uint q2 = w[qlr + u * 4u + 2u], q3 = w[qlr + u * 4u + 3u];
+                uint hb = qhr + b * 16u + h * 8u + ((m0 & 31u) >> 2u);
+                uint h0 = w[hb + 0u], h1 = w[hb + 1u], h2 = w[hb + 2u], h3 = w[hb + 3u];
+
+                l0[r] = (q0 & 0x0F0F0F0Fu) | (((h0 >> shl) & 0x03030303u) << 4u);
+                l1[r] = (q1 & 0x0F0F0F0Fu) | (((h1 >> shl) & 0x03030303u) << 4u);
+                l2[r] = (q2 & 0x0F0F0F0Fu) | (((h2 >> shl) & 0x03030303u) << 4u);
+                l3[r] = (q3 & 0x0F0F0F0Fu) | (((h3 >> shl) & 0x03030303u) << 4u);
+                i0[r] = ((q0 >> 4u) & 0x0F0F0F0Fu) | (((h0 >> s4) & 0x03030303u) << 4u);
+                i1[r] = ((q1 >> 4u) & 0x0F0F0F0Fu) | (((h1 >> s4) & 0x03030303u) << 4u);
+                i2[r] = ((q2 >> 4u) & 0x0F0F0F0Fu) | (((h2 >> s4) & 0x03030303u) << 4u);
+                i3[r] = ((q3 >> 4u) & 0x0F0F0F0Fu) | (((h3 >> s4) & 0x03030303u) << 4u);
+
+                uint swl = dotPacked4x8AccSatEXT(l0[r], 0x01010101u, 0u);
+                swl = dotPacked4x8AccSatEXT(l1[r], 0x01010101u, swl);
+                swl = dotPacked4x8AccSatEXT(l2[r], 0x01010101u, swl);
+                swl = dotPacked4x8AccSatEXT(l3[r], 0x01010101u, swl);
+                uint swh = dotPacked4x8AccSatEXT(i0[r], 0x01010101u, 0u);
+                swh = dotPacked4x8AccSatEXT(i1[r], 0x01010101u, swh);
+                swh = dotPacked4x8AccSatEXT(i2[r], 0x01010101u, swh);
+                swh = dotPacked4x8AccSatEXT(i3[r], 0x01010101u, swh);
+                cl[r] = -128 * int(swl) + 32 * 128 * 16;
+                ch[r] = -128 * int(swh) + 32 * 128 * 16;
+
+                scl[r] = bitfieldExtract(int(w[scr + (si >> 2u)]), int(8u * (si & 3u)), 8);
+                sch[r] = bitfieldExtract(int(w[scr + (sj >> 2u)]), int(8u * (sj & 3u)), 8);
+                vec2 dp = unpackHalf2x16(w[pc.d_u + ((ri + b) >> 1u)]);
+                dw[r] = (((ri + b) & 1u) == 0u) ? dp.x : dp.y;
+            }
+
+            // One activation read, LROWS rows of dots — and every lane in the wave
+            // wants these same bytes, so it is a broadcast.
+            for (int i = 0; i < ACC_N; ++i) {
+                if (i >= live) break;
+                int p = start + base + i;
+                uint a = by_slot ? uint(pslot[p]) : uint(ptoken[p]);
+                uint ab = a * pc.blocks * 64u + bu;
+                uint ah = ab + 16u;
+
+                uint a0 = qb[ab + 0u], a1 = qb[ab + 1u];
+                uint a2 = qb[ab + 2u], a3 = qb[ab + 3u];
+                uint a4 = qb[ah + 0u], a5 = qb[ah + 1u];
+                uint a6 = qb[ah + 2u], a7 = qb[ah + 3u];
+                int sbl = sb[a * pc.blocks * 16u + g16];
+                int sbh = sb[a * pc.blocks * 16u + g16 + 4u];
+                float as = ad[a * pc.blocks + b];
+
+                for (int r = 0; r < LROWS; ++r) {
+                    uint wl = dotPacked4x8AccSatEXT(l0[r], a0, 0u);
+                    wl = dotPacked4x8AccSatEXT(l1[r], a1, wl);
+                    wl = dotPacked4x8AccSatEXT(l2[r], a2, wl);
+                    wl = dotPacked4x8AccSatEXT(l3[r], a3, wl);
+                    uint wh = dotPacked4x8AccSatEXT(i0[r], a4, 0u);
+                    wh = dotPacked4x8AccSatEXT(i1[r], a5, wh);
+                    wh = dotPacked4x8AccSatEXT(i2[r], a6, wh);
+                    wh = dotPacked4x8AccSatEXT(i3[r], a7, wh);
+                    int il = scl[r] * (int(wl) + cl[r] - 32 * sbl);
+                    int ih = sch[r] * (int(wh) + ch[r] - 32 * sbh);
+                    acc[r][i] += dw[r] * as * float(il + ih);
+                }
+            }
+        }
+
+        // Straight out. The whole point: no subgroupAdd, no elected writer.
+        for (int r = 0; r < LROWS; ++r) {
+            if (uint(r) >= live_rows) break;
+            for (int i = 0; i < ACC_N; ++i) {
+                if (i >= live) break;
+                outv[uint(pslot[start + base + i]) * pc.rows + row0 + uint(r)] = acc[r][i];
+            }
+        }
+    }
+}

@@ -558,7 +558,21 @@ impl VulkanModel {
                         n_used,
                         nseq,
                     )?;
-                    if ops::expert_coopmat_for(n_ffe) {
+                    if ops::expert_lane_enabled() {
+                        ops::expert_lane(
+                            &l.ffn_gate_exps,
+                            &s.qb,
+                            &s.sb,
+                            &s.ad,
+                            &s.e_gate,
+                            grp,
+                            n_ffe,
+                            n_used,
+                            nseq,
+                            n_expert,
+                            false,
+                        )?;
+                    } else if ops::expert_coopmat_for(n_ffe) {
                         ops::expert_coopmat(
                             &l.ffn_gate_exps,
                             &s.qb,
@@ -599,7 +613,21 @@ impl VulkanModel {
                             n_expert,
                         )?;
                     }
-                    if ops::expert_coopmat_for(n_ffe) {
+                    if ops::expert_lane_enabled() {
+                        ops::expert_lane(
+                            &l.ffn_up_exps,
+                            &s.qb,
+                            &s.sb,
+                            &s.ad,
+                            &s.e_up,
+                            grp,
+                            n_ffe,
+                            n_used,
+                            nseq,
+                            n_expert,
+                            false,
+                        )?;
+                    } else if ops::expert_coopmat_for(n_ffe) {
                         ops::expert_coopmat(
                             &l.ffn_up_exps,
                             &s.qb,
@@ -679,7 +707,22 @@ impl VulkanModel {
                     // activation here is per (token, slot), NOT per token, because each
                     // expert consumed its own silu(gate)*up.
                     let dg = (&s.g_start, &s.g_count, &s.p_token, &s.p_slot);
-                    if ops::expert_coopmat_for(n_embd) {
+                    if ops::expert_lane_enabled() {
+                        ops::expert_lane(
+                            &l.ffn_down_exps,
+                            &s.qb,
+                            &s.sb,
+                            &s.ad,
+                            &s.e_down,
+                            dg,
+                            n_embd,
+                            n_used,
+                            nseq,
+                            n_expert,
+                            // by_slot: the down input is per (token, slot).
+                            true,
+                        )?;
+                    } else if ops::expert_coopmat_for(n_embd) {
                         ops::expert_coopmat(
                             &l.ffn_down_exps,
                             &s.qb,

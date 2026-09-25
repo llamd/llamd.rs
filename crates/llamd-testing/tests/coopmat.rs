@@ -393,3 +393,172 @@ fn run_one(model: &Model, name: &str, label: &str) {
     eprintln!();
     eprintln!("  VECTORISING THE LOADS: {:.3}x", ms[0] / ms[5]);
 }
+
+/// The lane-per-row expert kernel: correctness, then what removing the reduction is
+/// worth. §26 measured 57% of the expert kernel as unaccounted for by any work it
+/// does, and the geometry says it is the `subgroupAdd` epilogue — K = 2048 leaves each
+/// lane one loop iteration to amortise 32 reductions over.
+#[test]
+#[ignore = "uploads 23 GiB to the device; needs a free GPU and the real model"]
+fn lane_per_row_experts() {
+    let Some(path) = oracle_model() else {
+        eprintln!("  SKIP lane_per_row_experts: no LLAMD_TEST_MODEL");
+        return;
+    };
+    if !llamd_vulkan::available() {
+        return;
+    }
+    let model = Model::open(&path).expect("open");
+    let mut vk =
+        VulkanModel::load_with_slots(&model, 600, llamd_vulkan::MAX_TILE, 8).expect("load");
+    let vocab = llamd_tokenizer::Vocab::from_gguf(model.gguf()).expect("vocab");
+    let text = "Explain how a compiler turns source code into machine instructions, \
+                covering lexing, parsing, type checking, optimisation and code generation.";
+    let mut all = Vec::new();
+    while all.len() < 512 {
+        all.extend_from_slice(&vocab.encode(text, false));
+    }
+    all.truncate(512);
+
+    // Correctness first, across shapes that straddle ACC_N and the row blocking.
+    let mut wrong = 0;
+    let mut cases = 0;
+    for &tile in &[32usize, 128, 512] {
+        for &n in &[15usize, 16, 17, 33, 300, 512] {
+            vk.prefill_tile = tile;
+            let toks = &all[..n];
+            ops::set_expert_lane(false);
+            let want = vk.prefill(toks, 0).expect("subgroup kernel");
+            ops::set_expert_lane(true);
+            let got = vk.prefill(toks, 0).expect("lane kernel");
+            cases += 1;
+            if got != want {
+                wrong += 1;
+                eprintln!("  MISMATCH tile {tile}, {n} tokens: {want} vs {got}");
+            }
+        }
+    }
+    ops::set_expert_lane(false);
+    eprintln!("  {} of {cases} cases agree", cases - wrong);
+    assert_eq!(wrong, 0, "the lane kernel disagrees");
+
+    // Then the number, both arms alternating in one process.
+    let run = |vk: &mut VulkanModel, lane: bool| -> f64 {
+        ops::set_expert_lane(lane);
+        let _ = vk.prefill(&all, 0).expect("warm");
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let _ = vk.prefill(&all, 0).expect("prefill");
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        512.0 / best
+    };
+    eprintln!(
+        "  {:>6}{:>14}{:>14}{:>10}",
+        "tile", "lane-per-row", "subgroup", "speedup"
+    );
+    let mut best = (0usize, 0.0f64);
+    for tile in [128usize, 256, 512] {
+        vk.prefill_tile = tile;
+        let sub = run(&mut vk, false);
+        let lane = run(&mut vk, true);
+        if lane > best.1 {
+            best = (tile, lane);
+        }
+        eprintln!(
+            "  {tile:>6}{:>14}{:>14}{:>10}",
+            format!("{lane:.1}"),
+            format!("{sub:.1}"),
+            format!("{:.3}x", lane / sub)
+        );
+    }
+    ops::set_expert_lane(false);
+    eprintln!(
+        "  best lane-per-row: tile {} at {:.1} tok/s   (llama.cpp Vulkan pp512 3213.6)",
+        best.0, best.1
+    );
+}
+
+/// The clustered reduction: 16 lanes per row group instead of 64.
+#[test]
+#[ignore = "uploads 23 GiB to the device; needs a free GPU and the real model"]
+fn clustered_reduction_experts() {
+    let Some(path) = oracle_model() else {
+        return;
+    };
+    if !llamd_vulkan::available() {
+        return;
+    }
+    let model = Model::open(&path).expect("open");
+    let mut vk =
+        VulkanModel::load_with_slots(&model, 600, llamd_vulkan::MAX_TILE, 8).expect("load");
+    let vocab = llamd_tokenizer::Vocab::from_gguf(model.gguf()).expect("vocab");
+    let text = "Explain how a compiler turns source code into machine instructions, \
+                covering lexing, parsing, type checking, optimisation and code generation.";
+    let mut all = Vec::new();
+    while all.len() < 512 {
+        all.extend_from_slice(&vocab.encode(text, false));
+    }
+    all.truncate(512);
+
+    let mut wrong = 0;
+    let mut cases = 0;
+    for &tile in &[32usize, 128, 512] {
+        for &n in &[15usize, 17, 33, 300, 512] {
+            vk.prefill_tile = tile;
+            let toks = &all[..n];
+            ops::set_expert_cluster(0);
+            let want = vk.prefill(toks, 0).expect("subgroup");
+            ops::set_expert_cluster(16);
+            let got = vk.prefill(toks, 0).expect("clustered");
+            cases += 1;
+            if got != want {
+                wrong += 1;
+                eprintln!("  MISMATCH tile {tile}, {n} tokens: {want} vs {got}");
+            }
+        }
+    }
+    ops::set_expert_cluster(0);
+    eprintln!("  {} of {cases} cases agree", cases - wrong);
+    assert_eq!(wrong, 0, "the clustered kernel disagrees");
+
+    let run = |vk: &mut VulkanModel, lanes: usize| -> f64 {
+        ops::set_expert_cluster(lanes);
+        let _ = vk.prefill(&all, 0).expect("warm");
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let _ = vk.prefill(&all, 0).expect("prefill");
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        512.0 / best
+    };
+    eprintln!(
+        "  {:>6}{:>12}{:>12}{:>12}{:>12}",
+        "tile", "subgroup 64", "cluster 32", "cluster 16", "cluster 8"
+    );
+    let mut best = (0usize, 0usize, 0.0f64);
+    for tile in [128usize, 256, 512] {
+        vk.prefill_tile = tile;
+        let mut row = Vec::new();
+        for lanes in [0usize, 32, 16, 8] {
+            let t = run(&mut vk, lanes);
+            if t > best.2 {
+                best = (tile, lanes, t);
+            }
+            row.push(format!("{t:.1}"));
+        }
+        eprintln!(
+            "  {tile:>6}{:>12}{:>12}{:>12}{:>12}",
+            row[0], row[1], row[2], row[3]
+        );
+    }
+    ops::set_expert_cluster(0);
+    eprintln!(
+        "  best: tile {} cluster {} at {:.1} tok/s   (llama.cpp Vulkan pp512 3213.6)",
+        best.0,
+        if best.1 == 0 { 64 } else { best.1 },
+        best.2
+    );
+}

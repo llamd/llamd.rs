@@ -2,6 +2,7 @@
 #extension GL_EXT_integer_dot_product : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_clustered : require
 
 layout(local_size_x = 256) in;
 
@@ -39,13 +40,42 @@ layout(constant_id = 0) const int ACC_N = 16;
 #error "include expert_rt_body.glsl from a wrapper that defines ROWS"
 #endif
 
+// LANES PER OUTPUT ROW-GROUP. 0 (or absent) means the whole subgroup, which is the
+// original decomposition. A smaller cluster is the middle of two failures:
+//
+//   64 lanes per row  the reduction is ~19% of lane-ops, because K = 2048 leaves each
+//                     lane ONE loop iteration to amortise 32 subgroupAdds over (§26)
+//    1 lane per row   no reduction at all, and 2.15x SLOWER — each lane streams its
+//                     own row, so one load instruction touches 64 cache lines. The
+//                     ablation's "weight traffic is 3%" was measured with COALESCED
+//                     loads; it does not survive being reorganised.
+//
+// At CLUSTER lanes the reduction is log2(CLUSTER) steps over CLUSTER lanes instead of
+// 6 over 64 — 2048 lane-ops per row at 16 against 12288 — while the lanes of a
+// cluster still read CONSECUTIVE K and stay coalesced. Four clusters means four
+// streams, not sixty-four.
+#ifndef CLUSTER
+#define CLUSTER 0
+#endif
+#if CLUSTER > 0
+#define CL_LANES uint(CLUSTER)
+#else
+#define CL_LANES gl_SubgroupSize
+#endif
+
 void main() {
     uint expert = gl_WorkGroupID.y;
     int count = gcount[expert];
     if (count <= 0) return;
     int start = gstart[expert];
 
-    uint rbase = (gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID) * uint(ROWS);
+    // Which row group this lane belongs to. With CLUSTER = 0 this is the original
+    // one-group-per-subgroup mapping; with a cluster it is one group per cluster.
+    uint cl_id = gl_SubgroupInvocationID / CL_LANES;      // cluster within the subgroup
+    uint cl_lane = gl_SubgroupInvocationID % CL_LANES;    // lane within the cluster
+    uint cl_per_sg = gl_SubgroupSize / CL_LANES;
+    uint rbase = ((gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID) * cl_per_sg
+                  + cl_id) * uint(ROWS);
     if (rbase >= pc.rows) return;
     // How many of this lane group's ROWS rows are real. pc.rows is 768 or 2048
     // and ROWS divides both, but a caller with a ragged row count must not write
@@ -63,7 +93,7 @@ void main() {
             for (int i = 0; i < ACC_N; ++i) acc[r][i] = 0.0;
         }
 
-        for (uint u = gl_SubgroupInvocationID; u < n_u4; u += gl_SubgroupSize) {
+        for (uint u = cl_lane; u < n_u4; u += CL_LANES) {
             uint b = u >> 3u, jb0 = (u & 7u) << 4u;
             uint h = jb0 >> 6u, m0 = jb0 & 63u;
             uint shl = (m0 >= 32u) ? 2u : 0u, s4 = shl + 4u;
@@ -154,8 +184,12 @@ void main() {
             if (uint(r) >= live_rows) break;
             for (int i = 0; i < ACC_N; ++i) {
                 if (i >= live) break;
+#if CLUSTER > 0
+                float sum = subgroupClusteredAdd(acc[r][i], CLUSTER);
+#else
                 float sum = subgroupAdd(acc[r][i]);
-                if (subgroupElect()) {
+#endif
+                if (cl_lane == 0u) {
                     outv[uint(pslot[start + base + i]) * pc.rows + rbase + uint(r)] = sum;
                 }
             }

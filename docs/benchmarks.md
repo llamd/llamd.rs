@@ -2353,3 +2353,88 @@ that is ~97 ms of a 371 ms pass, or about **1870 tok/s**. Against llama.cpp's 32
 that is still behind, and this is the fifth projection in this document — the
 difference from the previous four is that it rests on a measured 57% with a
 mechanical explanation rather than on an op count.
+
+---
+
+## 27. The clustered reduction: two failures bracketing a win
+
+§26 measured 57% of the expert kernel as unaccounted for by any work it does, and
+blamed the `subgroupAdd` epilogue: the expert gate is K = 2048, so `n_u4 = 64` and
+the subgroup is 64 lanes wide — each lane runs **one** loop iteration, then pays 32
+reductions of ~6 DPP steps each.
+
+### Failure one: remove the reduction entirely
+
+`q6k_expert_lane.comp` — one lane per output row, walking the whole K itself, no
+cross-lane reduction at all. **Correct across 18 of 18 cases, and 2.15× slower**
+(644.5 against 1386.3 at pp512).
+
+The reason is a flaw in how §26's numbers were read. The ablation says weight traffic
+is **3%** — but that was measured with **coalesced** loads. One lane per row makes
+each lane stream its own row, so a single load instruction touches 64 cache lines,
+and the 3% became the dominant cost.
+
+> **An ablation prices a component in the arrangement it was measured in. It does not
+> price the same component after the arrangement changes around it.**
+
+That is the general lesson, and it is the fifth distinct way this document has been
+wrong about these kernels.
+
+### Failure two is the old one: 64 lanes per row
+
+Keeping the whole subgroup on one row is the other extreme: coalescing is perfect and
+the reduction costs ~12288 lane-ops per row against ~51200 of inner work.
+
+### The win is between them
+
+`CLUSTER` lanes per row group: the reduction is `log2(CLUSTER)` steps over `CLUSTER`
+lanes instead of 6 over 64, while the lanes of a cluster still read **consecutive K**
+and stay coalesced. Four clusters means four weight streams, not sixty-four.
+
+| prefill tile | subgroup 64 | cluster 32 | **cluster 16** | cluster 8 | 1 lane/row |
+|---|---|---|---|---|---|
+| 128 | 1237.8 | 1358.4 | **1380.5** | 1345.5 | 521.7 |
+| 256 | 1325.6 | 1471.3 | **1491.7** | 1465.7 | 599.2 |
+| 512 | 1364.7 | 1529.8 | **1547.1** | 1530.4 | 644.5 |
+
+A clean inverted U with its peak at 16, which is what the two failures predicted:
+too few lanes and the loads scatter, too many and the epilogue dominates. **1.134×**,
+and 15 of 15 cases emit the same token.
+
+### Where the engine stands
+
+| | before §26 | now |
+|---|---|---|
+| pp64 | 1127.6 | **1249.4** |
+| pp128 | 1349.8 | **1549.3** |
+| pp256 | 1425.4 | **1689.4** |
+| **pp512** | **1396** | **1572.6** |
+| decode, 1 stream | 109–113 | 112.4 |
+| decode, batch 8 | 396–411 | 395.0 |
+
+Prefill is **2.04× behind** llama.cpp Vulkan's 3214, from 4.9× at §19 and 2.3× at
+§25. Its non-coopmat path (1834) is now within **14%**.
+
+Correctness unchanged throughout: all five prompts token-for-token equal to
+llama.cpp, prefill equal to sequential decode across 100 (tile, length) cases,
+132 passed, 0 failed.
+
+### The scoreboard, honestly
+
+| | llamd | llama.cpp | |
+|---|---|---|---|
+| decode, 1 stream | **112.4** | 94.4–95.6 | win 1.18× |
+| decode, batch 2 | **189.8** | 145.8 | win 1.30× |
+| decode, batch 4 | **265.5** | 229.5 | win 1.16× |
+| decode, batch 8 | **395.0** | 290.9 | win 1.36× |
+| prefill pp512 | 1572.6 | **3214** | **lose 0.49×** |
+
+Four of five. The goal of being faster in every category is **not met**, and prefill
+is the sole holdout.
+
+Both remaining leads are measured rather than reasoned. The ablation's largest single
+line is still **activation reads at 28–40%**, and the `uvec4` vectorisation only
+collected that on the kernels where register pressure allowed it — the expert kernel
+refused it (§26). And the clustered reduction has only been applied to the expert
+kernel; `q6k_matvec` and `q6k_x3` have the same 64-lane epilogue over a K that is
+twice as long, so the same change is worth less there but is not worth nothing.

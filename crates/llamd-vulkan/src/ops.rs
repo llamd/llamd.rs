@@ -50,6 +50,10 @@ pub enum Pipeline {
     CoopmatProbe = 27,
     Q6kExpertCm = 28,
     MatvecAblate = 29,
+    Q6kExpertLane = 30,
+    Q6kExpertRt2c = 31,
+    Q6kExpertRt2c8 = 32,
+    Q6kExpertRt2c32 = 33,
 }
 
 impl Pipeline {
@@ -86,10 +90,14 @@ impl Pipeline {
             Pipeline::CoopmatProbe => "coopmat_probe",
             Pipeline::Q6kExpertCm => "q6k_expert_cm",
             Pipeline::MatvecAblate => "matvec_ablate",
+            Pipeline::Q6kExpertLane => "q6k_expert_lane",
+            Pipeline::Q6kExpertRt2c => "q6k_expert_rt2c",
+            Pipeline::Q6kExpertRt2c8 => "q6k_expert_rt2c8",
+            Pipeline::Q6kExpertRt2c32 => "q6k_expert_rt2c32",
         }
     }
 
-    pub const ALL: [Pipeline; 30] = [
+    pub const ALL: [Pipeline; 34] = [
         Pipeline::Q6kMatvec,
         Pipeline::Q6kX3,
         Pipeline::Q6kGemm,
@@ -120,6 +128,10 @@ impl Pipeline {
         Pipeline::CoopmatProbe,
         Pipeline::Q6kExpertCm,
         Pipeline::MatvecAblate,
+        Pipeline::Q6kExpertLane,
+        Pipeline::Q6kExpertRt2c,
+        Pipeline::Q6kExpertRt2c8,
+        Pipeline::Q6kExpertRt2c32,
     ];
 }
 
@@ -412,6 +424,59 @@ pub fn expert_coopmat_for(rows: usize) -> bool {
         && rows % CM_ROWS_PER_WG == 0
 }
 
+/// Rows one LANE of the lane-per-row expert kernel owns. Must match `LROWS` in
+/// `shaders/q6k_expert_lane.comp`.
+pub const LANE_ROWS: usize = 2;
+
+static EXPERT_LANE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Use the lane-per-row expert kernel: each lane walks the whole K for its rows, so
+/// there is no cross-lane reduction. §26 measured the reduction at 57% unaccounted
+/// time on the expert shape, where K = 2048 leaves each lane exactly one loop
+/// iteration to amortise a 32-accumulator `subgroupAdd` epilogue over.
+pub fn set_expert_lane(on: bool) {
+    EXPERT_LANE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn expert_lane_enabled() -> bool {
+    EXPERT_LANE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The routed expert projections, one lane per output row. No shared memory and no
+/// barriers, so a row count that does not divide the workgroup is fine — a lane with
+/// no rows returns.
+#[allow(clippy::too_many_arguments)]
+pub fn expert_lane(
+    w: &PlanarWeights,
+    qb: &VkBuf,
+    sb: &VkBuf,
+    ad: &VkBuf,
+    out: &VkBuf,
+    g: (&VkBuf, &VkBuf, &VkBuf, &VkBuf),
+    rows: usize,
+    n_used: usize,
+    nseq: usize,
+    n_expert: usize,
+    by_slot: bool,
+) -> Result<()> {
+    need(out, rows * n_used * nseq, "expert_lane out")?;
+    let p = planes(w)
+        .u(4, w.blocks())
+        .u(5, rows)
+        .u(6, n_used)
+        .u(7, nseq)
+        .u(8, usize::from(by_slot));
+    dispatch_acc(
+        Pipeline::Q6kExpertLane,
+        &[w.buf(), qb, sb, ad, out, g.0, g.1, g.2, g.3],
+        p,
+        rows.div_ceil(256 * LANE_ROWS) as u32,
+        n_expert as u32,
+        // LANE_ROWS * ACC_N accumulators is the register budget; §23 measured 32.
+        nseq.min(32 / LANE_ROWS),
+    )
+}
+
 /// The routed expert projections on the matrix units. `by_slot` picks the
 /// activation index, as in [`expert_row_tiled`]. Note it does NOT take the
 /// group-sum buffer: the signed shape needs no correction terms.
@@ -507,6 +572,24 @@ pub fn coopmat_probe(
 /// `expert_rt_body.glsl`.
 /// 2 x 16 measured best (§23): 32 accumulators is the sweet spot on this part, and
 /// 64 loses more to occupancy than the extra reuse wins.
+/// Lanes per output row group in the expert kernel. 0 uses the whole subgroup, which
+/// is the original decomposition; 16 uses the clustered variant. The reduction costs
+/// log2(lanes) steps over that many lanes, so a smaller cluster is cheaper — but the
+/// lanes of a cluster are what keep the weight loads coalesced, and taking it to 1
+/// (`q6k_expert_lane`) was 2.15x slower. 16 is the middle.
+/// 16 measured best, and the curve is a clean inverted U: 64 pays too much reduction
+/// (1364.7 tok/s at pp512), 32 gives 1529.8, 16 gives 1547.1, 8 gives 1530.4, and 1 —
+/// no reduction at all — collapses to 644.5 because the weight loads stop coalescing.
+static RT_CLUSTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(16);
+
+pub fn set_expert_cluster(lanes: usize) {
+    RT_CLUSTER.store(lanes, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn expert_cluster() -> usize {
+    RT_CLUSTER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 static RT_ROWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2);
 static RT_ACC: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(16);
 
@@ -1343,10 +1426,26 @@ pub fn expert_row_tiled(
             expert_major(w, qb, sb, ad, out, g, rows, n_used, nseq, n_expert)
         };
     }
-    let pipe = match rt_rows {
-        2 => Pipeline::Q6kExpertRt2,
-        8 => Pipeline::Q6kExpertRt8,
-        _ => Pipeline::Q6kExpertRt,
+    let cluster = expert_cluster();
+    let (pipe, rows_per_wg) = if cluster == 8 || cluster == 16 || cluster == 32 {
+        // Each subgroup holds subgroup_size/cluster row groups of rt_rows rows.
+        (
+            match cluster {
+                8 => Pipeline::Q6kExpertRt2c8,
+                32 => Pipeline::Q6kExpertRt2c32,
+                _ => Pipeline::Q6kExpertRt2c,
+            },
+            rows_per_workgroup().max(1) * (subgroup_size() as usize / cluster) * rt_rows,
+        )
+    } else {
+        (
+            match rt_rows {
+                2 => Pipeline::Q6kExpertRt2,
+                8 => Pipeline::Q6kExpertRt8,
+                _ => Pipeline::Q6kExpertRt,
+            },
+            rows_per_workgroup().max(1) * rt_rows,
+        )
     };
     let p = planes(w)
         .u(4, w.blocks())
@@ -1358,7 +1457,7 @@ pub fn expert_row_tiled(
         pipe,
         &[w.buf(), qb, sb, ad, out, g.0, g.1, g.2, g.3],
         p,
-        groups_for_rows_tiled(rows, rt_rows),
+        rows.div_ceil(rows_per_wg.max(1)) as u32,
         n_expert as u32,
         // The shader's ACC_N is its token chunk, and the register budget is
         // ROWS * ACC_N — so this asks for the chunk, never the tile width.
