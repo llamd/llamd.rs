@@ -100,9 +100,25 @@ layout(constant_id = 0) const int ACC_N = 16;
 // Which is better is not derivable: the shared version measured 0.981x because two
 // barriers per chunk cost more than the arithmetic saved, and because the `pslot`
 // load it removed was a cache hit, not a memory trip.
-#if defined(ADDRHOIST) || defined(ADDRHOIST_REG)
+#if defined(ADDRHOIST) || defined(ADDRHOIST_REG) || defined(PREFETCH)
 #define HOIST_ROWBASE 1
 #endif
+
+// PREFETCH — software pipelining, the one thing never tried.
+//
+// §31 eliminated every other explanation. Removing weight traffic saves 3%; making the
+// arithmetic twelve times denser gives parity; removing 5.7% of the instructions and
+// four points of scalar share gives zero; occupancy is 5-7 waves with no spills. What
+// is left is LATENCY: the loop issues a load and consumes it almost at once, so each
+// wave has nearly nothing in flight, and `s_waitcnt` is 8-13% of the stream.
+//
+// This issues the NEXT K-group's weight words before unpacking the current ones, so
+// the memory latency of iteration k+1 hides under the unpack-and-dot of iteration k.
+// It is what a tuned GEMM does and what this kernel has never done.
+//
+// The cost is registers — 8 uints per row in flight, 16 at ROWS 2 — and registers are
+// the OTHER latency-hiding mechanism on this part. The two could cancel exactly. That
+// is the experiment.
 #ifdef ADDRHOIST
 shared uint s_abase[64];
 #endif
@@ -173,6 +189,25 @@ void main() {
             for (int i = 0; i < ACC_N; ++i) acc[r][i] = 0.0;
         }
 
+#ifdef PREFETCH
+        // The prologue order, so the first iteration also arrives to a load already
+        // in flight rather than starting one.
+        uint nq[ROWS][4], nw[ROWS][4];
+        {
+            uint u0 = cl_lane;
+            uint b0 = u0 >> 3u, j0 = (u0 & 7u) << 4u;
+            uint h0i = j0 >> 6u, m0i = j0 & 63u;
+            uint ho0 = (m0i & 31u) >> 2u;
+            for (int r = 0; r < ROWS; ++r) {
+                uint ql = h_qlr[r] + u0 * 4u;
+                uint qh = h_qhr[r] + b0 * 16u + h0i * 8u + ho0;
+                for (uint j = 0u; j < 4u; ++j) {
+                    nq[r][j] = u0 < n_u4 ? w[ql + j] : 0u;
+                    nw[r][j] = u0 < n_u4 ? w[qh + j] : 0u;
+                }
+            }
+        }
+#endif
         for (uint u = cl_lane; u < n_u4; u += CL_LANES) {
             uint b = u >> 3u, jb0 = (u & 7u) << 4u;
             uint h = jb0 >> 6u, m0 = jb0 & 63u;
@@ -189,6 +224,28 @@ void main() {
             int  cl[ROWS], ch[ROWS], scl[ROWS], sch[ROWS];
             float dw[ROWS];
 
+#ifdef PREFETCH
+            // Take delivery of what the previous iteration ordered, then order the next
+            // BEFORE unpacking — so the load is in flight across the whole unpack.
+            uint cq[ROWS][4], cw[ROWS][4];
+            for (int r = 0; r < ROWS; ++r) {
+                for (uint j = 0u; j < 4u; ++j) { cq[r][j] = nq[r][j]; cw[r][j] = nw[r][j]; }
+            }
+            uint un = u + CL_LANES;
+            if (un < n_u4) {
+                uint bn = un >> 3u, jn = (un & 7u) << 4u;
+                uint hn = jn >> 6u, mn = jn & 63u;
+                uint hon = (mn & 31u) >> 2u;
+                for (int r = 0; r < ROWS; ++r) {
+                    uint ql = h_qlr[r] + un * 4u;
+                    uint qh = h_qhr[r] + bn * 16u + hn * 8u + hon;
+                    for (uint j = 0u; j < 4u; ++j) {
+                        nq[r][j] = w[ql + j];
+                        nw[r][j] = w[qh + j];
+                    }
+                }
+            }
+#endif
             for (int r = 0; r < ROWS; ++r) {
 #ifdef HOIST_ROWBASE
                 uint ri = h_ri[r], qlr = h_qlr[r], qhr = h_qhr[r], scr = h_scr[r];
@@ -199,6 +256,10 @@ void main() {
                 uint scr = pc.sc_u + ri * 4u;
 #endif
 
+#ifdef PREFETCH
+                uint q0 = cq[r][0], q1 = cq[r][1], q2 = cq[r][2], q3 = cq[r][3];
+                uint h0 = cw[r][0], h1 = cw[r][1], h2 = cw[r][2], h3 = cw[r][3];
+#else
                 uint hb = qhr + b * 16u + h * 8u + ((m0 & 31u) >> 2u);
 #ifdef VEC4LOAD
                 uvec4 qv = w[(qlr + u * 4u) >> 2u];
@@ -209,6 +270,7 @@ void main() {
                 uint q0 = w[qlr + u * 4u + 0u], q1 = w[qlr + u * 4u + 1u];
                 uint q2 = w[qlr + u * 4u + 2u], q3 = w[qlr + u * 4u + 3u];
                 uint h0 = w[hb + 0u], h1 = w[hb + 1u], h2 = w[hb + 2u], h3 = w[hb + 3u];
+#endif
 #endif
 
                 l0[r] = (q0 & 0x0F0F0F0Fu) | (((h0 >> shl) & 0x03030303u) << 4u);

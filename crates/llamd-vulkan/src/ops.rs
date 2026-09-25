@@ -64,6 +64,7 @@ pub enum Pipeline {
     Q6kExpertC16R4v = 41,
     Q6kExpertC16R2a = 42,
     Q6kExpertC16R2b = 43,
+    Q6kExpertC16R2p = 44,
 }
 
 impl Pipeline {
@@ -114,10 +115,11 @@ impl Pipeline {
             Pipeline::Q6kExpertC16R4v => "q6k_expert_c16_r4v",
             Pipeline::Q6kExpertC16R2a => "q6k_expert_c16_r2a",
             Pipeline::Q6kExpertC16R2b => "q6k_expert_c16_r2b",
+            Pipeline::Q6kExpertC16R2p => "q6k_expert_c16_r2p",
         }
     }
 
-    pub const ALL: [Pipeline; 44] = [
+    pub const ALL: [Pipeline; 45] = [
         Pipeline::Q6kMatvec,
         Pipeline::Q6kX3,
         Pipeline::Q6kGemm,
@@ -162,6 +164,7 @@ impl Pipeline {
         Pipeline::Q6kExpertC16R4v,
         Pipeline::Q6kExpertC16R2a,
         Pipeline::Q6kExpertC16R2b,
+        Pipeline::Q6kExpertC16R2p,
     ];
 }
 
@@ -669,8 +672,10 @@ static RT_ADDR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize:
 ///
 /// It uses shared memory, so it needs a barrier, so every lane group in the workgroup
 /// must have rows: usable only when the row count divides what a workgroup covers.
-/// 0 off, 1 hoisted through shared memory (needs a barrier), 2 hoisted into registers
-/// (costs ACC_N uints of pressure, no barrier).
+/// 0 off, 1 address hoist through shared memory (needs a barrier), 2 address hoist into
+/// registers (no barrier), 3 SOFTWARE-PIPELINED weight prefetch — the next K-group's
+/// words ordered before the current ones are unpacked, so the load is in flight across
+/// the unpack. §31 eliminated every non-latency explanation; this is the latency one.
 pub fn set_expert_addr(mode: usize) {
     RT_ADDR.store(mode, std::sync::atomic::Ordering::Relaxed);
 }
@@ -1532,6 +1537,7 @@ pub fn expert_row_tiled(
                 // Shared memory means a barrier, so every lane group must have rows.
                 1 if rows % per == 0 => Some(Pipeline::Q6kExpertC16R2a),
                 2 => Some(Pipeline::Q6kExpertC16R2b),
+                3 => Some(Pipeline::Q6kExpertC16R2p),
                 _ => None,
             }
         } else {

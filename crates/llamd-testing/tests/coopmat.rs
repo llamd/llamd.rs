@@ -780,7 +780,7 @@ fn expert_address_hoist() {
             let toks = &all[..n];
             ops::set_expert_addr(0);
             let want = vk.prefill(toks, 0).expect("plain");
-            for m in [1usize, 2] {
+            for m in [1usize, 2, 3] {
                 ops::set_expert_addr(m);
                 let got = vk.prefill(toks, 0).expect("hoisted");
                 cases += 1;
@@ -807,8 +807,8 @@ fn expert_address_hoist() {
         512.0 / best
     };
     eprintln!(
-        "  {:>6}{:>12}{:>12}{:>12}",
-        "tile", "plain", "shared+bar", "registers"
+        "  {:>6}{:>12}{:>14}{:>14}{:>14}",
+        "tile", "plain", "shared+bar", "registers", "PREFETCH"
     );
     let mut best = 0.0f64;
     for tile in [128usize, 256, 512] {
@@ -816,12 +816,14 @@ fn expert_address_hoist() {
         let a = run(&mut vk, 0);
         let b = run(&mut vk, 1);
         let c = run(&mut vk, 2);
-        best = best.max(a.max(b).max(c));
+        let d = run(&mut vk, 3);
+        best = best.max(a.max(b).max(c.max(d)));
         eprintln!(
-            "  {tile:>6}{:>12}{:>12}{:>12}",
+            "  {tile:>6}{:>12}{:>14}{:>14}{:>14}",
             format!("{a:.1}"),
             format!("{b:.1} {:.3}x", b / a),
-            format!("{c:.1} {:.3}x", c / a)
+            format!("{c:.1} {:.3}x", c / a),
+            format!("{d:.1} {:.3}x", d / a)
         );
     }
     ops::set_expert_addr(0);

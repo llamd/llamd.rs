@@ -2694,3 +2694,67 @@ it is a hypothesis, not a plan.
 Both variants stay in the tree, defaulted off. The register one is 1.004×/1.007× at the
 tiles that matter, which is inside the noise this card produces, and a change that
 cannot be distinguished from noise does not belong on the hot path.
+
+---
+
+## 32. Software pipelining: occupancy beats it, and now that is measured
+
+§31 eliminated every explanation except latency. This is the latency experiment: issue
+the next K-group's weight words **before** unpacking the current ones, so the load is in
+flight across the unpack. It is what a tuned GEMM does and what this kernel never did.
+
+### The trade, priced exactly
+
+| | VGPRs | waves/SIMD | instructions | scratch |
+|---|---|---|---|---|
+| plain | 84 | **6** | 2521 | 0 |
+| prefetched | 108 | **4** | 2619 | 0 |
+
+| prefill tile | plain | prefetched |
+|---|---|---|
+| 128 | 1380.2 | 1349.5 (0.978×) |
+| 256 | 1500.4 | 1474.0 (0.982×) |
+| 512 | 1552.6 | 1528.4 (0.984×) |
+
+45 of 45 cases emit the same token. **1.6–2.2% slower.**
+
+### What it establishes
+
+Two waves bought roughly 2%, and the in-flight load bought roughly nothing on top. So:
+
+> **On this part, with this kernel shape, WAVES are a better latency-hiding mechanism
+> than software pipelining — because switching wave is free and a register is not.**
+
+That is a real result and it is the opposite of the textbook advice, which assumes
+registers are cheaper than occupancy. It also retroactively explains §23 (32
+accumulators beat 64), §29 (`uvec4` loses wherever it widens live state), and §31's
+shared-memory variant: every change that spent registers or added barriers lost, and
+every change that spent neither won.
+
+### The corollary, which is the next candidate
+
+If occupancy dominates and registers are the scarce resource, the thing to attack is
+the **largest register consumer**, and that is the accumulator: `ROWS × ACC_N` = 32
+floats of the 84. Moving the accumulators to LDS would free roughly 32 VGPRs — 84 → ~52,
+which is **9 waves per SIMD instead of 6** — at the cost of an LDS read-modify-write per
+(K-group, token) where there is now a register add.
+
+That is a different bet from the last ten: it spends the cheap resource (LDS bandwidth)
+to buy the one the data says is binding (waves). Whether the LDS traffic costs more than
+three waves buy is, as ever, a measurement.
+
+### The record, stated plainly
+
+Ten attempts on these kernels, two wins:
+
+| | |
+|---|---|
+| attention rewrite (§22) | **1.98×** |
+| clustered reduction (§27) | **1.13×** |
+| wide tile, row tiling, coopmat, lane-per-row, clustered projections, uvec4 on experts, address hoist ×2, prefetch | 0.47× – 1.03× |
+
+Both wins came from geometry — from noticing a decomposition that did not fit the
+hardware — and neither came from the performance theory being held at the time. Every
+loss came from reasoning about work: bytes, instructions, or arithmetic density. The
+pattern is consistent enough to be a method: **on this hardware, look at the shape of
+the decomposition, not at the amount of work.**
