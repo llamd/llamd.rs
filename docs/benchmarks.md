@@ -3045,3 +3045,102 @@ The next step is not another performance measurement: it is to instrument stage 
 QK scores, then each stream's (m, l, o), then the merged attention output, then the layer
 output — and find the first stage at which the flash path diverges. Debugging a 48-layer
 amplification through final logits is what produced two wrong kernels in a row.
+
+---
+
+## 37. §36 retracted: the kernels were right, the method was wrong
+
+§36 read an end-to-end logits comparison as condemning both flash kernels, withdrew §35's
+numbers and reverted the default. **That verdict was wrong.** This section says why, and the
+correction matters more than either performance number.
+
+### Stage-by-stage, as it should have been done first
+
+Instead of comparing final logits — 48 layers downstream of the kernel — `ops::attention` is
+driven **directly** with synthetic Q, K and V and compared against softmax computed in
+**f64 on the host**. No model, no layers, no amplification. 22 key counts (1, 2, 3, 4, 5, 16,
+17, 63, 64, 65, 127, 128, 129, 255, 256, 257, 511, 512, 513, 1023, 1024, 2048) × five score
+distributions chosen to break a softmax: `random`, `dominant` (one key 40× everything),
+`flat` (all scores equal), `negative` (all far below zero), `rising` (the max arrives last,
+so every earlier block must be rescaled).
+
+| kernel | worst |kernel − f64 reference| |
+|---|---|
+| mode 0, three-pass | **9.537e-7** |
+| mode 1, one-pass flash | **9.388e-7** |
+| mode 2, four independent streams | **9.537e-7** |
+
+**All three are correct to f32 epsilon.** Mode 0's worst error is *identical* to mode 2's.
+There was never an attention bug.
+
+### Why the end-to-end method could not decide it
+
+The control that settles it: the **pre-§22 scalar attention kernel**, which was this
+project's reference through §V5–§21 and agrees with llama.cpp token for token, compared
+against the §22 vec4 kernel that has been the default since. Both are beyond dispute.
+
+| n_kv | mode 1 | mode 2 | **scalar (known-good)** |
+|---|---|---|---|
+| 3 | 5.528e-1 | 5.706e-1 | **5.706e-1** |
+| 4 | 8.269e-1 | 5.777e-1 | **7.353e-1** |
+| 63 | 1.791e0 | 2.193e0 | **2.977e0** |
+| 64 | 1.648e0 | 2.392e0 | **2.448e0** |
+
+**Two indisputably correct kernels differ by up to 3.0 absolute on final logits** — at
+n_kv 63 the known-good kernel deviates *more* than the flash kernel §36 condemned.
+
+The mechanism is the MoE routing, and it is a **discontinuity, not an amplification**: a
+bit-level difference in attention changes a router logit by ~1e-7, and where two experts are
+nearly tied that flips which of 128 experts is in the top 8 — for one token, in one of 48
+layers. A flipped expert moves that token's hidden state a long way. Mode 1 showing 6.6e-1
+at n_kv 2 while mode 2 shows 5.2e-6 is the signature: a flip is **binary**. It either happens
+or it does not, so two kernels of identical accuracy land orders of magnitude apart.
+
+**For a mixture-of-experts model, the noise floor of an end-to-end logits comparison is
+O(1).** It cannot distinguish a correct kernel from a buggy one, and §36 used it to condemn
+two correct kernels.
+
+### The correct gate, and what it changes
+
+- **The numerical gate is `attention_exact.rs`**: drive the kernel directly, compare against
+  a host reference in f64, sweep the boundaries and the pathological score shapes.
+- **Token equality remains a behavioural gate** — §36 was right about that much, and it is
+  why `attention_exact.rs` now exists.
+- **An end-to-end logits comparison is neither**, on this model. `flash_merge_logits_agree`
+  is kept for what it does measure — how much the routing shifts — with the known-good
+  control in it so nobody reads its magnitudes as error again.
+
+### The numbers, re-measured with mode 2 as the default
+
+| | mode 0 | **mode 2** | llama.cpp | |
+|---|---|---|---|---|
+| decode, 1 stream | 112.4 | **115.9** | 95.6 | **+21%** |
+| decode, batch 2 | 189.8 | **199.8** | 145.8 | **+37%** |
+| decode, batch 4 | 265.5 | **281.0** | 229.5 | **+22%** |
+| decode, batch 8 | 395.0 | **413.3** | 290.9 | **+42%** |
+| prefill pp256 | 1717.9 | **1731.7** | — | — |
+| prefill pp512 | 1573.0 | **1674.7** | 3213.6 | 0.52× |
+| prefill pp1024 | 1291.5 | **1441.2** | 3090.9 | 0.47× |
+| prefill pp2048 | 951.6 | **1141.1** | 2948.2 | 0.39× |
+
+Both gates pass at this default: all three kernels within 9.6e-7 of the f64 reference, all
+five prompts token-for-token equal to llama.cpp, prefill equal to sequential decode across
+100 cases, 132 passed, 0 failed.
+
+**§35's architecture was right and its numbers stand.** The four-stream kernel is the first
+change in this document whose benefit grows with the workload — 1.041× at pp512 rising to
+1.121× at pp2048 — and it lifted decode as well, which the one-pass version did not.
+
+Prefill is now **1.92× behind** llama.cpp at pp512, from 4.9× at §19.
+
+### What this cost, and the rule that comes out of it
+
+Two reversals in two sections: §35 shipped a default on a behavioural test alone, and §36
+withdrew a correct kernel on a test whose noise floor it had not measured. Both mistakes have
+the same shape — **using a test without first measuring what it cannot distinguish.**
+
+The rule: a numerical claim needs a control that establishes the method's floor. §36's
+logits test had a determinism control (mode 0 against itself, exactly zero) and I read that
+as sufficient. It was not: determinism proves the *engine* is reproducible, not that the
+*method* can resolve the difference being asked about. The control that mattered was two
+known-good kernels, and it took two wrong conclusions to add it.

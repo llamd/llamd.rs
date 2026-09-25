@@ -1084,6 +1084,10 @@ fn flash_merge_logits_agree() {
         // tile's tokens — not the whole prompt.
         let last_tile = if n % 512 == 0 { 512 } else { n % 512 };
         let tail = |v: Vec<f32>| v[(last_tile - 1) * nv..last_tile * nv].to_vec();
+        // The reference: the vec4 three-pass kernel, with the scalar arm explicitly OFF.
+        // Leaving it on is how the first version of this test accidentally produced the
+        // control below, and the leak is worth naming because the result is load-bearing.
+        ops::set_attention_scalar(false);
         ops::set_attention_flash(0);
         let _ = vk.prefill(toks, 0).expect("three-pass");
         let r = tail(vk.logits(last_tile).expect("logits"));
@@ -1097,8 +1101,20 @@ fn flash_merge_logits_agree() {
         ops::set_attention_flash(1);
         let _ = vk.prefill(toks, 0).expect("one-pass");
         let ref1 = tail(vk.logits(last_tile).expect("logits"));
-        for m in [0usize, 1, 2] {
-            ops::set_attention_flash(m);
+        // THE CONTROL THAT DECIDES THE METHOD. Mode 3 here is not a flash kernel at all:
+        // it is the PRE-§22 scalar three-pass attention, kept as an A/B arm and validated
+        // against llama.cpp for a dozen sections. It differs from mode 0 only in summation
+        // order (scalar loads versus vec4). If IT also moves the logits by ~1, then an
+        // end-to-end logit comparison cannot distinguish a correct kernel from a buggy one
+        // in this model, and §36's verdict was an artefact of the method rather than a bug.
+        for m in [0usize, 1, 2, 3] {
+            if m == 3 {
+                ops::set_attention_flash(0);
+                ops::set_attention_scalar(true);
+            } else {
+                ops::set_attention_scalar(false);
+                ops::set_attention_flash(m);
+            }
             let _ = vk.prefill(toks, 0).expect("flash");
             let g = tail(vk.logits(last_tile).expect("logits"));
             let mut eabs = 0.0f32;
@@ -1131,7 +1147,8 @@ fn flash_merge_logits_agree() {
             worst.push((eabs, n, m));
         }
     }
-    ops::set_attention_flash(2);
+    ops::set_attention_scalar(false);
+    ops::set_attention_flash(0);
     worst.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
     eprintln!(
         "  worst E_abs: {:.3e} at n_kv {} mode {}",

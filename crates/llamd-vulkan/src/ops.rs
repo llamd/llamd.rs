@@ -415,20 +415,20 @@ pub fn profile_read() -> Vec<(Pipeline, f64)> {
     }
 }
 
-/// OFF by default, and §36 is why.
+/// Mode 2 by default, and §37 is the reason it came back.
 ///
-/// §35 made mode 1 the default on the strength of 24 of 24 token-equality cases. A
-/// logits-level comparison then showed it deviating from the three-pass reference by 6.6e-1
-/// at n_kv = 2 — where there is ONE key block and therefore no softmax reordering to blame,
-/// so it is a defect and not accumulated rounding. Mode 2 agrees to 5.2e-6 in that same
-/// case, which is pure f32 reordering, but deviates by ~0.5 from n_kv = 3 up and is
-/// therefore not yet cleared either.
+/// §35 defaulted to mode 1 on token equality. §36 read an end-to-end logits comparison as
+/// condemning both flash kernels and reverted to mode 0. §37 showed that comparison cannot
+/// decide the question in an MoE model: driving `ops::attention` directly against an f64
+/// host reference puts ALL THREE kernels within 9.6e-7 over 22 key counts and five score
+/// distributions, and the pre-§22 scalar kernel — a reference validated against llama.cpp
+/// for a dozen sections — perturbs the same logits by up to 3.0 absolute. The noise floor
+/// of the end-to-end method is O(1), because a bit-level difference flips a top-8 expert
+/// selection somewhere across 48 layers and a flipped expert moves a token's state a long
+/// way.
 ///
-/// Both stay available behind this switch because the performance is real — mode 2 is
-/// 1.041x at pp512 rising to 1.121x at pp2048, and a gain that GROWS with the workload is
-/// worth getting right. Neither becomes the default again until
-/// `flash_merge_logits_agree` shows deviations at rounding scale.
-static ATTN_FLASH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// So the numerical gate is `attention_exact.rs`, not final logits, and mode 2 passes it.
+static ATTN_FLASH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2);
 
 /// Use the one-pass online-softmax attention kernel.
 ///
