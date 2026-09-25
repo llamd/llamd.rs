@@ -2758,3 +2758,69 @@ hardware — and neither came from the performance theory being held at the time
 loss came from reasoning about work: bytes, instructions, or arithmetic density. The
 pattern is consistent enough to be a method: **on this hardware, look at the shape of
 the decomposition, not at the amount of work.**
+
+---
+
+## 33. The LDS accumulator refutes itself, and the engine is at a local optimum
+
+§32's corollary: if waves beat pipelining and registers are scarce, move the biggest
+register consumer — the accumulator, `ROWS × ACC_N` = 32 floats of 84 — into LDS and buy
+waves with it.
+
+**It is refuted structurally, without a benchmark**, because LDS is not a different
+currency from registers. It is the same one.
+
+Per-lane accumulators for a 256-thread workgroup need `256 × ROWS × ACC_N × 4` bytes:
+
+| accumulator width | LDS per workgroup | consequence |
+|---|---|---|
+| ACC_N 16 | 32 KiB | caps a workgroup at **4 waves/SIMD** |
+| ACC_N 32 | 64 KiB | exactly `maxComputeSharedMemorySize` |
+| ACC_N 64 | **128 KiB** | **exceeds it; the pipeline cannot be created** |
+
+The VGPR count does fall as predicted — 84 → 60 — but the 84 it replaces already permit
+**6** waves per SIMD, and 32 KiB of LDS permits **4**. It trades 6 waves for 4 before a
+single LDS access is paid for. The shader is kept as the record and no wrapper
+instantiates it.
+
+*(A first draft of this section claimed "8 of 322 pipelines failed to be created". That
+came from counting ISA blocks in a debug dump, which is not a reliable count — the engine
+initialises fine either way, and `Pipeline::ALL` matches the shader table exactly. The
+refutation rests on the device limit and the occupancy arithmetic, not on that number.)*
+
+### Which means this design is at a local optimum
+
+Every resource the kernel can spend is now measured, and all of them are the same
+resource:
+
+| spend | to buy | measured |
+|---|---|---|
+| registers (wider ACC) | activation reuse per unpack | 2×16 beats 2×8 **and** 2×32 |
+| registers (prefetch) | a load in flight | **0.984×** (§32) |
+| LDS (accumulators) | registers | 6 waves → 4, **uncreatable at ACC 64** |
+| LDS (address hoist) | scalar instructions | **0.982×** (§31) |
+| coalescing (lane per row) | the reduction | **0.47×** (§27) |
+| the reduction (clusters) | nothing — it was pure overhead | **1.134×** (§27) |
+
+The only change that ever won bought something for **free**: the clustered reduction
+removed epilogue work without spending registers, LDS, or coalescing. Everything else
+traded one scarce thing for another and lost, because on this part they are all the same
+scarce thing — **waves in flight**.
+
+That is what "a local optimum" means here, and it is a stronger statement than "we ran
+out of ideas": within this decomposition family — one output row group per lane cluster,
+weights unpacked per K-group, activations reused across ROWS — there is no remaining
+resource to spend. Beating llama.cpp's prefill needs a **different family**, not a better
+point in this one.
+
+### What a different family would have to look like
+
+llama.cpp's 3214 t/s comes from two things this engine does not do: a dense
+matrix-matrix kernel over a 512-wide ubatch, and `KHR_coopmat` worth a measured 1.75×
+of it (§19, §24). §25 built the coopmat half and it reached parity, because the
+dequantisation it does not accelerate is 76% of that kernel. So the missing piece is not
+the matrix units — it is **feeding them**: a formulation where Q6_K is dequantised once
+into a form a matrix kernel can stream, rather than re-unpacked inside every matmul.
+
+That is a change to the data layout, not to a kernel — and it is the one direction this
+document has never tried.

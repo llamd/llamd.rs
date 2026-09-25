@@ -122,6 +122,31 @@ layout(constant_id = 0) const int ACC_N = 16;
 #ifdef ADDRHOIST
 shared uint s_abase[64];
 #endif
+
+// LDSACC — the accumulator in shared memory instead of registers.
+//
+// §32 found that waves beat software pipelining on this part, and the accumulator is
+// the largest register consumer: ROWS * ACC_N = 32 floats of 84. The apparent
+// corollary is to move it to LDS and buy waves with it.
+//
+// IT IS REFUTED, AND NOT INSTANTIATED. LDS is not a free resource — it is the same
+// occupancy currency as registers, and a worse one here. Per-lane accumulators need
+// 256 * ROWS * ACC_N * 4 bytes:
+//
+//   ACC_N 16 -> 32 KiB, which caps a workgroup at 4 waves per SIMD
+//   ACC_N 32 -> 64 KiB, exactly the hard limit
+//   ACC_N 64 -> 128 KiB, over it; the pipeline cannot be created at all
+//
+// The 84 VGPRs it replaces already permit 6 waves per SIMD, so it trades 6 waves for 4
+// before any LDS traffic is paid — and at ACC_N 64 it cannot be created at all, because
+// this device's maxComputeSharedMemorySize is 65536. The code stays as the record; no
+// wrapper includes it. See benchmarks.md §33.
+#ifdef LDSACC
+shared float s_acc[256 * ROWS * ACC_N];
+#define ACCREF(r, i) s_acc[(gl_LocalInvocationID.x * uint(ROWS) + uint(r)) * uint(ACC_N) + uint(i)]
+#else
+#define ACCREF(r, i) acc[r][i]
+#endif
 #if CLUSTER > 0
 #define CL_LANES uint(CLUSTER)
 #else
@@ -184,9 +209,11 @@ void main() {
         }
 #endif
 
+#ifndef LDSACC
         float acc[ROWS][ACC_N];
+#endif
         for (int r = 0; r < ROWS; ++r) {
-            for (int i = 0; i < ACC_N; ++i) acc[r][i] = 0.0;
+            for (int i = 0; i < ACC_N; ++i) ACCREF(r, i) = 0.0;
         }
 
 #ifdef PREFETCH
@@ -349,7 +376,7 @@ void main() {
                     wh = dotPacked4x8AccSatEXT(i3[r], a7, wh);
                     int il = scl[r] * (int(wl) + cl[r] - 32 * sbl);
                     int ih = sch[r] * (int(wh) + ch[r] - 32 * sbh);
-                    acc[r][i] += dw[r] * as * float(il + ih);
+                    ACCREF(r, i) += dw[r] * as * float(il + ih);
                 }
             }
         }
@@ -362,9 +389,9 @@ void main() {
             for (int i = 0; i < ACC_N; ++i) {
                 if (i >= live) break;
 #if CLUSTER > 0
-                float sum = subgroupClusteredAdd(acc[r][i], CLUSTER);
+                float sum = subgroupClusteredAdd(ACCREF(r, i), CLUSTER);
 #else
-                float sum = subgroupAdd(acc[r][i]);
+                float sum = subgroupAdd(ACCREF(r, i));
 #endif
                 if (cl_lane == 0u) {
                     outv[uint(pslot[start + base + i]) * pc.rows + rbase + uint(r)] = sum;
