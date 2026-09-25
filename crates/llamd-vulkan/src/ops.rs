@@ -901,6 +901,33 @@ pub fn matvec(
     dispatch_acc(pipe, &[w.buf(), qb, sb, ad, out], p, gx, 1, acc_for(nseq))
 }
 
+/// The output projection for ONE token — the last of a prefill tile.
+///
+/// Prefill needs the argmax of the final token only; running the 311 M-weight output
+/// projection for every token of the tile computed 159 G MAC and discarded 158.9 of them.
+/// See `q6k_matvec.comp`'s tail path. `tok0` must be non-zero, which it is for any tile
+/// wider than one token; a single-token tile already costs nothing.
+pub fn matvec_tail(
+    w: &PlanarWeights,
+    qb: &VkBuf,
+    sb: &VkBuf,
+    ad: &VkBuf,
+    out: &VkBuf,
+    rows: usize,
+    tok0: usize,
+) -> Result<()> {
+    need(out, rows, "matvec_tail out")?;
+    let p = planes(w).u(4, w.blocks()).u(5, rows).u(6, 1).u(7, tok0);
+    dispatch_acc(
+        Pipeline::Q6kMatvec,
+        &[w.buf(), qb, sb, ad, out],
+        p,
+        groups_for_rows(rows),
+        1,
+        1,
+    )
+}
+
 /// Rows a single lane accumulates in the GEMM kernel. Must match
 /// `ROWS_PER_LANE` in `shaders/q6k_gemm.comp`.
 pub const GEMM_ROWS_PER_LANE: usize = 2;

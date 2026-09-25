@@ -1080,10 +1080,10 @@ fn flash_merge_logits_agree() {
         }
         vk.prefill_tile = 512;
         let toks = &all[..n];
-        // prefill() only asks for logits on the FINAL tile, so the buffer holds that
-        // tile's tokens — not the whole prompt.
-        let last_tile = if n % 512 == 0 { 512 } else { n % 512 };
-        let tail = |v: Vec<f32>| v[(last_tile - 1) * nv..last_tile * nv].to_vec();
+        // §38: prefill now runs the output projection for the FINAL TOKEN ONLY, so the
+        // buffer holds exactly one token's logits and it is the one this test wants.
+        let last_tile = 1usize;
+        let tail = |v: Vec<f32>| v[..nv].to_vec();
         // The reference: the vec4 three-pass kernel, with the scalar arm explicitly OFF.
         // Leaving it on is how the first version of this test accidentally produced the
         // control below, and the leak is worth naming because the result is load-bearing.

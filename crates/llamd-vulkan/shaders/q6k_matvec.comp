@@ -49,7 +49,7 @@ layout(std430, binding = 4) writeonly buffer O { float outv[]; };
 
 layout(push_constant) uniform Push {
     uint ql_u; uint qh_u; uint sc_u; uint d_u;
-    uint blocks; uint rows; uint nseq; uint pad;
+    uint blocks; uint rows; uint nseq; uint tok0;
 } pc;
 #include "common.glsl"
 #include "q6k.glsl"
@@ -71,6 +71,28 @@ layout(constant_id = 0) const int ACC_N = 64;
 void main() {
     uint row = gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID;
     if (row >= pc.rows) return;
+
+    // THE SINGLE-TOKEN TAIL, and it is pure waste removal rather than a trade.
+    //
+    // The output projection is 2048 -> 151936, which is 311 M weights, and prefill ran it
+    // for EVERY token of the final tile when it needs exactly one — the token whose argmax
+    // becomes the first generated token. At a 512-token tile that is 159 G MAC computed and
+    // 158.9 G thrown away: 44% of this shader's work across the pass and 8% of the whole
+    // prefill (benchmarks.md §38).
+    //
+    // tok0 != 0 selects one token's activation and writes one row of output. The two paths
+    // below are untouched when tok0 is 0, so decode and every other matvec keep the literal
+    // zero bases that §31 showed are worth having.
+    if (pc.tok0 != 0u) {
+        float acc[ACC_N];
+        for (int i = 0; i < ACC_N; ++i) acc[i] = 0.0;
+        Q6K_ACC(w, pc.ql_u, pc.qh_u, pc.sc_u, pc.d_u, row * pc.blocks,
+                pc.tok0 * pc.blocks * 64u, pc.tok0 * pc.blocks * 16u, pc.tok0 * pc.blocks,
+                ACC_N, 1u, acc)
+        float t = subgroupAdd(acc[0]);
+        if (subgroupElect()) outv[row] = t;
+        return;
+    }
 
     // TOKEN CHUNKING, and it is what lets the prefill tile be wide.
     //

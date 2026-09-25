@@ -364,7 +364,7 @@ impl VulkanModel {
         }
         let kv_dim = self.hp.kv_dim();
         let stride = self.max_kv * kv_dim;
-        self.run(tokens, positions, stride, true)?
+        self.run(tokens, positions, stride, true, false)?
             .ok_or_else(|| Error::other("no logits produced"))
     }
 
@@ -381,6 +381,7 @@ impl VulkanModel {
         positions: &[usize],
         kv_stride: usize,
         want_logits: bool,
+        logits_last_only: bool,
     ) -> Result<Option<Vec<u32>>> {
         let nseq = tokens.len();
         if nseq == 0 || nseq != positions.len() || nseq > self.max_seq {
@@ -783,15 +784,38 @@ impl VulkanModel {
 
             ops::rms_norm_mul(&s.x, &self.output_norm, &s.xb, n_embd, nseq, eps)?;
             ops::quantize(&s.xb, &s.qb, &s.sb, &s.ad, (n_embd / 256) * nseq)?;
-            ops::matvec(
-                &self.output,
-                &s.qb,
-                &s.sb,
-                &s.ad,
-                &s.logits,
-                hp.n_vocab,
-                nseq,
-            )?;
+            // PREFILL NEEDS ONE TOKEN'S LOGITS, not the tile's.
+            //
+            // The output projection is 2048 -> 151936, 311 M weights. Running it for every
+            // token of the final tile computed 159 G MAC at a 512-token tile and discarded
+            // all but 0.3 of it — 44% of q6k_matvec's work and 8% of the whole prefill.
+            // Only the last token's argmax becomes the first generated token.
+            let n_logits = if logits_last_only && nseq > 1 {
+                1
+            } else {
+                nseq
+            };
+            if n_logits == 1 && nseq > 1 {
+                ops::matvec_tail(
+                    &self.output,
+                    &s.qb,
+                    &s.sb,
+                    &s.ad,
+                    &s.logits,
+                    hp.n_vocab,
+                    nseq - 1,
+                )?;
+            } else {
+                ops::matvec(
+                    &self.output,
+                    &s.qb,
+                    &s.sb,
+                    &s.ad,
+                    &s.logits,
+                    hp.n_vocab,
+                    nseq,
+                )?;
+            }
             ops::argmax(
                 &s.logits,
                 &s.amax_v,
@@ -799,7 +823,7 @@ impl VulkanModel {
                 &s.out_token,
                 hp.n_vocab,
                 ARGMAX_CHUNKS,
-                nseq,
+                n_logits,
             )
         })();
         // Close the recording whatever happened: leaving it open would refuse
@@ -811,9 +835,14 @@ impl VulkanModel {
         if !want_logits {
             return Ok(None);
         }
-        let mut got = vec![0i32; nseq];
+        let n_logits = if logits_last_only && nseq > 1 {
+            1
+        } else {
+            nseq
+        };
+        let mut got = vec![0i32; n_logits];
         self.s.out_token.download_i32(&mut got)?;
-        let mut out = Vec::with_capacity(nseq);
+        let mut out = Vec::with_capacity(n_logits);
         for (i, &g) in got.iter().enumerate() {
             if g < 0 || g as usize >= self.hp.n_vocab {
                 return Err(Error::other(format!("slot {i} argmax returned {g}")));
@@ -868,9 +897,10 @@ impl VulkanModel {
             // 10% of a token's traffic, and every earlier token's logits are
             // discarded. Skipping it on the other tiles is free correctness.
             let is_last = start + toks.len() == base_pos + tokens.len();
-            let out = self.run(toks, &positions, 0, is_last)?;
+            let out = self.run(toks, &positions, 0, is_last, true)?;
             if is_last {
-                last = out.map(|v| v[toks.len() - 1]);
+                // One element now: the tail path computes only the final token.
+                last = out.map(|v| v[v.len() - 1]);
             }
         }
         last.ok_or_else(|| Error::other("prefill produced no logits"))
