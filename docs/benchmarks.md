@@ -2530,3 +2530,92 @@ beats both 2×8 (16) and 2×32 (64).
 
 The three knobs are now measured together rather than separately, which is what §28
 concluded was the only reliable method. The defaults stand where they were.
+
+---
+
+## 30. The instruction mix, from the code that actually runs
+
+§21 named RGP and then used timestamps instead. §26 substituted ablation because RADV
+exposes no `VK_KHR_performance_query`. This gets the real thing, and it is the answer
+the previous eleven sections were circling.
+
+### RGP is installed, and captures work
+
+The Radeon Developer Tool Suite (2026-05-28, RGP 2.7) installs to `~/ai/rdts`.
+Captures of a swapchain-less compute app work through Mesa:
+
+```
+MESA_VK_TRACE=rgp  MESA_VK_TRACE_PER_SUBMIT=1  MESA_VK_TRACE_TRIGGER=<file>
+RADV_THREAD_TRACE_INSTRUCTION_TIMING=1  RADV_THREAD_TRACE_CACHE_COUNTERS=1
+```
+
+`radv: Thread trace support is enabled (instruction timing: enabled, cache counters:
+enabled, queue events: enabled)`, and 100+ MB `.rgp` files land in `/tmp`. Parsing the
+container confirms them: `B00P` magic, version 1.6, four `SQTT_DATA` chunks totalling
+109 MB, plus `CODE_OBJECT_DATABASE` and `PSO_CORRELATION`.
+
+**They cannot be read here.** `RadeonGPUProfiler` is a Qt GUI with no headless mode,
+there is no X display, and installing `xvfb` needs a password this session does not
+have. The 109 MB payload is a raw hardware token stream whose decoder is closed. So
+the captures are produced and kept, and they are openable on a desktop — but they are
+not what produced the finding below.
+
+### What did: the static instruction mix, two ways
+
+`rga` (also in RDTS) compiles SPIR-V for gfx1201 and disassembles it — but with AMD's
+compiler, not the ACO one RADV runs. So the same analysis was repeated on
+**`RADV_DEBUG=asm`**, which is the code that actually executes. 294 ISA blocks, 42
+shaders × 7 accumulator variants, in build order, so every block is attributable.
+
+The two agree to within a percent or two, which is what makes it trustworthy:
+
+| kernel | instrs | packed dot | VALU | **scalar** | VMEM | `s_waitcnt` |
+|---|---|---|---|---|---|---|
+| expert kernel (ACC 16) | 2523 | **11%** | 33% | **47%** | 4% | 8% |
+| `q6k_matvec` (ACC 32) | 5901 | 9% | 39% | **44%** | 6% | 13% |
+| `q6k_x3` (ACC 32) | 17742 | 9% | 39% | **44%** | 6% | 13% |
+| `attention` (ACC 64) | 635 | — | 32% | **49%** | 2% | 3% |
+| `q6k_grouped` (ACC 1) | 303 | 5% | 43% | **47%** | 3% | 11% |
+
+**Scalar work — address arithmetic, loop control, branches and waits — is 44–49% of
+every kernel. The packed dot products, the actual multiply-accumulate this engine
+exists to perform, are 9–11%.**
+
+### It explains every result in §19 through §29
+
+| attempt | what it targeted | share of the mix | outcome |
+|---|---|---|---|
+| wide tile (§19, §20) | weight traffic | VMEM, 4–6% | **0%** |
+| row tiling (§20) | activation load count | VMEM, 4–6% | 3% |
+| cooperative matrix (§25) | the dot products | **9–11%** | parity |
+| `uvec4` loads (§26) | load instruction count | VMEM, 4–6% | 1.21× / 0.985× |
+| lane-per-row (§27) | the reduction | scalar — but broke coalescing | 0.47× |
+| **clustered reduction (§27)** | **the reduction** | **scalar, 44–49%** | **1.134×** |
+| clustered projections (§28) | same, wrong kernel | scalar | 0.957× |
+
+Five attempts aimed at 4–11% of the instruction stream and returned 0–3%. **The one
+that worked is the only one that touched the 44–49%.** That was not visible at the
+time and it was not luck that it worked — it was the only change in the whole series
+pointed at the dominant category, and it was chosen from a geometric argument that
+happened to be right for a reason nobody had measured.
+
+### What to do, and for once the target is not a guess
+
+`s_waitcnt` at 8–13% is the wave explicitly stalled on memory, and it is irreducible
+without changing access patterns. The rest of the scalar half is **address
+arithmetic**, and the inner loops are full of it: `a * pc.blocks * 64u + bu`,
+`a * pc.blocks * 16u + g16` and `a * pc.blocks + b` are recomputed for every
+(token, K-group) pair, where `a` changes only per token and `pc.blocks` is a push
+constant. Strength-reducing those to increments, and hoisting the per-token bases out
+of the K loop, attacks 30-odd percent of the instruction stream rather than 9.
+
+That is the next change, and unlike the five failures it is aimed at the measured
+majority of the work.
+
+### The standing caveats
+
+This is a **static** mix, not a dynamic profile: loops mean executed counts differ
+from instruction counts, and SALU co-issues with VALU on RDNA so 47% of instructions
+is not 47% of cycles. What makes it actionable anyway is that all five kernels agree,
+both compilers agree, and the ranking it implies has now correctly predicted the
+outcome of seven separate experiments after the fact.
