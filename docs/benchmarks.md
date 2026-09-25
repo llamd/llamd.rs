@@ -2824,3 +2824,87 @@ into a form a matrix kernel can stream, rather than re-unpacked inside every mat
 
 That is a change to the data layout, not to a kernel — and it is the one direction this
 document has never tried.
+
+---
+
+## 34. Does the per-layer dequantised buffer fit? Yes — and it is the wrong target
+
+§33 ended by naming a data-layout change as the one untried direction: dequantise Q6_K
+once per layer into a form a matrix kernel can stream, rather than re-unpacking it inside
+every matmul. The first question was whether it fits.
+
+### It fits, comfortably
+
+Measured, sampling `mem_info_vram_used` while a real prefill runs:
+
+| | |
+|---|---|
+| peak VRAM while prefilling | **25.52 GiB** |
+| device total | 31.86 GiB |
+| **headroom** | **6.34 GiB** |
+| one layer as s8 (604 M params) | 0.580 GiB |
+| double-buffered | 1.160 GiB |
+| layers that would fit at once | **10** |
+
+Capacity is not the obstacle. Two other things are.
+
+### It is traffic-negative, because s8 is bigger than Q6_K
+
+Q6_K is 6.5625 bits per weight; s8 is 8. So the dequantised form is **1.22× larger**, and
+every pass that reads it costs more than the pass it replaces. For one layer, with `P`
+chunk-passes over the expert weights:
+
+| | traffic per layer |
+|---|---|
+| now | `P` × 495 MB |
+| dequantised | 495 (read) + 604 (write) + `P` × 604 MB |
+
+The second is larger for every `P ≥ 1`. It never breaks even — the dequantise pass is pure
+added traffic and the reads that follow are each 22% more expensive. What it buys is the
+unpack ALU, which the ISA mix puts at roughly 9% of the inner loop. That is a bad trade,
+and no prompt length improves it.
+
+### And at the prompt lengths that would justify it, attention dominates anyway
+
+Prefill throughput **degrades** with prompt length here, and llama.cpp's does not:
+
+| prompt | llamd | llama.cpp Vulkan | ratio |
+|---|---|---|---|
+| 512 | 1582.4 | 2340 | 0.68× |
+| 1024 | 1291.5 | **3090.9** | **0.42×** |
+| 2048 | 951.6 | **2948.2** | **0.32×** |
+
+**The gap widens with length.** The cause is arithmetic: attention is O(T²) while the
+matmuls are O(T), and the attention kernel runs **7.3× slower per MAC** than the matmul
+kernels do on the same hardware. A two-term model — attention MACs at its measured
+753 G MAC/s, matmul MACs at their measured 5500 — predicts the measurements to within 2%:
+
+| prompt | attention | matmuls | attention share | predicted | measured |
+|---|---|---|---|---|---|
+| 512 | 68 ms | 253 ms | 21% | 321 | **324** |
+| 1024 | 274 | 506 | 35% | 780 | **793** |
+| 1536 | 616 | 759 | 45% | 1375 | **1400** |
+| 2048 | 1095 | 1012 | **52%** | 2107 | **2152** |
+
+So attention is 21% of a 512-token prefill and **52% of a 2048-token one**, and it is the
+only kernel in the engine still running at an eighth of what the others achieve.
+
+### Which makes attention the target for the third time
+
+§21 found attention at 61% of prefill and §22's rewrite took it to 18% — a 1.98× win, the
+largest in this document. It is back to being the bottleneck not because the rewrite
+failed but because its share **grows as T²** while everything else grows as T.
+
+The remaining inefficiency is structural, and unlike §33's local optimum it is not a
+resource trade. `attention.comp` still **materialises the score matrix** in a global
+scratch buffer and makes three passes over it: write the scores, exponentiate in place,
+then read them back for the weighted sum of V. Flash attention does the same arithmetic in
+one pass with an online softmax, never materialising the scores, which removes two global
+round-trips over an O(T²) array and lets the (query, key) space be tiled for reuse.
+
+That is the next change, it is the third time the evidence has pointed at this kernel, and
+it targets the workload that actually matters — long prompts — rather than the 512-token
+benchmark.
+
+**The dequantised-buffer idea is closed**: it fits, it is traffic-negative, and it aims at
+9% of the wrong kernel.

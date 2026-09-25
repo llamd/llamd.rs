@@ -829,3 +829,50 @@ fn expert_address_hoist() {
     ops::set_expert_addr(0);
     eprintln!("  best hoisted: {best:.1} tok/s   (llama.cpp Vulkan pp512 3213.6)");
 }
+
+/// How prefill scales past 512 tokens — the baseline any per-layer dequantisation
+/// scheme has to beat, because that scheme's cost is per LAYER and its benefit is per
+/// TILE, so it can only amortise over prompts long enough to need several tiles.
+#[test]
+#[ignore = "uploads 23 GiB and a large KV cache; needs a free GPU and the real model"]
+fn prefill_scaling_past_512() {
+    let Some(path) = oracle_model() else {
+        return;
+    };
+    if !llamd_vulkan::available() {
+        return;
+    }
+    let model = Model::open(&path).expect("open");
+    let mut vk = VulkanModel::load_with_slots(&model, 2100, llamd_vulkan::MAX_TILE, 8)
+        .expect("load with a 2100-token cache");
+    let vocab = llamd_tokenizer::Vocab::from_gguf(model.gguf()).expect("vocab");
+    let text = "Explain how a compiler turns source code into machine instructions, \
+                covering lexing, parsing, type checking, optimisation and code generation.";
+    let mut all = Vec::new();
+    while all.len() < 2048 {
+        all.extend_from_slice(&vocab.encode(text, false));
+    }
+    all.truncate(2048);
+    vk.prefill_tile = 512;
+
+    eprintln!(
+        "  {:>8}{:>8}{:>12}{:>12}",
+        "prompt", "tiles", "seconds", "tok/s"
+    );
+    for n in [512usize, 1024, 1536, 2048] {
+        let toks = &all[..n];
+        let _ = vk.prefill(toks, 0).expect("warm");
+        let mut best = f64::MAX;
+        for _ in 0..2 {
+            let t = std::time::Instant::now();
+            let _ = vk.prefill(toks, 0).expect("prefill");
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        eprintln!(
+            "  {n:>8}{:>8}{:>12}{:>12}",
+            n.div_ceil(512),
+            format!("{best:.3}"),
+            format!("{:.1}", n as f64 / best)
+        );
+    }
+}
