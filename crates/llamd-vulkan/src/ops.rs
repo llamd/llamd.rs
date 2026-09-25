@@ -62,6 +62,8 @@ pub enum Pipeline {
     Q6kExpertC16R2v = 39,
     Q6kExpertC16R4 = 40,
     Q6kExpertC16R4v = 41,
+    Q6kExpertC16R2a = 42,
+    Q6kExpertC16R2b = 43,
 }
 
 impl Pipeline {
@@ -110,10 +112,12 @@ impl Pipeline {
             Pipeline::Q6kExpertC16R2v => "q6k_expert_c16_r2v",
             Pipeline::Q6kExpertC16R4 => "q6k_expert_c16_r4",
             Pipeline::Q6kExpertC16R4v => "q6k_expert_c16_r4v",
+            Pipeline::Q6kExpertC16R2a => "q6k_expert_c16_r2a",
+            Pipeline::Q6kExpertC16R2b => "q6k_expert_c16_r2b",
         }
     }
 
-    pub const ALL: [Pipeline; 42] = [
+    pub const ALL: [Pipeline; 44] = [
         Pipeline::Q6kMatvec,
         Pipeline::Q6kX3,
         Pipeline::Q6kGemm,
@@ -156,6 +160,8 @@ impl Pipeline {
         Pipeline::Q6kExpertC16R2v,
         Pipeline::Q6kExpertC16R4,
         Pipeline::Q6kExpertC16R4v,
+        Pipeline::Q6kExpertC16R2a,
+        Pipeline::Q6kExpertC16R2b,
     ];
 }
 
@@ -649,6 +655,28 @@ pub fn set_expert_vec4(on: bool) {
 
 pub fn expert_vec4() -> bool {
     RT_VEC4.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static RT_ADDR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Hoist the expert kernel's address arithmetic out of the K loop.
+///
+/// §30 put scalar work at 44-49% of the instruction stream against 9-11% for the dot
+/// products. This lifts the per-token `pslot`/`ptoken` GLOBAL LOAD and the three
+/// `a * blocks * N` multiplies out of the inner loop — one fetch and one multiply per
+/// token per chunk instead of per token per K-group — and the per-row weight plane
+/// bases, which are loop-invariant in K.
+///
+/// It uses shared memory, so it needs a barrier, so every lane group in the workgroup
+/// must have rows: usable only when the row count divides what a workgroup covers.
+/// 0 off, 1 hoisted through shared memory (needs a barrier), 2 hoisted into registers
+/// (costs ACC_N uints of pressure, no barrier).
+pub fn set_expert_addr(mode: usize) {
+    RT_ADDR.store(mode, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn expert_addr() -> usize {
+    RT_ADDR.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 static RT_ROWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2);
@@ -1496,18 +1524,32 @@ pub fn expert_row_tiled(
     let cluster = expert_cluster();
     let (pipe, rows_per_wg) = if cluster == 16 {
         // The swept grid: ROWS x vec4, all at sixteen lanes per row group.
-        let pipe = match (rt_rows, expert_vec4()) {
-            (1, false) => Pipeline::Q6kExpertC16R1,
-            (1, true) => Pipeline::Q6kExpertC16R1v,
-            (4, false) => Pipeline::Q6kExpertC16R4,
-            (4, true) => Pipeline::Q6kExpertC16R4v,
-            (_, true) => Pipeline::Q6kExpertC16R2v,
-            (_, false) => Pipeline::Q6kExpertC16R2,
+        let per = rows_per_workgroup().max(1) * (subgroup_size() as usize / 16) * rt_rows;
+        // The hoisted variant shares memory and therefore barriers, so it is only
+        // correct when no lane group returns early for want of rows.
+        let hoist = if rt_rows == 2 && !expert_vec4() {
+            match expert_addr() {
+                // Shared memory means a barrier, so every lane group must have rows.
+                1 if rows % per == 0 => Some(Pipeline::Q6kExpertC16R2a),
+                2 => Some(Pipeline::Q6kExpertC16R2b),
+                _ => None,
+            }
+        } else {
+            None
         };
-        (
-            pipe,
-            rows_per_workgroup().max(1) * (subgroup_size() as usize / 16) * rt_rows,
-        )
+        let pipe = if let Some(p) = hoist {
+            p
+        } else {
+            match (rt_rows, expert_vec4()) {
+                (1, false) => Pipeline::Q6kExpertC16R1,
+                (1, true) => Pipeline::Q6kExpertC16R1v,
+                (4, false) => Pipeline::Q6kExpertC16R4,
+                (4, true) => Pipeline::Q6kExpertC16R4v,
+                (_, true) => Pipeline::Q6kExpertC16R2v,
+                (_, false) => Pipeline::Q6kExpertC16R2,
+            }
+        };
+        (pipe, per)
     } else if cluster == 8 || cluster == 32 {
         (
             if cluster == 8 {

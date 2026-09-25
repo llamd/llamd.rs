@@ -749,3 +749,81 @@ fn expert_rows_acc_vec4_sweep() {
         best.3
     );
 }
+
+/// Hoisting the address arithmetic out of the K loop — §30's measured target.
+#[test]
+#[ignore = "uploads 23 GiB to the device; needs a free GPU and the real model"]
+fn expert_address_hoist() {
+    let Some(path) = oracle_model() else {
+        return;
+    };
+    if !llamd_vulkan::available() {
+        return;
+    }
+    let model = Model::open(&path).expect("open");
+    let mut vk =
+        VulkanModel::load_with_slots(&model, 600, llamd_vulkan::MAX_TILE, 8).expect("load");
+    let vocab = llamd_tokenizer::Vocab::from_gguf(model.gguf()).expect("vocab");
+    let text = "Explain how a compiler turns source code into machine instructions, \
+                covering lexing, parsing, type checking, optimisation and code generation.";
+    let mut all = Vec::new();
+    while all.len() < 512 {
+        all.extend_from_slice(&vocab.encode(text, false));
+    }
+    all.truncate(512);
+
+    let mut wrong = 0;
+    let mut cases = 0;
+    for &tile in &[32usize, 128, 512] {
+        for &n in &[15usize, 17, 33, 300, 512] {
+            vk.prefill_tile = tile;
+            let toks = &all[..n];
+            ops::set_expert_addr(0);
+            let want = vk.prefill(toks, 0).expect("plain");
+            for m in [1usize, 2] {
+                ops::set_expert_addr(m);
+                let got = vk.prefill(toks, 0).expect("hoisted");
+                cases += 1;
+                if got != want {
+                    wrong += 1;
+                    eprintln!("  MISMATCH mode {m} tile {tile}, {n} tokens: {want} vs {got}");
+                }
+            }
+        }
+    }
+    ops::set_expert_addr(0);
+    eprintln!("  {} of {cases} cases agree", cases - wrong);
+    assert_eq!(wrong, 0, "the hoisted kernel disagrees");
+
+    let run = |vk: &mut VulkanModel, on: usize| -> f64 {
+        ops::set_expert_addr(on);
+        let _ = vk.prefill(&all, 0).expect("warm");
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let _ = vk.prefill(&all, 0).expect("prefill");
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        512.0 / best
+    };
+    eprintln!(
+        "  {:>6}{:>12}{:>12}{:>12}",
+        "tile", "plain", "shared+bar", "registers"
+    );
+    let mut best = 0.0f64;
+    for tile in [128usize, 256, 512] {
+        vk.prefill_tile = tile;
+        let a = run(&mut vk, 0);
+        let b = run(&mut vk, 1);
+        let c = run(&mut vk, 2);
+        best = best.max(a.max(b).max(c));
+        eprintln!(
+            "  {tile:>6}{:>12}{:>12}{:>12}",
+            format!("{a:.1}"),
+            format!("{b:.1} {:.3}x", b / a),
+            format!("{c:.1} {:.3}x", c / a)
+        );
+    }
+    ops::set_expert_addr(0);
+    eprintln!("  best hoisted: {best:.1} tok/s   (llama.cpp Vulkan pp512 3213.6)");
+}

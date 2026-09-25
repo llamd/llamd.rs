@@ -2619,3 +2619,78 @@ from instruction counts, and SALU co-issues with VALU on RDNA so 47% of instruct
 is not 47% of cycles. What makes it actionable anyway is that all five kernels agree,
 both compilers agree, and the ranking it implies has now correctly predicted the
 outcome of seven separate experiments after the fact.
+
+---
+
+## 31. The address-arithmetic pass: neutral, and it kills the scalar theory
+
+§30 measured scalar work at 44–49% of the instruction stream against 9–11% for the
+packed dot products, and flagged its own caveat: *"SALU co-issues with VALU on RDNA,
+so 47% of instructions is not 47% of cycles."* This tests it.
+
+### What was hoisted
+
+Two things the inner loop recomputed for every (K-group, token) pair:
+
+1. **`pslot[p]` / `ptoken[p]` — a global load**, re-fetched per K-group though it
+   depends only on the token.
+2. **`a * blocks * 64`, `a * blocks * 16`, `a * blocks`** — three multiplies where one
+   suffices; the others are shifts of it.
+
+Plus the per-row weight plane bases `(expert*rows + row) * blocks` and its three plane
+offsets, which are **loop-invariant in K** and were being recomputed every iteration.
+
+Two variants, because where the hoisted value lives is the whole question: shared
+memory (needs a barrier) or registers (costs `ACC_N` uints of pressure).
+
+### Static: it worked. Dynamic: it did nothing.
+
+| | instructions | scalar share |
+|---|---|---|
+| plain | 2523 | 47% |
+| hoisted | 2380 | **43%** |
+
+| prefill tile | plain | shared + barrier | registers |
+|---|---|---|---|
+| 128 | 1402.9 | 1378.2 (0.982×) | 1396.6 (0.995×) |
+| 256 | 1507.9 | 1479.3 (0.981×) | 1514.0 (1.004×) |
+| 512 | 1556.7 | 1532.3 (0.984×) | 1567.4 (1.007×) |
+
+30 of 30 cases emit the same token. **5.7% fewer instructions and four points off the
+scalar share produced no measurable change.** The shared-memory variant is
+consistently 2% *slower*: two barriers per chunk cost more than the arithmetic saved,
+and the `pslot` load it removed was an L0 cache hit, not a memory trip.
+
+### What this settles
+
+**The scalar half is largely free.** SALU issues on a separate pipe from VALU and
+overlaps with it, so a kernel can be 47% scalar instructions and lose nothing to them.
+§30's instruction mix correctly *ranked* the categories and could not *price* them —
+which is the same failure mode as §27's ablation, one level down: a count is not a
+cost.
+
+So the bottleneck is none of the things that have been measured and attacked:
+
+| candidate | evidence it is not the bottleneck |
+|---|---|
+| weight traffic | removing it entirely saves 3% (§26) |
+| the dot products | 12× denser arithmetic gave parity (§25) |
+| occupancy / spills | 5–7 waves per SIMD, zero scratch (§23, §26) |
+| scalar work | 5.7% fewer instructions gave 0% (this section) |
+| load instruction count | `uvec4` helped only where registers allowed (§26, §29) |
+
+**One candidate survives every test: the activation reads.** Removing them is the only
+ablation arm that ever moved the number — 28–40% — and `s_waitcnt`, the wave explicitly
+stalled on memory, is 8–13% of the stream. They are read once per (row-group, token,
+K-group), and the only successful reduction has been sharing them across rows, which
+§29 showed saturates at ROWS 2 for register reasons.
+
+The untried mechanism is staging the activation tile in **LDS** once per workgroup so
+that all sixteen row groups read it from there instead of from global — 32 KiB for a
+16-token chunk at K = 2048, which fits, at the cost of occupancy and barriers that this
+section just measured at 2%. That is the next experiment, and on this document's record
+it is a hypothesis, not a plan.
+
+Both variants stay in the tree, defaulted off. The register one is 1.004×/1.007× at the
+tiles that matter, which is inside the noise this card produces, and a change that
+cannot be distinguished from noise does not belong on the hot path.

@@ -72,6 +72,40 @@ layout(constant_id = 0) const int ACC_N = 16;
 #ifndef CLUSTER
 #define CLUSTER 0
 #endif
+
+// ADDRHOIST — the address arithmetic, lifted out of the K loop.
+//
+// §30 disassembled what actually runs: scalar work (address arithmetic, loop control,
+// branches and waits) is 44-49% of every kernel here, against 9-11% for the packed dot
+// products this engine exists to perform. Five optimisations aimed at the 4-11% and
+// returned 0-3%; the one that worked touched the scalar half.
+//
+// Two things in the inner loop are recomputed for every (K-group, token) pair when
+// neither has to be:
+//
+//   1. `pslot[p]` / `ptoken[p]` is a GLOBAL LOAD, re-fetched per K-group even though
+//      it depends only on the token. Hoisted into shared memory, one entry per token
+//      per chunk — 64 bytes, filled once, read as a broadcast.
+//   2. `a * pc.blocks * 64`, `a * pc.blocks * 16` and `a * pc.blocks` are three
+//      multiplies per (K-group, token). Only `a * pc.blocks` is needed; the rest are
+//      shifts of it. Hoisting that product leaves two shifts and an add.
+//
+// And the per-row weight plane bases — `(expert*rows + row) * blocks` and its three
+// plane offsets — are loop-INVARIANT in K and were being recomputed every iteration.
+//
+// Shared memory means a barrier, so the row count must divide the workgroup's rows
+// exactly: a lane group that returned early would desert it. The host checks.
+// ADDRHOIST puts the per-token base in SHARED memory, which needs a barrier.
+// ADDRHOIST_REG puts it in REGISTERS, which does not — at ACC_N uints of pressure.
+// Which is better is not derivable: the shared version measured 0.981x because two
+// barriers per chunk cost more than the arithmetic saved, and because the `pslot`
+// load it removed was a cache hit, not a memory trip.
+#if defined(ADDRHOIST) || defined(ADDRHOIST_REG)
+#define HOIST_ROWBASE 1
+#endif
+#ifdef ADDRHOIST
+shared uint s_abase[64];
+#endif
 #if CLUSTER > 0
 #define CL_LANES uint(CLUSTER)
 #else
@@ -100,8 +134,39 @@ void main() {
 
     uint n_u4 = pc.blocks * 8u;
 
+#ifdef HOIST_ROWBASE
+    // Loop-invariant in K: computed once per row, not once per row per K-group.
+    uint h_ri[ROWS], h_qlr[ROWS], h_qhr[ROWS], h_scr[ROWS];
+    for (int r = 0; r < ROWS; ++r) {
+        uint ri = (expert * pc.rows + rbase + uint(r)) * pc.blocks;
+        h_ri[r] = ri;
+        h_qlr[r] = pc.ql_u + ri * 32u;
+        h_qhr[r] = pc.qh_u + ri * 16u;
+        h_scr[r] = pc.sc_u + ri * 4u;
+    }
+#endif
+
     for (int base = 0; base < count; base += ACC_N) {
         int live = min(ACC_N, count - base);
+#ifdef ADDRHOIST
+        // One global fetch and one multiply per token per CHUNK, where the inner loop
+        // was doing both per token per K-group.
+        for (int i = int(gl_LocalInvocationID.x); i < live; i += 256) {
+            int pr = start + base + i;
+            uint a = pc.by_slot != 0u ? uint(pslot[pr]) : uint(ptoken[pr]);
+            s_abase[i] = a * pc.blocks;
+        }
+        barrier();
+#endif
+#ifdef ADDRHOIST_REG
+        // The same hoist with no barrier: ACC_N uints of register pressure instead.
+        uint r_abase[ACC_N];
+        for (int i = 0; i < ACC_N; ++i) {
+            int pr = start + base + min(i, live - 1);
+            uint a = pc.by_slot != 0u ? uint(pslot[pr]) : uint(ptoken[pr]);
+            r_abase[i] = a * pc.blocks;
+        }
+#endif
 
         float acc[ROWS][ACC_N];
         for (int r = 0; r < ROWS; ++r) {
@@ -125,10 +190,14 @@ void main() {
             float dw[ROWS];
 
             for (int r = 0; r < ROWS; ++r) {
+#ifdef HOIST_ROWBASE
+                uint ri = h_ri[r], qlr = h_qlr[r], qhr = h_qhr[r], scr = h_scr[r];
+#else
                 uint ri = (expert * pc.rows + rbase + uint(r)) * pc.blocks;
                 uint qlr = pc.ql_u + ri * 32u;
                 uint qhr = pc.qh_u + ri * 16u;
                 uint scr = pc.sc_u + ri * 4u;
+#endif
 
                 uint hb = qhr + b * 16u + h * 8u + ((m0 & 31u) >> 2u);
 #ifdef VEC4LOAD
@@ -173,10 +242,24 @@ void main() {
             // THE REUSE. One activation load per token, ROWS rows of dots.
             for (int i = 0; i < ACC_N; ++i) {
                 if (i >= live) break;
+#if defined(ADDRHOIST) || defined(ADDRHOIST_REG)
+#ifdef ADDRHOIST
+                uint abase = s_abase[i];
+#else
+                uint abase = r_abase[i];
+#endif
+                uint ab = (abase << 6u) + bu;
+                uint ah = ab + 16u;
+                uint sbase = (abase << 4u) + g16;
+                uint adi = abase + b;
+#else
                 int p = start + base + i;
                 uint a = by_slot ? uint(pslot[p]) : uint(ptoken[p]);
                 uint ab = a * pc.blocks * 64u + bu;
                 uint ah = ab + 16u;
+                uint sbase = a * pc.blocks * 16u + g16;
+                uint adi = a * pc.blocks + b;
+#endif
 
 #ifdef VEC4LOAD
                 uvec4 av = qb[ab >> 2u];
@@ -189,9 +272,9 @@ void main() {
                 uint a4 = qb[ah + 0u], a5 = qb[ah + 1u];
                 uint a6 = qb[ah + 2u], a7 = qb[ah + 3u];
 #endif
-                int sbl = sb[a * pc.blocks * 16u + g16];
-                int sbh = sb[a * pc.blocks * 16u + g16 + 4u];
-                float as = ad[a * pc.blocks + b];
+                int sbl = sb[sbase];
+                int sbh = sb[sbase + 4u];
+                float as = ad[adi];
 
                 for (int r = 0; r < ROWS; ++r) {
                     uint wl = dotPacked4x8AccSatEXT(l0[r], a0, 0u);
@@ -209,6 +292,9 @@ void main() {
             }
         }
 
+#ifdef ADDRHOIST
+        barrier();
+#endif
         for (int r = 0; r < ROWS; ++r) {
             if (uint(r) >= live_rows) break;
             for (int i = 0; i < ACC_N; ++i) {
