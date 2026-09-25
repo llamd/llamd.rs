@@ -662,3 +662,90 @@ fn clustered_reduction_projections() {
         d_on / d_off
     );
 }
+
+/// ROWS x ACC x vec4, re-swept together.
+///
+/// §23 chose ROWS 2 / ACC 16 before §26's vectorisation and §27's clustering existed,
+/// and all three trade through the same register file. §26 tested vec4 only at that
+/// one point and found it 1.5% slower, which says nothing about the other points.
+#[test]
+#[ignore = "uploads 23 GiB to the device; needs a free GPU and the real model"]
+fn expert_rows_acc_vec4_sweep() {
+    let Some(path) = oracle_model() else {
+        return;
+    };
+    if !llamd_vulkan::available() {
+        return;
+    }
+    let model = Model::open(&path).expect("open");
+    let mut vk =
+        VulkanModel::load_with_slots(&model, 600, llamd_vulkan::MAX_TILE, 8).expect("load");
+    let vocab = llamd_tokenizer::Vocab::from_gguf(model.gguf()).expect("vocab");
+    let text = "Explain how a compiler turns source code into machine instructions, \
+                covering lexing, parsing, type checking, optimisation and code generation.";
+    let mut prompt = Vec::new();
+    while prompt.len() < 512 {
+        prompt.extend_from_slice(&vocab.encode(text, false));
+    }
+    prompt.truncate(512);
+    vk.prefill_tile = 512;
+
+    // Every arm must emit this.
+    ops::set_expert_cluster(16);
+    ops::set_expert_vec4(false);
+    ops::set_expert_tile(2, 16);
+    let want = vk.prefill(&prompt, 0).expect("reference");
+
+    eprintln!("  512-token prompt, tile 512, cluster 16. accumulators = ROWS * ACC.");
+    eprintln!(
+        "  {:>5}{:>5}{:>6}{:>12}{:>12}{:>9}",
+        "ROWS", "ACC", "regs", "scalar", "vec4", "vec4 win"
+    );
+    let mut best = (0usize, 0usize, false, 0.0f64);
+    for &(rows, acc) in &[
+        (1usize, 16usize),
+        (1, 32),
+        (2, 8),
+        (2, 16),
+        (2, 32),
+        (4, 8),
+        (4, 16),
+    ] {
+        let mut t = [0.0f64; 2];
+        for (vi, &v) in [false, true].iter().enumerate() {
+            ops::set_expert_vec4(v);
+            ops::set_expert_tile(rows, acc);
+            let got = vk.prefill(&prompt, 0).expect("prefill");
+            assert_eq!(
+                got, want,
+                "ROWS {rows} ACC {acc} vec4 {v} changed the token"
+            );
+            let mut bestrun = f64::MAX;
+            for _ in 0..2 {
+                let s = std::time::Instant::now();
+                let _ = vk.prefill(&prompt, 0).expect("prefill");
+                bestrun = bestrun.min(s.elapsed().as_secs_f64());
+            }
+            t[vi] = 512.0 / bestrun;
+            if t[vi] > best.3 {
+                best = (rows, acc, v, t[vi]);
+            }
+        }
+        eprintln!(
+            "  {rows:>5}{acc:>5}{:>6}{:>12}{:>12}{:>9}",
+            rows * acc,
+            format!("{:.1}", t[0]),
+            format!("{:.1}", t[1]),
+            format!("{:.3}x", t[1] / t[0])
+        );
+    }
+    ops::set_expert_tile(best.0, best.1);
+    ops::set_expert_vec4(best.2);
+    eprintln!(
+        "  best: ROWS {} ACC {} {} at {:.1} tok/s",
+        best.0,
+        best.1,
+        if best.2 { "vec4" } else { "scalar" },
+        best.3
+    );
+}

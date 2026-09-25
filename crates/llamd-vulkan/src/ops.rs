@@ -56,6 +56,12 @@ pub enum Pipeline {
     Q6kExpertRt2c32 = 33,
     Q6kMatvecC = 34,
     Q6kX3C = 35,
+    Q6kExpertC16R1 = 36,
+    Q6kExpertC16R1v = 37,
+    Q6kExpertC16R2 = 38,
+    Q6kExpertC16R2v = 39,
+    Q6kExpertC16R4 = 40,
+    Q6kExpertC16R4v = 41,
 }
 
 impl Pipeline {
@@ -98,10 +104,16 @@ impl Pipeline {
             Pipeline::Q6kExpertRt2c32 => "q6k_expert_rt2c32",
             Pipeline::Q6kMatvecC => "q6k_matvec_c",
             Pipeline::Q6kX3C => "q6k_x3_c",
+            Pipeline::Q6kExpertC16R1 => "q6k_expert_c16_r1",
+            Pipeline::Q6kExpertC16R1v => "q6k_expert_c16_r1v",
+            Pipeline::Q6kExpertC16R2 => "q6k_expert_c16_r2",
+            Pipeline::Q6kExpertC16R2v => "q6k_expert_c16_r2v",
+            Pipeline::Q6kExpertC16R4 => "q6k_expert_c16_r4",
+            Pipeline::Q6kExpertC16R4v => "q6k_expert_c16_r4v",
         }
     }
 
-    pub const ALL: [Pipeline; 36] = [
+    pub const ALL: [Pipeline; 42] = [
         Pipeline::Q6kMatvec,
         Pipeline::Q6kX3,
         Pipeline::Q6kGemm,
@@ -138,6 +150,12 @@ impl Pipeline {
         Pipeline::Q6kExpertRt2c32,
         Pipeline::Q6kMatvecC,
         Pipeline::Q6kX3C,
+        Pipeline::Q6kExpertC16R1,
+        Pipeline::Q6kExpertC16R1v,
+        Pipeline::Q6kExpertC16R2,
+        Pipeline::Q6kExpertC16R2v,
+        Pipeline::Q6kExpertC16R4,
+        Pipeline::Q6kExpertC16R4v,
     ];
 }
 
@@ -616,6 +634,21 @@ pub fn set_expert_cluster(lanes: usize) {
 
 pub fn expert_cluster() -> usize {
     RT_CLUSTER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Read the expert kernel's two hot buffers as `uvec4`.
+///
+/// Separate from the projections' switch because the same change has opposite signs
+/// on the two kernels (§28), and it trades through the same register file as ROWS and
+/// ACC — so it is swept with them rather than decided once.
+static RT_VEC4: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_expert_vec4(on: bool) {
+    RT_VEC4.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn expert_vec4() -> bool {
+    RT_VEC4.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 static RT_ROWS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2);
@@ -1461,13 +1494,26 @@ pub fn expert_row_tiled(
         };
     }
     let cluster = expert_cluster();
-    let (pipe, rows_per_wg) = if cluster == 8 || cluster == 16 || cluster == 32 {
-        // Each subgroup holds subgroup_size/cluster row groups of rt_rows rows.
+    let (pipe, rows_per_wg) = if cluster == 16 {
+        // The swept grid: ROWS x vec4, all at sixteen lanes per row group.
+        let pipe = match (rt_rows, expert_vec4()) {
+            (1, false) => Pipeline::Q6kExpertC16R1,
+            (1, true) => Pipeline::Q6kExpertC16R1v,
+            (4, false) => Pipeline::Q6kExpertC16R4,
+            (4, true) => Pipeline::Q6kExpertC16R4v,
+            (_, true) => Pipeline::Q6kExpertC16R2v,
+            (_, false) => Pipeline::Q6kExpertC16R2,
+        };
         (
-            match cluster {
-                8 => Pipeline::Q6kExpertRt2c8,
-                32 => Pipeline::Q6kExpertRt2c32,
-                _ => Pipeline::Q6kExpertRt2c,
+            pipe,
+            rows_per_workgroup().max(1) * (subgroup_size() as usize / 16) * rt_rows,
+        )
+    } else if cluster == 8 || cluster == 32 {
+        (
+            if cluster == 8 {
+                Pipeline::Q6kExpertRt2c8
+            } else {
+                Pipeline::Q6kExpertRt2c32
             },
             rows_per_workgroup().max(1) * (subgroup_size() as usize / cluster) * rt_rows,
         )

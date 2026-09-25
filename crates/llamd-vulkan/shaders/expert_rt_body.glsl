@@ -6,8 +6,23 @@
 
 layout(local_size_x = 256) in;
 
+// VEC4LOAD picks how the two hot buffers are read. Every index this kernel forms for
+// a run of four uints is 4-aligned, so a uvec4 view is exact — one 16-byte load
+// instead of four. It was measured 1.21x on the attention projections (§26) and 1.5%
+// SLOWER here at the then-current ROWS 2 / ACC 16, because uvec4 temporaries widen a
+// kernel §23 had already tuned to the register file. But §23's sweep predates both
+// the vectorisation and §27's clustering, and all three trade through the same
+// registers — so the optimum is re-measured over all three together rather than
+// assumed to have stayed put.
+#ifdef VEC4LOAD
+layout(std430, binding = 0) readonly buffer W   { uvec4 w[];      };
+layout(std430, binding = 1) readonly buffer QB  { uvec4 qb[];     };
+#define WS(i) (w[(i) >> 2u][(i) & 3u])
+#else
 layout(std430, binding = 0) readonly buffer W   { uint  w[];      };
 layout(std430, binding = 1) readonly buffer QB  { uint  qb[];     };
+#define WS(i) (w[i])
+#endif
 layout(std430, binding = 2) readonly buffer SB  { int   sb[];     };
 layout(std430, binding = 3) readonly buffer AD  { float ad[];     };
 layout(std430, binding = 4) buffer          O   { float outv[];   };
@@ -115,10 +130,17 @@ void main() {
                 uint qhr = pc.qh_u + ri * 16u;
                 uint scr = pc.sc_u + ri * 4u;
 
+                uint hb = qhr + b * 16u + h * 8u + ((m0 & 31u) >> 2u);
+#ifdef VEC4LOAD
+                uvec4 qv = w[(qlr + u * 4u) >> 2u];
+                uint q0 = qv.x, q1 = qv.y, q2 = qv.z, q3 = qv.w;
+                uvec4 hv = w[hb >> 2u];
+                uint h0 = hv.x, h1 = hv.y, h2 = hv.z, h3 = hv.w;
+#else
                 uint q0 = w[qlr + u * 4u + 0u], q1 = w[qlr + u * 4u + 1u];
                 uint q2 = w[qlr + u * 4u + 2u], q3 = w[qlr + u * 4u + 3u];
-                uint hb = qhr + b * 16u + h * 8u + ((m0 & 31u) >> 2u);
                 uint h0 = w[hb + 0u], h1 = w[hb + 1u], h2 = w[hb + 2u], h3 = w[hb + 3u];
+#endif
 
                 l0[r] = (q0 & 0x0F0F0F0Fu) | (((h0 >> shl) & 0x03030303u) << 4u);
                 l1[r] = (q1 & 0x0F0F0F0Fu) | (((h1 >> shl) & 0x03030303u) << 4u);
@@ -142,9 +164,9 @@ void main() {
                 cl[r] = -128 * int(swl) + 32 * 128 * 16;
                 ch[r] = -128 * int(swh) + 32 * 128 * 16;
 
-                scl[r] = bitfieldExtract(int(w[scr + (si >> 2u)]), int(8u * (si & 3u)), 8);
-                sch[r] = bitfieldExtract(int(w[scr + (sj >> 2u)]), int(8u * (sj & 3u)), 8);
-                vec2 dp = unpackHalf2x16(w[pc.d_u + ((ri + b) >> 1u)]);
+                scl[r] = bitfieldExtract(int(WS(scr + (si >> 2u))), int(8u * (si & 3u)), 8);
+                sch[r] = bitfieldExtract(int(WS(scr + (sj >> 2u))), int(8u * (sj & 3u)), 8);
+                vec2 dp = unpackHalf2x16(WS(pc.d_u + ((ri + b) >> 1u)));
                 dw[r] = (((ri + b) & 1u) == 0u) ? dp.x : dp.y;
             }
 
@@ -156,10 +178,17 @@ void main() {
                 uint ab = a * pc.blocks * 64u + bu;
                 uint ah = ab + 16u;
 
+#ifdef VEC4LOAD
+                uvec4 av = qb[ab >> 2u];
+                uvec4 bv = qb[ah >> 2u];
+                uint a0 = av.x, a1 = av.y, a2 = av.z, a3 = av.w;
+                uint a4 = bv.x, a5 = bv.y, a6 = bv.z, a7 = bv.w;
+#else
                 uint a0 = qb[ab + 0u], a1 = qb[ab + 1u];
                 uint a2 = qb[ab + 2u], a3 = qb[ab + 3u];
                 uint a4 = qb[ah + 0u], a5 = qb[ah + 1u];
                 uint a6 = qb[ah + 2u], a7 = qb[ah + 3u];
+#endif
                 int sbl = sb[a * pc.blocks * 16u + g16];
                 int sbh = sb[a * pc.blocks * 16u + g16 + 4u];
                 float as = ad[a * pc.blocks + b];

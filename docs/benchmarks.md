@@ -2485,3 +2485,48 @@ what distinguishes them is register pressure, how much the activation is reused,
 how much coalescing there is to lose, none of which a count of instructions exposes.
 **The only reliable method found in 28 sections is to measure each kernel separately,
 in the engine, with both arms alternating in one process.**
+
+---
+
+## 29. Re-sweeping ROWS × ACC × vec4: the default was already right
+
+§23 chose ROWS 2 / ACC 16 for the expert kernel before §26's vectorisation and §27's
+clustering existed, and all three trade through the same register file. §26 tested
+`uvec4` at that single point, found it 1.5% slower, and drew a conclusion from one
+sample. This re-measures the whole grid, with every arm asserted to emit the same
+token.
+
+| ROWS | ACC | accumulators | scalar | vec4 | vec4 |
+|---|---|---|---|---|---|
+| 1 | 16 | 16 | 1281.3 | 1273.1 | 0.994× |
+| 1 | 32 | 32 | 1271.8 | 1274.0 | 1.002× |
+| 2 | 8 | 16 | 1479.2 | 1428.0 | 0.965× |
+| **2** | **16** | **32** | **1559.8** | 1516.9 | 0.973× |
+| 2 | 32 | 64 | 1530.6 | 1509.3 | 0.986× |
+| 4 | 8 | 32 | 1456.7 | 1422.4 | 0.976× |
+| 4 | 16 | 64 | 1541.7 | 1515.7 | 0.983× |
+
+**No change. ROWS 2 / ACC 16 / scalar remains the optimum**, and the sweep is worth
+more than the null result suggests because of three things it settles:
+
+**`uvec4` loses everywhere in this kernel, not just at one point.** 0.965× to 1.002×
+across all seven. §26's single sample was representative after all — but that was
+luck, and the grid is what shows it.
+
+**And the loss correlates with ROWS, not with the accumulator count.** At ROWS 1 it is
+neutral (0.994×, 1.002×); at ROWS 2 and 4 it costs 2–3.5%. That is a mechanism, not a
+coincidence: with ROWS > 1 the `uvec4` temporaries stay live across the inner row
+loop, so they add ~16 VGPRs of pressure where the scalar version can retire each word
+as it is consumed. The projections have one row per lane group, which is exactly why
+the same change wins 1.21× there (§28).
+
+**Activation reuse across rows dominates everything else.** ROWS 1 is 1271–1281
+against 1559.8 at ROWS 2 — a **22% penalty** for giving up the sharing. That is
+consistent with the ablation putting activation reads at 28–40% (§26) and it is why
+`q6k_expert_lane`, which went to one row per lane, could never have won.
+
+**32 accumulators is still the cliff edge**, now confirmed under clustering: 2×16 (32)
+beats both 2×8 (16) and 2×32 (64).
+
+The three knobs are now measured together rather than separately, which is what §28
+concluded was the only reliable method. The defaults stand where they were.
