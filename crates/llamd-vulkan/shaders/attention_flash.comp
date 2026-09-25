@@ -1,0 +1,166 @@
+#version 450
+//
+// Attention in ONE pass over the keys, with an online softmax.
+//
+// WHY, for the third time. §21 found attention at 61% of prefill; §22's rewrite took it
+// to 18% and was the largest win in this engine. §34 shows it back on top — 21% of a
+// 512-token prefill but 52% of a 2048-token one — not because the rewrite failed but
+// because its share grows as T^2 while everything else grows as T. And it still runs at
+// 753 G MAC/s against the matmul kernels' 5500 on the same silicon: 7.3x off.
+//
+// TWO STRUCTURAL PROBLEMS, both addressed here.
+//
+// 1. THREE PASSES OVER AN O(T^2) ARRAY. attention.comp writes every score to a global
+//    scratch buffer, walks it again to exponentiate in place, and walks it a third time
+//    for the weighted sum of V. This keeps a running max and sum instead — the standard
+//    online softmax — so the scores never leave the workgroup and the buffer is not
+//    needed at all.
+//
+// 2. THE QK READS ARE UNCOALESCED, and that is the larger of the two. Mapping one thread
+//    to one KEY means threads are kv_stride apart, so a single load instruction touches
+//    256 different cache lines and fetches 16 KiB to use 4 KiB. Here four threads share a
+//    key and split the head dimension, so each group reads 512 CONTIGUOUS bytes, and the
+//    per-key dot is closed with subgroupClusteredAdd over those four lanes — which is
+//    §27's finding (a cheap clustered reduction beats a wide one) applied to attention.
+//
+// Keys are processed 64 at a time: 4 subgroups x 16 keys x 4 lanes. LDS is ~5 KiB, which
+// matters because §33 established that LDS and registers are the same occupancy currency
+// and this kernel cannot afford to spend either.
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_clustered : require
+
+layout(local_size_x = 256) in;
+
+// vec4 views, as in attention.comp: head_dim is a multiple of 4 and the host refuses a
+// model where it is not, so every base divides exactly.
+layout(std430, binding = 0) readonly  buffer Q  { vec4  q4[];     };
+layout(std430, binding = 1) readonly  buffer KC { vec4  kc4[];    };
+layout(std430, binding = 2) readonly  buffer VC { vec4  vc4[];    };
+layout(std430, binding = 3) writeonly buffer O  { vec4  o4[];     };
+layout(std430, binding = 4) buffer            SC { float scores[]; };  // unused; kept for
+layout(std430, binding = 5) readonly  buffer M  { int   meta[];   };   // one descriptor set
+layout(push_constant) uniform P {
+    uint n_head; uint n_head_kv; uint hd; uint max_kv;
+    uint nseq; uint ratio; uint kv_stride;
+} pc;
+
+// BK is also the subgroup width, because the softmax reduction is one subgroup over one
+// block. The host refuses this kernel where the subgroup is not 64 and falls back to the
+// three-pass one, rather than quietly reducing over the wrong lanes.
+#define BK   64          // keys per iteration
+#define KPSG 16          // keys per subgroup: BK / 4 subgroups
+#define LPK  4           // lanes per key: 64 / KPSG
+
+shared vec4  sq[128];    // the query, staged once
+shared float s_p[BK];    // this block's scores, then its probabilities
+shared vec4  s_acc[256]; // each thread's own output partial
+shared float s_ml[4];    // 0: running max, 1: running sum, 2: this block's rescale
+
+void main() {
+    uint s = gl_WorkGroupID.x / pc.n_head;
+    uint h = gl_WorkGroupID.x - s * pc.n_head;
+    if (s >= pc.nseq) return;
+    uint n_kv = uint(meta[2 * int(s) + 1]) + 1u;
+    uint kvh = h / pc.ratio;
+    uint kv_dim = pc.n_head_kv * pc.hd;
+    float scale = inversesqrt(float(pc.hd));
+
+    uint t = gl_LocalInvocationID.x;
+    uint sg = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint hd4 = pc.hd >> 2u;
+    uint qb4 = ((s * pc.n_head + h) * pc.hd) >> 2u;
+    uint kbase = s * pc.kv_stride;
+
+    for (uint i = t; i < hd4; i += 256u) sq[i] = q4[qb4 + i];
+    s_acc[t] = vec4(0.0);
+    if (t == 0u) { s_ml[0] = -1.0 / 0.0; s_ml[1] = 0.0; s_ml[2] = 1.0; }
+    barrier();
+
+    // Which key this lane helps with, and which slice of the head dimension it takes.
+    uint k_local = sg * uint(KPSG) + lane / uint(LPK);   // 0..BK-1
+    uint dpart = lane % uint(LPK);                       // 0..LPK-1
+    uint dlo = dpart * (hd4 / uint(LPK));
+    uint dhi = dlo + hd4 / uint(LPK);
+    // And which output element it owns for the weighted sum of V.
+    uint parts = max(1u, 256u / hd4);
+    uint dslot = t % hd4;
+    uint part = t / hd4;
+
+    for (uint kb = 0u; kb < n_kv; kb += uint(BK)) {
+        uint j = kb + k_local;
+
+        // ---- scores: LPK lanes per key, each reading CONTIGUOUS vec4 ----
+        vec4 a0 = vec4(0.0), a1 = vec4(0.0);
+        if (j < n_kv) {
+            uint ko4 = (kbase + j * kv_dim + kvh * pc.hd) >> 2u;
+            uint i = dlo;
+            for (; i + 2u <= dhi; i += 2u) {
+                a0 += sq[i] * kc4[ko4 + i];
+                a1 += sq[i + 1u] * kc4[ko4 + i + 1u];
+            }
+            for (; i < dhi; ++i) a0 += sq[i] * kc4[ko4 + i];
+        }
+        vec4 v = a0 + a1;
+        float part_dot = v.x + v.y + v.z + v.w;
+        float dot = subgroupClusteredAdd(part_dot, LPK);
+        if (lane % uint(LPK) == 0u) {
+            s_p[k_local] = (j < n_kv) ? dot * scale : -1.0 / 0.0;
+        }
+        barrier();
+
+        // ---- the online softmax update, one subgroup over the whole 64-key block ----
+        //
+        // This is the whole point of the rewrite: a running max and a running sum, so the
+        // scores are consumed here and never written anywhere. The accumulated output has
+        // to be rescaled whenever the max moves, which is why alpha is published.
+        if (sg == 0u) {
+            float sv = s_p[lane];
+            float bm = subgroupMax(sv);
+            float m_old = s_ml[0];
+            float m_new = max(m_old, bm);
+            // exp(-inf - m_new) is 0, which is exactly right on the first block: the
+            // accumulator is still zero, so scaling it by zero changes nothing.
+            float alpha = exp(m_old - m_new);
+            float p = (sv > -1.0 / 0.0) ? exp(sv - m_new) : 0.0;
+            float bl = subgroupAdd(p);
+            s_p[lane] = p;
+            if (lane == 0u) {
+                s_ml[0] = m_new;
+                s_ml[1] = s_ml[1] * alpha + bl;
+                s_ml[2] = alpha;
+            }
+        }
+        barrier();
+
+        // Every thread rescales its OWN accumulator, so no barrier is needed between this
+        // and the accumulation below.
+        s_acc[t] *= s_ml[2];
+
+        // ---- the weighted sum of V: every thread its own output vec4 ----
+        // Coalesced: for a fixed key, threads of one part have consecutive dslot and
+        // therefore consecutive vec4.
+        if (part < parts) {
+            uint per = uint(BK) / parts;
+            for (uint kk = part * per; kk < (part + 1u) * per; ++kk) {
+                uint jj = kb + kk;
+                if (jj >= n_kv) break;
+                float p = s_p[kk];
+                if (p == 0.0) continue;
+                uint vo4 = (kbase + jj * kv_dim + kvh * pc.hd) >> 2u;
+                s_acc[t] += p * vc4[vo4 + dslot];
+            }
+        }
+        barrier();
+    }
+
+    // ---- combine the partials and divide by the running sum ----
+    if (t < hd4) {
+        vec4 sum = vec4(0.0);
+        for (uint p = 0u; p < parts; ++p) sum += s_acc[p * hd4 + t];
+        o4[qb4 + t] = sum / s_ml[1];
+    }
+}

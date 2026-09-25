@@ -56,15 +56,16 @@ pub enum Pipeline {
     Q6kExpertRt2c32 = 33,
     Q6kMatvecC = 34,
     Q6kX3C = 35,
-    Q6kExpertC16R1 = 36,
-    Q6kExpertC16R1v = 37,
-    Q6kExpertC16R2 = 38,
-    Q6kExpertC16R2v = 39,
-    Q6kExpertC16R4 = 40,
-    Q6kExpertC16R4v = 41,
-    Q6kExpertC16R2a = 42,
-    Q6kExpertC16R2b = 43,
-    Q6kExpertC16R2p = 44,
+    AttentionFlash = 36,
+    Q6kExpertC16R1 = 37,
+    Q6kExpertC16R1v = 38,
+    Q6kExpertC16R2 = 39,
+    Q6kExpertC16R2v = 40,
+    Q6kExpertC16R4 = 41,
+    Q6kExpertC16R4v = 42,
+    Q6kExpertC16R2a = 43,
+    Q6kExpertC16R2b = 44,
+    Q6kExpertC16R2p = 45,
 }
 
 impl Pipeline {
@@ -107,6 +108,7 @@ impl Pipeline {
             Pipeline::Q6kExpertRt2c32 => "q6k_expert_rt2c32",
             Pipeline::Q6kMatvecC => "q6k_matvec_c",
             Pipeline::Q6kX3C => "q6k_x3_c",
+            Pipeline::AttentionFlash => "attention_flash",
             Pipeline::Q6kExpertC16R1 => "q6k_expert_c16_r1",
             Pipeline::Q6kExpertC16R1v => "q6k_expert_c16_r1v",
             Pipeline::Q6kExpertC16R2 => "q6k_expert_c16_r2",
@@ -119,7 +121,7 @@ impl Pipeline {
         }
     }
 
-    pub const ALL: [Pipeline; 45] = [
+    pub const ALL: [Pipeline; 46] = [
         Pipeline::Q6kMatvec,
         Pipeline::Q6kX3,
         Pipeline::Q6kGemm,
@@ -156,6 +158,7 @@ impl Pipeline {
         Pipeline::Q6kExpertRt2c32,
         Pipeline::Q6kMatvecC,
         Pipeline::Q6kX3C,
+        Pipeline::AttentionFlash,
         Pipeline::Q6kExpertC16R1,
         Pipeline::Q6kExpertC16R1v,
         Pipeline::Q6kExpertC16R2,
@@ -407,6 +410,29 @@ pub fn profile_read() -> Vec<(Pipeline, f64)> {
             })
             .collect()
     }
+}
+
+/// ON by default (§35): 1.025x at pp512 growing to 1.069x at pp2048, because attention's
+/// share grows as T^2; neutral at decode, where it is ~2.5% of the pass. Correct across 24
+/// (tile, length) cases against the kernel it replaces.
+static ATTN_FLASH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Use the one-pass online-softmax attention kernel.
+///
+/// §34: attention is 21% of a 512-token prefill and 52% of a 2048-token one, and runs at
+/// 753 G MAC/s against the matmul kernels' 5500. The three-pass kernel materialises every
+/// score in a global buffer and maps one thread to one KEY, so a load instruction touches
+/// 256 cache lines. This one keeps a running max and sum, and four lanes share a key so
+/// each group reads contiguous bytes.
+///
+/// Its softmax reduction is one subgroup over one 64-key block, so it needs a 64-wide
+/// subgroup; where that does not hold the three-pass kernel is used instead.
+pub fn set_attention_flash(on: bool) {
+    ATTN_FLASH.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn attention_flash() -> bool {
+    ATTN_FLASH.load(std::sync::atomic::Ordering::Relaxed) && subgroup_size() == 64
 }
 
 static ATTN_SCALAR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1140,6 +1166,8 @@ pub fn attention(
     dispatch(
         if attention_scalar() {
             Pipeline::AttentionScalar
+        } else if attention_flash() {
+            Pipeline::AttentionFlash
         } else {
             Pipeline::Attention
         },

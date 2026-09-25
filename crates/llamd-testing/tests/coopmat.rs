@@ -876,3 +876,136 @@ fn prefill_scaling_past_512() {
         );
     }
 }
+
+/// Flash attention: one pass over the keys with an online softmax, four lanes per key.
+///
+/// §34 put attention at 21% of a 512-token prefill and 52% of a 2048-token one, running
+/// 7.3x slower per MAC than the matmul kernels. The bar is the same emitted token, then
+/// the number — measured at BOTH prompt lengths, because the whole point is the long one.
+#[test]
+#[ignore = "uploads 23 GiB and a large KV cache; needs a free GPU and the real model"]
+fn flash_attention() {
+    let Some(path) = oracle_model() else {
+        return;
+    };
+    if !llamd_vulkan::available() {
+        return;
+    }
+    let model = Model::open(&path).expect("open");
+    let mut vk =
+        VulkanModel::load_with_slots(&model, 2100, llamd_vulkan::MAX_TILE, 8).expect("load");
+    let vocab = llamd_tokenizer::Vocab::from_gguf(model.gguf()).expect("vocab");
+    let text = "Explain how a compiler turns source code into machine instructions, \
+                covering lexing, parsing, type checking, optimisation and code generation.";
+    let mut all = Vec::new();
+    while all.len() < 2048 {
+        all.extend_from_slice(&vocab.encode(text, false));
+    }
+    all.truncate(2048);
+
+    // Correctness first, over lengths that straddle the 64-key block and the tile.
+    let mut wrong = 0;
+    let mut cases = 0;
+    for &tile in &[32usize, 128, 512] {
+        for &n in &[1usize, 63, 64, 65, 129, 300, 512, 1024] {
+            vk.prefill_tile = tile;
+            let toks = &all[..n];
+            ops::set_attention_flash(false);
+            let want = vk.prefill(toks, 0).expect("three-pass");
+            ops::set_attention_flash(true);
+            let got = vk.prefill(toks, 0).expect("flash");
+            cases += 1;
+            if got != want {
+                wrong += 1;
+                if wrong <= 6 {
+                    eprintln!("  MISMATCH tile {tile}, {n} tokens: {want} vs {got}");
+                }
+            }
+        }
+    }
+    ops::set_attention_flash(false);
+    eprintln!("  {} of {cases} cases agree", cases - wrong);
+    assert_eq!(
+        wrong, 0,
+        "flash attention disagrees in {wrong} of {cases} cases"
+    );
+
+    // Then the number, alternating arms in one process.
+    let run = |vk: &mut VulkanModel, n: usize, on: bool| -> f64 {
+        ops::set_attention_flash(on);
+        let toks = &all[..n];
+        let _ = vk.prefill(toks, 0).expect("warm");
+        let mut best = f64::MAX;
+        for _ in 0..2 {
+            let t = std::time::Instant::now();
+            let _ = vk.prefill(toks, 0).expect("prefill");
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        n as f64 / best
+    };
+    vk.prefill_tile = 512;
+    eprintln!(
+        "  {:>8}{:>14}{:>14}{:>10}",
+        "prompt", "flash", "three-pass", "speedup"
+    );
+    for n in [512usize, 1024, 1536, 2048] {
+        let old = run(&mut vk, n, false);
+        let new = run(&mut vk, n, true);
+        eprintln!(
+            "  {n:>8}{:>14}{:>14}{:>10}",
+            format!("{new:.1}"),
+            format!("{old:.1}"),
+            format!("{:.3}x", new / old)
+        );
+    }
+    ops::set_attention_flash(false);
+}
+
+/// Flash attention at DECODE, where n_kv is the context and attention is a small share —
+/// so the bar here is "no regression", not a win.
+#[test]
+#[ignore = "uploads 23 GiB; needs a free GPU and the real model"]
+fn flash_attention_decode() {
+    let Some(path) = oracle_model() else {
+        return;
+    };
+    if !llamd_vulkan::available() {
+        return;
+    }
+    let model = Model::open(&path).expect("open");
+    let mut vk =
+        VulkanModel::load_with_slots(&model, 600, llamd_vulkan::MAX_TILE, 8).expect("load");
+    let vocab = llamd_tokenizer::Vocab::from_gguf(model.gguf()).expect("vocab");
+    let tok = vocab.encode("The", false)[0];
+    let run = |vk: &mut VulkanModel, batch: usize, on: bool| -> f64 {
+        ops::set_attention_flash(on);
+        let toks: Vec<u32> = std::iter::repeat_n(tok, batch).collect();
+        let pos: Vec<usize> = (0..batch).map(|_| 256).collect();
+        let _ = vk.forward_batch(&toks, &pos).expect("warm");
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            for _ in 0..16 {
+                let _ = vk.forward_batch(&toks, &pos).expect("decode");
+            }
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        (batch * 16) as f64 / best
+    };
+    eprintln!("  256 tokens of context");
+    eprintln!(
+        "  {:>7}{:>12}{:>14}{:>10}",
+        "batch", "flash", "three-pass", "ratio"
+    );
+    for b in [1usize, 4, 8] {
+        let off = run(&mut vk, b, false);
+        let on = run(&mut vk, b, true);
+        eprintln!(
+            "  {b:>7}{:>12}{:>14}{:>10}",
+            format!("{on:.1}"),
+            format!("{off:.1}"),
+            format!("{:.3}x", on / off)
+        );
+    }
+    ops::set_attention_flash(false);
+}

@@ -2908,3 +2908,63 @@ benchmark.
 
 **The dequantised-buffer idea is closed**: it fits, it is traffic-negative, and it aims at
 9% of the wrong kernel.
+
+---
+
+## 35. Flash attention: one pass, and the gain grows with the prompt
+
+§34 showed attention back on top — 21% of a 512-token prefill, **52% of a 2048-token one**
+— not because §22's rewrite failed but because its share grows as T² while everything else
+grows as T. And it still ran at 753 G MAC/s against the matmul kernels' 5500.
+
+### Two structural problems, both addressed
+
+**Three passes over an O(T²) array.** `attention.comp` writes every score to a global
+scratch buffer, walks it again to exponentiate in place, and walks it a third time for the
+weighted sum of V. `attention_flash.comp` keeps a **running max and sum** — the standard
+online softmax — so the scores are consumed in the workgroup and the buffer is not needed.
+
+**The QK reads were uncoalesced, and that is the larger one.** One thread per *key* puts
+threads `kv_stride` apart, so a single load instruction touches 256 cache lines and fetches
+16 KiB to use 4 KiB. Now **four lanes share a key** and split the head dimension, so each
+group reads 512 contiguous bytes, and the per-key dot closes with
+`subgroupClusteredAdd(·, 4)` — §27's finding (a narrow clustered reduction beats a wide
+one) applied to attention.
+
+Keys go 64 at a time: 4 subgroups × 16 keys × 4 lanes, with the softmax reduction being one
+subgroup over one block. That ties `BK` to the subgroup width, so the host falls back to the
+three-pass kernel where the subgroup is not 64 rather than reducing over the wrong lanes.
+
+### Result: it works, and it scales the right way
+
+| prompt | flash | three-pass | speedup |
+|---|---|---|---|
+| 512 | 1604.2 | 1565.6 | 1.025× |
+| 1024 | 1343.5 | 1287.9 | 1.043× |
+| 1536 | 1156.5 | 1092.8 | 1.058× |
+| **2048** | **1013.0** | 947.8 | **1.069×** |
+
+**The gain grows with prompt length**, which is the shape the T² argument predicts and the
+first change in this document whose benefit increases with the workload rather than
+decreasing. Decode is neutral — 0.968× / 1.052× / 0.982× at batch 1 / 4 / 8 over a
+256-token context, which is noise on a kernel that is ~2.5% of a decode pass.
+
+24 of 24 (tile, length) cases emit the same token as the kernel it replaces, across lengths
+straddling the 64-key block and the tile. All five prompts still token-for-token equal to
+llama.cpp, prefill still equals sequential decode across 100 cases, 132 passed, 0 failed.
+**On by default.**
+
+### Honest about the magnitude
+
+1.069× at pp2048, where attention is 52% of the pass, means attention itself got about
+1.15× faster — not the 7× its 753 G MAC/s against the matmuls' 5500 suggests is available.
+So the score buffer and the coalescing were real but not the whole story.
+
+What remains is visible in the structure: the softmax reduction is **one subgroup over one
+block**, so the other three subgroups wait at a barrier for it, three times per 64 keys —
+about 96 barriers per workgroup at n_kv 2048. The standard fix is four **independent**
+flash streams, one per subgroup, each with its own running (o, m, l) over its own slice of
+the keys, combined once at the very end. That removes every per-block barrier.
+
+That is the next change, and it follows the same rule the two other wins followed: it
+removes work that buys nothing rather than trading one scarce resource for another.
