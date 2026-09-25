@@ -1,0 +1,165 @@
+#version 450
+//
+// Q, K and V in ONE dispatch.
+//
+// WHY. All three multiply the same activation, so a weight read already serves
+// every sequence — but issued separately they are 4096, 512 and 512 rows, which
+// at one subgroup per row is 1024, 128 and 128 subgroups. On a 32-WGP card the
+// two small ones leave most of it idle for the whole projection. Fused, the row
+// space is 5120 and K and V fill the card alongside Q. The same change on the
+// ROCm side was worth 23% — the largest single win in that path — and the reason
+// was occupancy, not the two launches saved.
+//
+// THE PLANE OFFSETS ARE PER MATRIX. Q, K and V are separate tensors with
+// separate planar layouts, so each carries its own four offsets. Reading one
+// set for all three is the obvious bug here and would produce fluent, wrong
+// output; the macro takes them as parameters for exactly that reason.
+//
+// THE MACRO IS INSTANTIATED THREE TIMES, once per branch, because GLSL has no
+// pointers to buffers. Only one branch runs per subgroup, and the arithmetic is
+// one source.
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0)  readonly  buffer W0 { uvec4 w0[]; };
+layout(std430, binding = 1)  readonly  buffer W1 { uvec4 w1[]; };
+layout(std430, binding = 2)  readonly  buffer W2 { uvec4 w2[]; };
+layout(std430, binding = 3)  readonly  buffer QB { uvec4 qb[]; };
+layout(std430, binding = 4)  readonly  buffer SB { int   sb[]; };
+layout(std430, binding = 5)  readonly  buffer AD { float ad[]; };
+layout(std430, binding = 6)  writeonly buffer O0 { float o0[]; };
+layout(std430, binding = 7)  writeonly buffer O1 { float o1[]; };
+layout(std430, binding = 8)  writeonly buffer O2 { float o2[]; };
+
+layout(push_constant) uniform Push {
+    uint q_ql; uint q_qh; uint q_sc; uint q_d;      // Q's planes
+    uint k_ql; uint k_qh; uint k_sc; uint k_d;      // K's
+    uint v_ql; uint v_qh; uint v_sc; uint v_d;      // V's
+    uint blocks; uint rows0; uint rows1; uint rows2;
+    uint nseq;
+} pc;
+// SIXTEEN LANES PER ROW. Q, K and V are K = 2048, so n_u4 = 64 against a 64-lane
+// subgroup — one iteration per lane, which is the exact shape §26 found pathological
+// and §27 fixed on the expert kernel.
+#define CLUSTER 16
+#define Q6K_LANE  (gl_SubgroupInvocationID % uint(CLUSTER))
+#define Q6K_LANES uint(CLUSTER)
+#extension GL_KHR_shader_subgroup_clustered : require
+#include "common.glsl"
+#include "q6k.glsl"
+
+// The accumulator width, a SPECIALIZATION CONSTANT.
+//
+// WHY. `float acc[MAX_SEQ]` is sized at compile time, so raising MAX_SEQ from 32
+// to 64 cost every pass 192 VGPRs instead of 72 — one wave per SIMD instead of
+// three — even a pass using 32 slots. Measured: a 512-token prompt at tile 32
+// went from 598.5 to 541.7 tok/s purely from the wider array.
+//
+// Specialized, each pipeline variant carries only the slots it needs, and the
+// loops below unroll because the bound is a constant rather than a push value.
+// The host creates one variant per power of two and picks by token count.
+layout(constant_id = 0) const int ACC_N = 64;
+
+void main() {
+    uint cl_id = gl_SubgroupInvocationID / uint(CLUSTER);
+    uint cl_lane = gl_SubgroupInvocationID % uint(CLUSTER);
+    uint cl_per_sg = gl_SubgroupSize / uint(CLUSTER);
+    uint grow = (gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID) * cl_per_sg + cl_id;
+    uint total = pc.rows0 + pc.rows1 + pc.rows2;
+    if (grow >= total) return;
+
+    // Token-chunked exactly as q6k_matvec is, so a wide prefill tile costs
+    // registers per CHUNK rather than per tile. See that shader for why.
+    if (grow < pc.rows0) {
+        if (pc.nseq <= uint(ACC_N)) {
+            // One chunk: literal zero bases, so the offsets fold away. See
+            // q6k_matvec.comp for why that is worth writing twice.
+            float acc[ACC_N];
+            for (int i = 0; i < ACC_N; ++i) acc[i] = 0.0;
+            Q6K_ACC(w0, pc.q_ql, pc.q_qh, pc.q_sc, pc.q_d, grow * pc.blocks,
+                    0u, 0u, 0u, ACC_N, ACC_N, acc)
+            for (int s = 0; s < ACC_N; ++s) {
+                if (uint(s) >= pc.nseq) break;
+                float t = subgroupClusteredAdd(acc[s], CLUSTER);
+                if (cl_lane == 0u) o0[uint(s) * pc.rows0 + grow] = t;
+            }
+            return;
+        }
+        for (uint base = 0u; base < pc.nseq; base += uint(ACC_N)) {
+            uint live = min(uint(ACC_N), pc.nseq - base);
+            float acc[ACC_N];
+            for (int i = 0; i < ACC_N; ++i) acc[i] = 0.0;
+            Q6K_ACC(w0, pc.q_ql, pc.q_qh, pc.q_sc, pc.q_d, grow * pc.blocks,
+                    base * pc.blocks * 64u, base * pc.blocks * 16u, base * pc.blocks,
+                    ACC_N, live, acc)
+            for (int s = 0; s < ACC_N; ++s) {
+                if (uint(s) >= live) break;
+                float t = subgroupClusteredAdd(acc[s], CLUSTER);
+                if (cl_lane == 0u) o0[(base + uint(s)) * pc.rows0 + grow] = t;
+            }
+        }
+    } else if (grow < pc.rows0 + pc.rows1) {
+        uint row = grow - pc.rows0;
+        if (pc.nseq <= uint(ACC_N)) {
+            // One chunk: literal zero bases, so the offsets fold away. See
+            // q6k_matvec.comp for why that is worth writing twice.
+            float acc[ACC_N];
+            for (int i = 0; i < ACC_N; ++i) acc[i] = 0.0;
+            Q6K_ACC(w1, pc.k_ql, pc.k_qh, pc.k_sc, pc.k_d, row * pc.blocks,
+                    0u, 0u, 0u, ACC_N, ACC_N, acc)
+            for (int s = 0; s < ACC_N; ++s) {
+                if (uint(s) >= pc.nseq) break;
+                float t = subgroupClusteredAdd(acc[s], CLUSTER);
+                if (cl_lane == 0u) o1[uint(s) * pc.rows1 + row] = t;
+            }
+            return;
+        }
+        for (uint base = 0u; base < pc.nseq; base += uint(ACC_N)) {
+            uint live = min(uint(ACC_N), pc.nseq - base);
+            float acc[ACC_N];
+            for (int i = 0; i < ACC_N; ++i) acc[i] = 0.0;
+            Q6K_ACC(w1, pc.k_ql, pc.k_qh, pc.k_sc, pc.k_d, row * pc.blocks,
+                    base * pc.blocks * 64u, base * pc.blocks * 16u, base * pc.blocks,
+                    ACC_N, live, acc)
+            for (int s = 0; s < ACC_N; ++s) {
+                if (uint(s) >= live) break;
+                float t = subgroupClusteredAdd(acc[s], CLUSTER);
+                if (cl_lane == 0u) o1[(base + uint(s)) * pc.rows1 + row] = t;
+            }
+        }
+    } else {
+        uint row = grow - pc.rows0 - pc.rows1;
+        if (pc.nseq <= uint(ACC_N)) {
+            // One chunk: literal zero bases, so the offsets fold away. See
+            // q6k_matvec.comp for why that is worth writing twice.
+            float acc[ACC_N];
+            for (int i = 0; i < ACC_N; ++i) acc[i] = 0.0;
+            Q6K_ACC(w2, pc.v_ql, pc.v_qh, pc.v_sc, pc.v_d, row * pc.blocks,
+                    0u, 0u, 0u, ACC_N, ACC_N, acc)
+            for (int s = 0; s < ACC_N; ++s) {
+                if (uint(s) >= pc.nseq) break;
+                float t = subgroupClusteredAdd(acc[s], CLUSTER);
+                if (cl_lane == 0u) o2[uint(s) * pc.rows2 + row] = t;
+            }
+            return;
+        }
+        for (uint base = 0u; base < pc.nseq; base += uint(ACC_N)) {
+            uint live = min(uint(ACC_N), pc.nseq - base);
+            float acc[ACC_N];
+            for (int i = 0; i < ACC_N; ++i) acc[i] = 0.0;
+            Q6K_ACC(w2, pc.v_ql, pc.v_qh, pc.v_sc, pc.v_d, row * pc.blocks,
+                    base * pc.blocks * 64u, base * pc.blocks * 16u, base * pc.blocks,
+                    ACC_N, live, acc)
+            for (int s = 0; s < ACC_N; ++s) {
+                if (uint(s) >= live) break;
+                float t = subgroupClusteredAdd(acc[s], CLUSTER);
+                if (cl_lane == 0u) o2[(base + uint(s)) * pc.rows2 + row] = t;
+            }
+        }
+    }
+}

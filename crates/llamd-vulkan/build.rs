@@ -47,6 +47,8 @@ const SHADERS: &[&str] = &[
     "q6k_expert_rt2c",
     "q6k_expert_rt2c8",
     "q6k_expert_rt2c32",
+    "q6k_matvec_c",
+    "q6k_x3_c",
 ];
 
 fn main() {

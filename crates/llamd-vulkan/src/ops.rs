@@ -54,6 +54,8 @@ pub enum Pipeline {
     Q6kExpertRt2c = 31,
     Q6kExpertRt2c8 = 32,
     Q6kExpertRt2c32 = 33,
+    Q6kMatvecC = 34,
+    Q6kX3C = 35,
 }
 
 impl Pipeline {
@@ -94,10 +96,12 @@ impl Pipeline {
             Pipeline::Q6kExpertRt2c => "q6k_expert_rt2c",
             Pipeline::Q6kExpertRt2c8 => "q6k_expert_rt2c8",
             Pipeline::Q6kExpertRt2c32 => "q6k_expert_rt2c32",
+            Pipeline::Q6kMatvecC => "q6k_matvec_c",
+            Pipeline::Q6kX3C => "q6k_x3_c",
         }
     }
 
-    pub const ALL: [Pipeline; 34] = [
+    pub const ALL: [Pipeline; 36] = [
         Pipeline::Q6kMatvec,
         Pipeline::Q6kX3,
         Pipeline::Q6kGemm,
@@ -132,6 +136,8 @@ impl Pipeline {
         Pipeline::Q6kExpertRt2c,
         Pipeline::Q6kExpertRt2c8,
         Pipeline::Q6kExpertRt2c32,
+        Pipeline::Q6kMatvecC,
+        Pipeline::Q6kX3C,
     ];
 }
 
@@ -422,6 +428,28 @@ pub fn expert_coopmat_for(rows: usize) -> bool {
     EXPERT_CM.load(std::sync::atomic::Ordering::Relaxed)
         && crate::has_coopmat()
         && rows % CM_ROWS_PER_WG == 0
+}
+
+static MATVEC_CLUSTER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Use the 16-lane clustered variants of the attention projections.
+///
+/// The same fix §27 landed on the expert kernel, applied to the same pathology here.
+/// Q, K and V are K = 2048, so `n_u4 = 64` against a 64-lane subgroup — one loop
+/// iteration per lane to amortise a 32-accumulator epilogue over, which is exactly
+/// the shape the expert gate had.
+pub fn set_matvec_cluster(on: bool) {
+    MATVEC_CLUSTER.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn matvec_cluster() -> bool {
+    MATVEC_CLUSTER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Rows one workgroup covers when 16 lanes share a row.
+fn groups_for_rows_clustered(rows: usize) -> u32 {
+    let per = rows_per_workgroup().max(1) * (subgroup_size() as usize / 16).max(1);
+    rows.div_ceil(per.max(1)) as u32
 }
 
 /// Rows one LANE of the lane-per-row expert kernel owns. Must match `LROWS` in
@@ -748,14 +776,12 @@ pub fn matvec(
     nseq: usize,
 ) -> Result<()> {
     let p = planes(w).u(4, w.blocks()).u(5, rows).u(6, nseq);
-    dispatch_acc(
-        Pipeline::Q6kMatvec,
-        &[w.buf(), qb, sb, ad, out],
-        p,
-        groups_for_rows(rows),
-        1,
-        acc_for(nseq),
-    )
+    let (pipe, gx) = if matvec_cluster() {
+        (Pipeline::Q6kMatvecC, groups_for_rows_clustered(rows))
+    } else {
+        (Pipeline::Q6kMatvec, groups_for_rows(rows))
+    };
+    dispatch_acc(pipe, &[w.buf(), qb, sb, ad, out], p, gx, 1, acc_for(nseq))
 }
 
 /// Rows a single lane accumulates in the GEMM kernel. Must match
@@ -836,8 +862,16 @@ pub fn matvec_x3(
         .u(14, rows.1)
         .u(15, rows.2)
         .u(16, nseq);
+    let (pipe, gx) = if matvec_cluster() {
+        (
+            Pipeline::Q6kX3C,
+            groups_for_rows_clustered(rows.0 + rows.1 + rows.2),
+        )
+    } else {
+        (Pipeline::Q6kX3, groups_for_rows(rows.0 + rows.1 + rows.2))
+    };
     dispatch_acc(
-        Pipeline::Q6kX3,
+        pipe,
         &[
             w.0.buf(),
             w.1.buf(),
@@ -850,7 +884,7 @@ pub fn matvec_x3(
             out.2,
         ],
         p,
-        groups_for_rows(rows.0 + rows.1 + rows.2),
+        gx,
         1,
         acc_for(nseq),
     )

@@ -562,3 +562,103 @@ fn clustered_reduction_experts() {
         best.2
     );
 }
+
+/// The clustered reduction applied to the attention projections — §27's fix on the
+/// same pathology in the other 26% of the pass.
+#[test]
+#[ignore = "uploads 23 GiB to the device; needs a free GPU and the real model"]
+fn clustered_reduction_projections() {
+    let Some(path) = oracle_model() else {
+        return;
+    };
+    if !llamd_vulkan::available() {
+        return;
+    }
+    let model = Model::open(&path).expect("open");
+    let mut vk =
+        VulkanModel::load_with_slots(&model, 600, llamd_vulkan::MAX_TILE, 8).expect("load");
+    let vocab = llamd_tokenizer::Vocab::from_gguf(model.gguf()).expect("vocab");
+    let text = "Explain how a compiler turns source code into machine instructions, \
+                covering lexing, parsing, type checking, optimisation and code generation.";
+    let mut all = Vec::new();
+    while all.len() < 512 {
+        all.extend_from_slice(&vocab.encode(text, false));
+    }
+    all.truncate(512);
+
+    let mut wrong = 0;
+    let mut cases = 0;
+    for &tile in &[32usize, 128, 512] {
+        for &n in &[15usize, 17, 33, 300, 512] {
+            vk.prefill_tile = tile;
+            let toks = &all[..n];
+            ops::set_matvec_cluster(false);
+            let want = vk.prefill(toks, 0).expect("subgroup");
+            ops::set_matvec_cluster(true);
+            let got = vk.prefill(toks, 0).expect("clustered");
+            cases += 1;
+            if got != want {
+                wrong += 1;
+                eprintln!("  MISMATCH tile {tile}, {n} tokens: {want} vs {got}");
+            }
+        }
+    }
+    ops::set_matvec_cluster(false);
+    eprintln!("  {} of {cases} cases agree", cases - wrong);
+    assert_eq!(wrong, 0, "the clustered projections disagree");
+
+    let run = |vk: &mut VulkanModel, on: bool| -> f64 {
+        ops::set_matvec_cluster(on);
+        let _ = vk.prefill(&all, 0).expect("warm");
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            let _ = vk.prefill(&all, 0).expect("prefill");
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        512.0 / best
+    };
+    eprintln!(
+        "  {:>6}{:>14}{:>14}{:>10}",
+        "tile", "clustered", "subgroup 64", "speedup"
+    );
+    let mut best = 0.0f64;
+    for tile in [128usize, 256, 512] {
+        vk.prefill_tile = tile;
+        let off = run(&mut vk, false);
+        let on = run(&mut vk, true);
+        best = best.max(on);
+        eprintln!(
+            "  {tile:>6}{:>14}{:>14}{:>10}",
+            format!("{on:.1}"),
+            format!("{off:.1}"),
+            format!("{:.3}x", on / off)
+        );
+    }
+    ops::set_matvec_cluster(false);
+    eprintln!("  best: {best:.1} tok/s   (llama.cpp Vulkan pp512 3213.6, no coopmat 1834.3)");
+
+    // Decode too: q6k_matvec and q6k_x3 run there as well, over a much shorter K.
+    let dec = |vk: &mut VulkanModel, on: bool| -> f64 {
+        ops::set_matvec_cluster(on);
+        let toks = [all[0]; 8];
+        let pos = [64usize; 8];
+        let _ = vk.forward_batch(&toks, &pos).expect("warm");
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            for _ in 0..16 {
+                let _ = vk.forward_batch(&toks, &pos).expect("decode");
+            }
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        (8 * 16) as f64 / best
+    };
+    let d_off = dec(&mut vk, false);
+    let d_on = dec(&mut vk, true);
+    ops::set_matvec_cluster(false);
+    eprintln!(
+        "  decode batch 8: clustered {d_on:.1} vs subgroup {d_off:.1} = {:.3}x",
+        d_on / d_off
+    );
+}

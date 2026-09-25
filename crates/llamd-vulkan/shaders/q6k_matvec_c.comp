@@ -1,0 +1,139 @@
+#version 450
+//
+// Planar Q6_K x Q8_K matvec, batched, for Vulkan compute on AMD.
+//
+// THIS IS THE SAME ARITHMETIC as crates/llamd-rocm/kernels/llamd_udot.hip, and
+// deliberately so: the point of a second backend is a comparison on identical
+// hardware, which is only meaningful if both compute the same thing. Both are
+// validated against llamd_quant::dot_q6k_q8k.
+//
+// THE IDENTITY. Q6_K stores w in 0..63 before the -32; Q8_K activations are
+// signed int8 and become unsigned as b = a + 128 (exactly a XOR 0x80). Over a
+// 16-value scale group:
+//
+//   S sc*(w-32)*a = sc * [ S w*b - 128*S w - 32*S b + 32*128*16 ]
+//
+// `S w*b` is dotPacked4x8AccSatEXT per sequence; `S w` is the same instruction
+// against 0x01010101 and is SHARED by every sequence; `S b` is precomputed.
+// RADV reports integerDotProduct4x8BitPackedUnsignedAccelerated = true, so this
+// is the hardware instruction and not an emulation.
+//
+// WHY PLANAR. Four weights pack into a uint only if their value indices are
+// consecutive and share a scale group. ggml's 210-byte interleaved blocks are
+// 2-byte aligned and give neither; the planar repack gives sixteen consecutive
+// indices, which is exactly one scale group. It also lets every load here be a
+// plain uint from an std430 buffer with no byte addressing.
+//
+// PROVENANCE: the Q6_K layout is from llama.cpp / ggml (MIT, (c) 2023-2026 The
+// ggml authors).
+
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 256) in;
+
+const int MAX_SEQ = 8;
+
+// The whole planar weight tensor, addressed as uints. Plane offsets arrive as
+// push constants already divided by 4.
+layout(std430, binding = 0) readonly buffer W { uvec4 w[]; };
+// Activation, biased to unsigned and packed 4 bytes per uint.
+layout(std430, binding = 1) readonly buffer QB { uvec4 qb[]; };
+// Per-16 group sums of the biased activation.
+layout(std430, binding = 2) readonly buffer SB { int   sb[]; };
+// Per-block activation scale.
+layout(std430, binding = 3) readonly buffer AD { float ad[]; };
+layout(std430, binding = 4) writeonly buffer O { float outv[]; };
+
+layout(push_constant) uniform Push {
+    uint ql_u; uint qh_u; uint sc_u; uint d_u;
+    uint blocks; uint rows; uint nseq; uint pad;
+} pc;
+// SIXTEEN LANES PER ROW, not sixty-four. See q6k.glsl and benchmarks.md §27.
+#define CLUSTER 16
+#define Q6K_LANE  (gl_SubgroupInvocationID % uint(CLUSTER))
+#define Q6K_LANES uint(CLUSTER)
+#extension GL_KHR_shader_subgroup_clustered : require
+#include "common.glsl"
+#include "q6k.glsl"
+
+// The accumulator width, a SPECIALIZATION CONSTANT.
+//
+// WHY. `float acc[MAX_SEQ]` is sized at compile time, so raising MAX_SEQ from 32
+// to 64 cost every pass 192 VGPRs instead of 72 — one wave per SIMD instead of
+// three — even a pass using 32 slots. Measured: a 512-token prompt at tile 32
+// went from 598.5 to 541.7 tok/s purely from the wider array.
+//
+// Specialized, each pipeline variant carries only the slots it needs, and the
+// loops below unroll because the bound is a constant rather than a push value.
+// The host creates one variant per power of two and picks by token count.
+layout(constant_id = 0) const int ACC_N = 64;
+
+// One subgroup per output row; every sequence multiplies the same matrix, so
+// NS is the batch width and one weight read serves all of them.
+void main() {
+    uint cl_id = gl_SubgroupInvocationID / uint(CLUSTER);
+    uint cl_lane = gl_SubgroupInvocationID % uint(CLUSTER);
+    uint cl_per_sg = gl_SubgroupSize / uint(CLUSTER);
+    uint row = (gl_WorkGroupID.x * gl_NumSubgroups + gl_SubgroupID) * cl_per_sg + cl_id;
+    if (row >= pc.rows) return;
+
+    // TOKEN CHUNKING, and it is what lets the prefill tile be wide.
+    //
+    // The accumulator is ACC_N wide whatever pc.nseq is, so 512 tokens run as 16
+    // chunks of 32 instead of needing 512 floats per lane. The weight row is
+    // re-read once per chunk — exactly what a tile of 32 already paid, so the
+    // attention path costs no more than before — and in exchange the TILE can be
+    // wide enough that an expert sees every token of its group at once. That is
+    // where the traffic is: 96.5% of it. See benchmarks.md §19.
+    //
+    // `base` and `live` derive only from pc.nseq and ACC_N, both uniform, so every
+    // lane of the subgroup runs the same number of iterations and the subgroupAdd
+    // below is not reached divergently.
+    // THE SINGLE-CHUNK FAST PATH, and it is not a micro-optimisation.
+    //
+    // With only the chunked loop below, the activation bases are `base * ...`
+    // rather than the literal `0u` they used to be, so the compiler can no longer
+    // fold them out of the inner loop — it must compute an offset per access. That
+    // cost decode about 4% at batch 2 to 8, where this shader and q6k_x3 are 16% of
+    // the time and every pass fits in ONE chunk. Profiled, not guessed: attention
+    // was 2.5% of decode, so the attention rewrite could not have been the cause.
+    //
+    // So the common case — one chunk, which is every decode pass and any tile no
+    // wider than ACC_N — is written out separately with literal zero bases AND a
+    // compile-time live count. Passing `pc.nseq` there instead would reintroduce a
+    // runtime `break` into the unrolled inner loop, which is what the original
+    // shader deliberately did not have: it accumulated all ACC_N slots and filtered
+    // on the WRITE. Slots past pc.nseq then hold arithmetic on unused activation
+    // rows, which is harmless — they are never written out, and the reads are in
+    // bounds because the buffers are sized for max_seq, which is at least ACC_N.
+    if (pc.nseq <= uint(ACC_N)) {
+        float acc[ACC_N];
+        for (int i = 0; i < ACC_N; ++i) acc[i] = 0.0;
+        Q6K_ACC(w, pc.ql_u, pc.qh_u, pc.sc_u, pc.d_u, row * pc.blocks,
+                0u, 0u, 0u, ACC_N, ACC_N, acc)
+        for (int s = 0; s < ACC_N; ++s) {
+            if (uint(s) >= pc.nseq) break;
+            float t = subgroupClusteredAdd(acc[s], CLUSTER);
+            if (cl_lane == 0u) outv[uint(s) * pc.rows + row] = t;
+        }
+        return;
+    }
+
+    for (uint base = 0u; base < pc.nseq; base += uint(ACC_N)) {
+        uint live = min(uint(ACC_N), pc.nseq - base);
+        float acc[ACC_N];
+        for (int i = 0; i < ACC_N; ++i) acc[i] = 0.0;
+        Q6K_ACC(w, pc.ql_u, pc.qh_u, pc.sc_u, pc.d_u, row * pc.blocks,
+                base * pc.blocks * 64u, base * pc.blocks * 16u, base * pc.blocks,
+                ACC_N, live, acc)
+
+        for (int s = 0; s < ACC_N; ++s) {
+            if (uint(s) >= live) break;
+            float t = subgroupClusteredAdd(acc[s], CLUSTER);
+            if (cl_lane == 0u) outv[(base + uint(s)) * pc.rows + row] = t;
+        }
+    }
+}

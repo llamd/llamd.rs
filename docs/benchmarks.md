@@ -2438,3 +2438,50 @@ collected that on the kernels where register pressure allowed it — the expert 
 refused it (§26). And the clustered reduction has only been applied to the expert
 kernel; `q6k_matvec` and `q6k_x3` have the same 64-lane epilogue over a K that is
 twice as long, so the same change is worth less there but is not worth nothing.
+
+---
+
+## 28. The same fix on the attention projections: 0.957×
+
+§27's clustered reduction was worth 1.134× on the expert kernel. `q6k_matvec` and
+`q6k_x3` carry the identical epilogue — and Q/K/V is K = 2048, so `n_u4 = 64` against
+a 64-lane subgroup, **exactly** the one-iteration-per-lane shape §26 diagnosed. The
+same change applied to them is **4% slower**.
+
+| prefill tile | clustered | subgroup 64 | |
+|---|---|---|---|
+| 128 | 1337.8 | 1403.9 | 0.953× |
+| 256 | 1447.9 | 1512.9 | 0.957× |
+| 512 | 1497.6 | 1564.3 | 0.957× |
+| decode batch 8 | 479.1 | 497.6 | 0.963× |
+
+15 of 15 cases emit the same token, so this is a performance result and not a bug.
+
+### Why it does not transfer
+
+The two kernels differ in what shares the activation. The expert kernel carries
+`ROWS = 2` per lane, so one activation read feeds two rows and the epilogue is a
+larger fraction of what is left. The projections are one row per lane group, so
+clustering only quarters the coalescing without the same offset — four weight streams
+per subgroup instead of one, paying for a cheaper reduction that was a smaller share
+to begin with.
+
+`Q6K_LANE`/`Q6K_LANES` stay in `q6k.glsl` and the two `_c` variants stay in the tree,
+defaulted off, because a negative result with a measurement attached is worth more
+than the two lines it costs. Anyone reading §27 will otherwise try exactly this.
+
+### The pattern across this document
+
+Three separate changes now have **opposite signs on two kernels that look alike**:
+
+| change | expert kernel | attention projections |
+|---|---|---|
+| `uvec4` vectorised loads (§26) | **0.985×** | **1.21×** |
+| clustered reduction (§27, §28) | **1.134×** | **0.957×** |
+| cooperative matrix (§25) | 0.987× | not attempted |
+
+Every one was predicted to help both. Nothing in the op counts distinguishes them —
+what distinguishes them is register pressure, how much the activation is reused, and
+how much coalescing there is to lose, none of which a count of instructions exposes.
+**The only reliable method found in 28 sections is to measure each kernel separately,
+in the engine, with both arms alternating in one process.**

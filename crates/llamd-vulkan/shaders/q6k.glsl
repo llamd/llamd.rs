@@ -54,13 +54,30 @@
 // weight buffer.
 //
 // Requires pc.blocks.
+// WHICH LANES SHARE A ROW. By default the whole subgroup, which is what this kernel
+// has always done. A shader may define these to a CLUSTER instead, so that
+// log2(CLUSTER) reduction steps over CLUSTER lanes replace 6 over 64 while the lanes
+// sharing a row still read CONSECUTIVE K and stay coalesced. §27 measured that as a
+// clean inverted U peaking at 16 on the expert kernel: 64 lanes pay too much
+// epilogue, one lane per row loses coalescing and is 2.15x slower.
+//
+// It matters most where K is short enough that the loop cannot amortise the epilogue.
+// Q, K and V are K = 2048, so n_u4 = 64 against a 64-lane subgroup — exactly one
+// iteration per lane, the same shape §26 found pathological.
+#ifndef Q6K_LANE
+#define Q6K_LANE  gl_SubgroupInvocationID
+#endif
+#ifndef Q6K_LANES
+#define Q6K_LANES gl_SubgroupSize
+#endif
+
 #define Q6K_ACC(WB, QLU, QHU, SCU, DU, RI, AQ, AS, AA, NS, NLIVE, ACC)         \
 {                                                                              \
     uint _nu4 = pc.blocks * 8u;                                                \
     uint _qlr = (QLU) + (RI) * 32u;                                            \
     uint _qhr = (QHU) + (RI) * 16u;                                            \
     uint _scr = (SCU) + (RI) * 4u;                                             \
-    for (uint _u = gl_SubgroupInvocationID; _u < _nu4; _u += gl_SubgroupSize) { \
+    for (uint _u = Q6K_LANE; _u < _nu4; _u += Q6K_LANES) {                     \
         uint _b = _u >> 3u;                                                    \
         uint _j = (_u & 7u) << 4u;                                             \
         uint _h = _j >> 6u;                                                    \
