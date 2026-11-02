@@ -40,6 +40,21 @@ fn main() {
                 std::process::exit(2);
             }
         },
+        Some("readbench") => match args.get(2) {
+            Some(path) => {
+                if let Err(e) = readbench(path, &args[3..]) {
+                    eprintln!("llamd: {e}");
+                    std::process::exit(1);
+                }
+            }
+            None => {
+                eprintln!(
+                    "usage: llamd readbench <file> [--depth 64] [--chunk 4M] [--extent 48M] \
+                     [--total 8G] [--buffered] [--seed N]"
+                );
+                std::process::exit(2);
+            }
+        },
         Some("experts") => match args.get(2) {
             Some(path) => {
                 let verify = args
@@ -74,7 +89,8 @@ fn main() {
             eprintln!(
                 "llamd {}\n\nusage:\n  llamd inspect <model.gguf>\n  llamd experts <model.gguf> [--verify N]\n  \
                  llamd plan <model.gguf> [--vram 32G] [--ram 16G] [--ctx N] [--os-reserve 3G] [--batch N]\n  \
-                 llamd synth qwen3-coder-480b-q8_0 <out.gguf>",
+                 llamd synth qwen3-coder-480b-q8_0 <out.gguf>\n  \
+                 llamd readbench <file> [--depth N] [--chunk 4M] [--extent 48M] [--total 8G] [--buffered]",
                 env!("CARGO_PKG_VERSION")
             );
             std::process::exit(2);
@@ -283,5 +299,119 @@ fn plan(path: &str, opts: &[String]) -> llamd_core::Result<()> {
         cfg.ctx
     );
     print!("{}", llamd_ooc::MemoryPlan::new(&cfg, &facts)?.report());
+    Ok(())
+}
+
+/// Read random expert-sized extents through the loader and report what the
+/// storage actually delivers. Extents start on 32-byte boundaries, like GGUF
+/// expert tensors, so the direct path's widening is exercised.
+fn readbench(path: &str, opts: &[String]) -> llamd_core::Result<()> {
+    use llamd_ooc::{Category, Ledger, Loader, LoaderConfig, Priority, Tier, parse_bytes};
+    let mut cfg = LoaderConfig::default();
+    let (mut extent, mut total, mut seed) = (48u64 << 20, 8u64 << 30, 0x5eedu64);
+    let mut it = opts.iter();
+    while let Some(k) = it.next() {
+        if k == "--buffered" {
+            cfg.direct = false;
+            continue;
+        }
+        let v = it
+            .next()
+            .ok_or_else(|| llamd_core::Error::other(format!("{k} needs a value")))?;
+        match k.as_str() {
+            "--depth" => {
+                cfg.queue_depth = v.parse().map_err(|_| llamd_core::Error::other("--depth"))?;
+                cfg.max_speculative_in_flight =
+                    (cfg.queue_depth / 4).clamp(1, cfg.queue_depth.saturating_sub(1).max(1));
+            }
+            "--chunk" => cfg.chunk_bytes = parse_bytes(v)? as usize,
+            "--extent" => extent = parse_bytes(v)?,
+            "--total" => total = parse_bytes(v)?,
+            "--seed" => seed = v.parse().map_err(|_| llamd_core::Error::other("--seed"))?,
+            other => return Err(llamd_core::Error::other(format!("unknown option {other}"))),
+        }
+    }
+    let len = std::fs::metadata(path)?.len();
+    if extent > len {
+        return Err(llamd_core::Error::other("extent larger than the file"));
+    }
+    let ledger = Ledger::with_caps(Tier::Ram, &[(Category::Staging, cfg.staging_bytes())]);
+    let rss0 = rss_mib();
+    let loader = Loader::new(path, cfg.clone(), &ledger)?;
+    let n = (total / extent).max(1) as usize;
+    let mut rng = seed;
+    let mut next = || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    // Keep a bounded number of extents in flight so destination memory is
+    // bounded too: enough to cover the queue depth.
+    let window = (cfg.queue_depth * cfg.chunk_bytes) as u64 / extent.max(1) + 2;
+    let t0 = std::time::Instant::now();
+    let mut inflight = std::collections::VecDeque::new();
+    let mut lat = Vec::with_capacity(n);
+    let mut bytes = 0u64;
+    for _ in 0..n {
+        let off = (next() % (len - extent + 1)) / 32 * 32;
+        inflight.push_back(loader.submit(
+            llamd_gguf::Extent {
+                offset: off,
+                len: extent,
+            },
+            Priority::Required,
+            Vec::new(),
+        )?);
+        if inflight.len() as u64 >= window {
+            let t = inflight.pop_front().expect("nonempty");
+            lat.push(t.wait_timed()?.1);
+            bytes += extent;
+        }
+    }
+    while let Some(t) = inflight.pop_front() {
+        lat.push(t.wait_timed()?.1);
+        bytes += extent;
+    }
+    let wall = t0.elapsed().as_secs_f64();
+    lat.sort();
+    let pct = |p: f64| lat[((lat.len() - 1) as f64 * p) as usize].as_secs_f64() * 1e3;
+    let st = loader.stats();
+    println!(
+        "  file        {path} ({:.2} GiB)",
+        len as f64 / (1u64 << 30) as f64
+    );
+    println!(
+        "  config      depth {} | chunk {} | extent {} | {} extents | mode {:?}",
+        cfg.queue_depth,
+        llamd_ooc::fmt_bytes(cfg.chunk_bytes as u64),
+        llamd_ooc::fmt_bytes(extent),
+        n,
+        loader.mode()
+    );
+    println!(
+        "  throughput  {:.0} MiB/s ({:.2} GiB in {wall:.2} s)",
+        bytes as f64 / (1u64 << 20) as f64 / wall,
+        bytes as f64 / (1u64 << 30) as f64
+    );
+    println!(
+        "  per extent  p50 {:.1} ms | p90 {:.1} ms | p99 {:.1} ms | max {:.1} ms",
+        pct(0.5),
+        pct(0.9),
+        pct(0.99),
+        pct(1.0)
+    );
+    println!(
+        "  chunks      {} direct, {} buffered, {} errors | mean queue wait {:.2} ms",
+        st.direct_chunks,
+        st.buffered_chunks,
+        st.errors,
+        st.queue_wait.as_secs_f64() * 1e3 / st.chunks.max(1) as f64
+    );
+    println!(
+        "  memory      RSS {rss0:.1} -> {:.1} MiB | staging reserved {}",
+        rss_mib(),
+        llamd_ooc::fmt_bytes(ledger.usage(Category::Staging).peak)
+    );
     Ok(())
 }
