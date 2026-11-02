@@ -480,4 +480,34 @@ mod planar_tests {
     fn a_short_source_is_refused() {
         assert!(repack_q6k_planar(&[0u8; 10], 1, 1).is_err());
     }
+
+    #[test]
+    fn per_expert_planes_are_the_whole_tensors_planes_sliced() {
+        // THE PROPERTY OUT-OF-CORE LOADING RESTS ON. Today a layer's
+        // `[cols, rows, n_expert]` expert tensor is repacked as ONE planar
+        // matrix of `n_expert * rows` rows. Streaming repacks one expert at a
+        // time. For a streamed expert to be bit-identical to what the resident
+        // kernels read, each plane of the whole repack must be the
+        // concatenation, in expert order, of that plane from every per-expert
+        // repack. Asserted here so a layout change cannot break it silently.
+        let (n_expert, rows, blocks) = (5usize, 6usize, 3usize);
+        let per = rows * blocks * Q6K_BLOCK_BYTES;
+        let src: Vec<u8> = (0..n_expert * per)
+            .map(|i| (i.wrapping_mul(2654435761) >> 7) as u8)
+            .collect();
+
+        let whole = repack_q6k_planar(&src, n_expert * rows, blocks).unwrap();
+        let lw = PlanarQ6K::layout(n_expert * rows, blocks);
+        let le = PlanarQ6K::layout(rows, blocks);
+        let planes = |l: &PlanarQ6K| [(l.ql, l.qh), (l.qh, l.sc), (l.sc, l.d), (l.d, l.total)];
+
+        for (p, ((ws, we), (es, ee))) in planes(&lw).into_iter().zip(planes(&le)).enumerate() {
+            let mut cat = Vec::new();
+            for e in 0..n_expert {
+                let one = repack_q6k_planar(&src[e * per..(e + 1) * per], rows, blocks).unwrap();
+                cat.extend_from_slice(&one[es..ee]);
+            }
+            assert_eq!(&whole[ws..we], &cat[..], "plane {p} differs");
+        }
+    }
 }

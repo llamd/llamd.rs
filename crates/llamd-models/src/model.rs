@@ -106,7 +106,26 @@ pub struct Model {
 
 impl Model {
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        let gguf = Gguf::open(path)?;
+        Self::from_gguf(Gguf::open(path)?)
+    }
+
+    /// Open WITHOUT mapping the file: header, hyperparameters and tensor
+    /// names are checked exactly as in [`Model::open`], but no tensor bytes
+    /// are touched. Methods that need zero-copy data (`tensor`, `expert`,
+    /// `matvec_*`) then return an error; weights are fetched through
+    /// [`Model::expert_index`] and `Gguf::read_at` instead.
+    ///
+    /// This is how a model larger than RAM is opened.
+    pub fn open_unmapped(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        Self::from_gguf(Gguf::open_unmapped(path)?)
+    }
+
+    /// The (layer, expert, projection) → byte-range index for a MoE model.
+    pub fn expert_index(&self) -> Result<crate::ExpertIndex> {
+        crate::ExpertIndex::build(&self.gguf, &self.hparams)
+    }
+
+    fn from_gguf(gguf: Gguf) -> Result<Self> {
         let hparams = Hparams::from_gguf(&gguf)?;
         let layers: Vec<LayerNames> = (0..hparams.n_layer)
             .map(|il| LayerNames::new(il, hparams.arch, &gguf))

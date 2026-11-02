@@ -53,6 +53,7 @@ version = "0.1.0"
 dependencies = [
  "llamd-core",
  "llamd-gguf",
+ "llamd-models",
  "llamd-quant",
  "llamd-runtime",
 ]
