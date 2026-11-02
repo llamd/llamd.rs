@@ -18,6 +18,7 @@ members = [
     "crates/llamd-vulkan",
     "crates/llamd-models",
     "crates/llamd-runtime",
+    "crates/llamd-ooc",
     "crates/llamd-sampling",
     "crates/llamd-server",
     "crates/llamd-testing",
@@ -45,6 +46,7 @@ llamd-rocm      = { path = "crates/llamd-rocm" }
 llamd-vulkan    = { path = "crates/llamd-vulkan" }
 llamd-models    = { path = "crates/llamd-models" }
 llamd-runtime   = { path = "crates/llamd-runtime" }
+llamd-ooc       = { path = "crates/llamd-ooc" }
 llamd-sampling  = { path = "crates/llamd-sampling" }
 
 # External — deliberately few. Every dependency in the numerical path is a

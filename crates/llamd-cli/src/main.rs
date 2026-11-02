@@ -9,6 +9,37 @@
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("plan") => match args.get(2) {
+            Some(path) => {
+                if let Err(e) = plan(path, &args[3..]) {
+                    eprintln!("llamd: {e}");
+                    std::process::exit(1);
+                }
+            }
+            None => {
+                eprintln!(
+                    "usage: llamd plan <model.gguf> [--vram 32G] [--ram 16G] [--ctx 4096] \
+                     [--os-reserve 3G] [--batch 32]"
+                );
+                std::process::exit(2);
+            }
+        },
+        Some("synth") => match (args.get(2).map(String::as_str), args.get(3)) {
+            (Some("qwen3-coder-480b-q8_0"), Some(out)) => {
+                let r = llamd_models::synthetic::SyntheticMoe::qwen3_coder_480b_q8_0()
+                    .writer()
+                    .and_then(|w| w.write(out));
+                if let Err(e) = r {
+                    eprintln!("llamd: {e}");
+                    std::process::exit(1);
+                }
+                println!("  wrote sparse {out} (full tensor table, no tensor data)");
+            }
+            _ => {
+                eprintln!("usage: llamd synth qwen3-coder-480b-q8_0 <out.gguf>");
+                std::process::exit(2);
+            }
+        },
         Some("experts") => match args.get(2) {
             Some(path) => {
                 let verify = args
@@ -41,7 +72,9 @@ fn main() {
         },
         _ => {
             eprintln!(
-                "llamd {}\n\nusage:\n  llamd inspect <model.gguf>\n  llamd experts <model.gguf> [--verify N]",
+                "llamd {}\n\nusage:\n  llamd inspect <model.gguf>\n  llamd experts <model.gguf> [--verify N]\n  \
+                 llamd plan <model.gguf> [--vram 32G] [--ram 16G] [--ctx N] [--os-reserve 3G] [--batch N]\n  \
+                 llamd synth qwen3-coder-480b-q8_0 <out.gguf>",
                 env!("CARGO_PKG_VERSION")
             );
             std::process::exit(2);
@@ -213,5 +246,42 @@ fn experts(path: &str, verify: usize) -> llamd_core::Result<()> {
         );
         println!("  RSS after       {:.1} MiB", rss_mib());
     }
+    Ok(())
+}
+
+/// The memory plan for a model under a VRAM/RAM budget. Opens unmapped, so it
+/// works on models far larger than this machine's memory.
+fn plan(path: &str, opts: &[String]) -> llamd_core::Result<()> {
+    let mut cfg = llamd_ooc::BudgetConfig::target_32g_16g();
+    let mut it = opts.iter();
+    while let Some(k) = it.next() {
+        let v = it
+            .next()
+            .ok_or_else(|| llamd_core::Error::other(format!("{k} needs a value")))?;
+        let num = |v: &str| {
+            v.parse::<usize>()
+                .map_err(|_| llamd_core::Error::other(format!("{k}: {v:?} is not a number")))
+        };
+        match k.as_str() {
+            "--vram" => cfg.vram_total = llamd_ooc::parse_bytes(v)?,
+            "--ram" => cfg.ram_total = llamd_ooc::parse_bytes(v)?,
+            "--os-reserve" => cfg.os_reserve = llamd_ooc::parse_bytes(v)?,
+            "--ctx" => cfg.ctx = num(v)?,
+            "--batch" => cfg.max_batch = num(v)?,
+            other => return Err(llamd_core::Error::other(format!("unknown option {other}"))),
+        }
+    }
+    let m = llamd_models::Model::open_unmapped(path)?;
+    let idx = m.expert_index()?;
+    let facts = llamd_ooc::ModelFacts::from_model(&m, &idx)?;
+    println!(
+        "  model {path}: {} ({} layers x {} experts, top-{}), ctx {}",
+        llamd_ooc::fmt_bytes(m.gguf().file_size() as u64),
+        facts.n_layer,
+        facts.n_expert,
+        facts.n_expert_used,
+        cfg.ctx
+    );
+    print!("{}", llamd_ooc::MemoryPlan::new(&cfg, &facts)?.report());
     Ok(())
 }

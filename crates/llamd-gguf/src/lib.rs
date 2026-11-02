@@ -715,6 +715,34 @@ mod tests {
     }
 
     #[test]
+    fn a_sparse_file_has_the_full_tensor_table_but_no_data_on_disk() {
+        use std::os::unix::fs::MetadataExt;
+        let f = TempFile::new("sparse");
+        let mut w = sample(3);
+        // 2 GiB of declared Q8_0 data that is never written.
+        w.tensor_sparse("huge", &[32, 1 << 26], 8).unwrap();
+        w.write(&f.0).unwrap();
+        let u = Gguf::open_unmapped(&f.0).unwrap();
+        let e = u.tensor_extent(u.tensor("huge").unwrap()).unwrap();
+        assert_eq!(e.len, (1u64 << 26) * 34);
+        assert_eq!(u.file_size() as u64, e.end());
+        let blocks = std::fs::metadata(&f.0).unwrap().blocks() * 512;
+        assert!(
+            blocks < 16 << 20,
+            "{blocks} bytes allocated for a sparse file"
+        );
+        // A hole reads as zeros; the real tensors keep their bytes.
+        let mut z = [1u8; 64];
+        u.read_at(e.offset + 12345, &mut z).unwrap();
+        assert!(z.iter().all(|&b| b == 0));
+        let a = u.tensor("a").unwrap();
+        assert_eq!(
+            u.read_extent(u.tensor_extent(a).unwrap()).unwrap()[..4],
+            1f32.to_le_bytes()
+        );
+    }
+
+    #[test]
     fn extent_alignment_is_the_largest_power_of_two_capped_at_4096() {
         let e = |offset| Extent { offset, len: 1 };
         assert_eq!(e(0).alignment(), 4096);

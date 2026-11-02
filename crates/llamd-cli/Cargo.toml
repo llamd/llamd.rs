@@ -14,6 +14,7 @@ llamd-core.workspace = true
 llamd-gguf.workspace = true
 llamd-quant.workspace = true
 llamd-models.workspace = true
+llamd-ooc.workspace = true
 
 [[bin]]
 name = "llamd"

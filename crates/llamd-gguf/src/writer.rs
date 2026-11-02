@@ -7,6 +7,12 @@
 //!
 //! It is not a converter. Tensor bytes are written as given; producing
 //! correctly quantized blocks is the caller's business.
+//!
+//! SPARSE TENSORS. [`GgufWriter::tensor_sparse`] declares a tensor of full
+//! size without supplying bytes; [`GgufWriter::write`] leaves a hole there, so
+//! a file with the exact tensor table of a 500 GB model occupies a few MB of
+//! disk. That is how out-of-core code is exercised at the target's real shape
+//! on a machine that cannot store the target. Reads of a hole return zeros.
 
 use crate::{DEFAULT_ALIGNMENT, MAGIC, Value};
 use llamd_core::{Error, Result};
@@ -22,7 +28,9 @@ struct PendingTensor {
     name: String,
     dims: Vec<u64>,
     ggml_type: u32,
-    data: Vec<u8>,
+    /// `None`: sparse — `len` bytes of hole.
+    data: Option<Vec<u8>>,
+    len: u64,
 }
 
 impl Default for GgufWriter {
@@ -57,12 +65,33 @@ impl GgufWriter {
             name: name.to_string(),
             dims: dims.to_vec(),
             ggml_type,
-            data,
+            len: data.len() as u64,
+            data: Some(data),
         });
         self
     }
 
-    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+    /// Declare a tensor WITHOUT data. Its length is computed from the shape
+    /// and block format, exactly as the reader will compute it.
+    pub fn tensor_sparse(&mut self, name: &str, dims: &[u64], ggml_type: u32) -> Result<&mut Self> {
+        let ty = llamd_quant::QuantType::from_ggml(ggml_type)?;
+        let n: u64 = dims.iter().product();
+        let len = ty.bytes_for(
+            usize::try_from(n).map_err(|_| Error::malformed("gguf writer", "tensor too large"))?,
+        )? as u64;
+        self.tensors.push(PendingTensor {
+            name: name.to_string(),
+            dims: dims.to_vec(),
+            ggml_type,
+            data: None,
+            len,
+        });
+        Ok(self)
+    }
+
+    /// Header and tensor table, padded to the data section, plus each
+    /// tensor's data-relative offset and the data section's total length.
+    fn layout(&self) -> Result<(Vec<u8>, Vec<u64>, u64)> {
         let a = self.alignment;
         if a == 0 || !a.is_power_of_two() {
             return Err(Error::malformed(
@@ -92,7 +121,7 @@ impl GgufWriter {
         for t in &self.tensors {
             off = off.div_ceil(a) * a;
             offsets.push(off);
-            off += t.data.len() as u64;
+            off += t.len;
         }
         for (t, o) in self.tensors.iter().zip(&offsets) {
             put_str(&mut out, &t.name);
@@ -106,15 +135,38 @@ impl GgufWriter {
 
         let data_start = (out.len() as u64).div_ceil(a) * a;
         out.resize(data_start as usize, 0);
+        Ok((out, offsets, off))
+    }
+
+    /// The whole file in memory. Sparse tensors become zeros — use
+    /// [`GgufWriter::write`] for anything large.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let (mut out, offsets, _) = self.layout()?;
+        let data_start = out.len() as u64;
         for (t, o) in self.tensors.iter().zip(&offsets) {
             out.resize((data_start + o) as usize, 0);
-            out.extend_from_slice(&t.data);
+            match &t.data {
+                Some(d) => out.extend_from_slice(d),
+                None => out.resize(out.len() + t.len as usize, 0),
+            }
         }
         Ok(out)
     }
 
+    /// Write to `path`, leaving holes for sparse tensors.
     pub fn write(&self, path: impl AsRef<Path>) -> Result<()> {
-        Ok(std::fs::write(path, self.to_bytes()?)?)
+        use std::os::unix::fs::FileExt;
+        let (head, offsets, data_len) = self.layout()?;
+        let f = std::fs::File::create(path)?;
+        f.write_all_at(&head, 0)?;
+        let data_start = head.len() as u64;
+        for (t, o) in self.tensors.iter().zip(&offsets) {
+            if let Some(d) = &t.data {
+                f.write_all_at(d, data_start + o)?;
+            }
+        }
+        f.set_len(data_start + data_len)?;
+        Ok(())
     }
 }
 

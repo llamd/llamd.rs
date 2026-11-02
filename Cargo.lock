@@ -54,6 +54,7 @@ dependencies = [
  "llamd-core",
  "llamd-gguf",
  "llamd-models",
+ "llamd-ooc",
  "llamd-quant",
  "llamd-runtime",
 ]
@@ -92,6 +93,15 @@ dependencies = [
  "llamd-gguf",
  "llamd-quant",
  "llamd-tensor",
+]
+
+[[package]]
+name = "llamd-ooc"
+version = "0.1.0"
+dependencies = [
+ "llamd-core",
+ "llamd-gguf",
+ "llamd-models",
 ]
 
 [[package]]

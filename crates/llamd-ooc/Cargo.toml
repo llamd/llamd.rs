@@ -1,0 +1,14 @@
+[package]
+name         = "llamd-ooc"
+description  = "Out-of-core MoE: memory budgets, expert loading, expert cache. Models larger than RAM and VRAM."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+authors.workspace      = true
+
+[dependencies]
+llamd-core.workspace = true
+llamd-gguf.workspace = true
+llamd-models.workspace = true
