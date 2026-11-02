@@ -1330,6 +1330,9 @@ pub fn info() -> Result<DeviceInfo> {
 mod tests {
     use super::*;
 
+    // Gated at compile time, not only at run time: without the toolchain the
+    // `ffi` module does not exist, so a runtime check alone cannot compile.
+    #[cfg(vulkan)]
     #[test]
     fn pipeline_ids_match_the_shader_table() {
         if !crate::built_with_vulkan() {
